@@ -1,0 +1,1940 @@
+//! A SQL editor tab: its toolbar, the editor over its results with a
+//! splitter between them, and the footer. The editor (`sql_text`) and the
+//! results (`sql_results`) draw their own panes.
+
+use egui::{
+    Color32, CornerRadius, Frame, Id, Rect, Sense, Stroke, StrokeKind, Ui, WidgetInfo, WidgetType,
+    pos2, vec2,
+};
+
+use crate::format;
+use crate::i18n::{Locale, Msgid, gettext, msgid, ngettext};
+use crate::keymap::{Command, Keymap, Scope, Written};
+use crate::model::{Action, ConnTabId, NoWrites, RunMode, SqlTab, TabId, Workspace};
+use crate::settings::Settings;
+use crate::style::Icon;
+use crate::theme::{Look, Palette};
+use crate::typography::{Text, TextRole};
+use crate::ui::Paint;
+use crate::ui::focus;
+use crate::ui::menu;
+use crate::ui::widgets::{self, ButtonSpec};
+
+/// Left and right padding of the toolbar.
+const SIDE: f32 = 16.0;
+
+/// The least height of the editor, and of the results under it.
+const MIN_PANE: f32 = 80.0;
+
+/// Why Run and Run all cannot be pressed while a read-write run is in
+/// flight.
+const WRITING: Msgid =
+    msgid("A read-write run is still going in this tab. Cancel it or wait for it.");
+
+/// The height of what divides the editor from the results: a band to drag
+/// between two rules, or the terminal's one rule.
+fn splitter_height(look: &Look) -> f32 {
+    if look.terminal { 1.0 } else { 9.0 }
+}
+
+/// The least a pane gets of `room` points shared by the two: 80, or half
+/// the room when it is too small for both.
+fn least_pane(room: f32) -> f32 {
+    MIN_PANE.min(room.max(0.0) / 2.0)
+}
+
+/// The editor's height when it takes `split` of `room` points, with the
+/// results keeping their least height and the editor its own.
+fn editor_height(split: f32, room: f32) -> f32 {
+    let least = least_pane(room);
+    (split * room).round().clamp(least, room.max(0.0) - least)
+}
+
+/// The share of `room` an editor `height` points tall takes, once both
+/// panes have their least height.
+fn split_at(height: f32, room: f32) -> Option<f32> {
+    let least = least_pane(room);
+    (room > 0.0).then(|| height.clamp(least, room - least) / room)
+}
+
+/// Draws the SQL editor tab `id` of `workspace`, the connection tab
+/// `tab`, and returns what it asks for, in the order its toolbar, editor,
+/// results and splitter ask. The editor edits the tab's text in place.
+pub fn show(
+    ui: &mut Ui,
+    paint: Paint,
+    tab: ConnTabId,
+    id: TabId,
+    workspace: &mut Workspace,
+    settings: &Settings,
+    keymap: &Keymap,
+) -> Vec<Action> {
+    let Paint {
+        locale,
+        palette,
+        look,
+    } = paint;
+    let mut actions = toolbar(ui, paint, tab, id, workspace, settings);
+    if !look.terminal {
+        footer(ui, paint, tab, id, workspace, settings);
+    }
+    let Some(split) = workspace.sql_tab(id).map(|sql| sql.split) else {
+        return actions;
+    };
+    // What the toolbar and the footer leave: the editor takes its share,
+    // the band follows it, and the results take the rest.
+    let room = ui.available_rect_before_wrap();
+    let band = splitter_height(&look);
+    let shared = room.height() - band;
+    let editor = Rect::from_min_size(room.min, vec2(room.width(), editor_height(split, shared)));
+    let divider = Rect::from_min_size(editor.left_bottom(), vec2(room.width(), band));
+    let results = Rect::from_min_max(divider.left_bottom(), room.max);
+    let mut pane = |rect: Rect, salt: &str| {
+        // An id of its own: one counted from the parent's widgets would
+        // change when the row panel appears beside the panes, and the
+        // widgets in them would lose the keyboard focus with it.
+        let pane_id = Id::new(("sql-pane", salt, tab.0, id.0));
+        let mut child = ui.new_child(egui::UiBuilder::new().id(pane_id).max_rect(rect));
+        child.set_clip_rect(rect.intersect(ui.clip_rect()));
+        child
+    };
+    let dialect = workspace.driver.dialect();
+    let tree_has_arrows = workspace.pane == crate::model::Pane::Tree;
+    if let Some(sql) = workspace.sql_tab_mut(id) {
+        let mut child = pane(editor, "sql-text");
+        let asked = super::sql_text::show(
+            &mut child,
+            paint,
+            tab,
+            sql,
+            settings,
+            dialect,
+            tree_has_arrows,
+        );
+        actions.extend(asked);
+    }
+    if let Some(sql) = workspace.sql_tab(id) {
+        let mut child = pane(results, "sql-results");
+        let asked =
+            super::sql_results::show(&mut child, paint, tab, workspace, sql, settings, keymap);
+        actions.extend(asked);
+    }
+    // After the panes, so the band takes the pointer where they meet it.
+    let place = Splitter {
+        band: divider,
+        top: room.top(),
+        shared,
+    };
+    if let Some(split) = splitter(ui, &place, id, locale, &look, &palette) {
+        actions.push(Action::SetSqlSplit {
+            tab,
+            sql_tab: id,
+            split,
+        });
+    }
+    actions
+}
+
+/// Where the divider under the editor sits.
+struct Splitter {
+    band: Rect,
+    /// The editor's top.
+    top: f32,
+    /// The height the editor and the results share.
+    shared: f32,
+}
+
+/// The divider under the editor, which is the handle that moves it: the
+/// band and its grip (macOS), or the terminal's rule and 3 pt to each of
+/// its sides (one point is too thin to catch). Returns the share the
+/// editor takes where a drag puts the band.
+fn splitter(
+    ui: &Ui,
+    place: &Splitter,
+    id: TabId,
+    locale: Locale,
+    look: &Look,
+    palette: &Palette,
+) -> Option<f32> {
+    let band = place.band;
+    let handle = if look.terminal {
+        band.expand2(vec2(0.0, 3.0))
+    } else {
+        band
+    };
+    // A drag only: the Tab key passes the band by.
+    let handle_id = ui.id().with(("sql-split", id.0));
+    let response = ui.interact(handle, handle_id, Sense::DRAG);
+    response.widget_info(|| {
+        WidgetInfo::labeled(
+            WidgetType::Other,
+            true,
+            gettext(locale, "Resize the editor"),
+        )
+    });
+    let held = response.hovered() || response.dragged();
+    if held {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    if look.terminal {
+        let rule = if held { palette.dim } else { palette.outline };
+        widgets::hline(ui, band.x_range(), band.center().y, rule);
+    } else {
+        ui.painter()
+            .rect_filled(band, CornerRadius::ZERO, palette.surface);
+        widgets::hline(ui, band.x_range(), band.top() + 0.5, palette.outline);
+        widgets::hline(ui, band.x_range(), band.bottom() - 0.5, palette.outline);
+        let grip = if held {
+            palette.dim
+        } else {
+            palette.border.lerp_to_gamma(palette.faint, 0.3)
+        };
+        ui.painter().rect_filled(
+            Rect::from_center_size(band.center(), vec2(36.0, 3.0)),
+            CornerRadius::same(2),
+            grip,
+        );
+    }
+    // The band keeps under the pointer the point it was caught by.
+    let pointer = response.interact_pointer_pos()?;
+    if response.drag_started() {
+        let caught = pointer.y - band.top();
+        ui.data_mut(|data| data.insert_temp(handle_id, caught));
+    }
+    if !response.dragged() {
+        return None;
+    }
+    let caught = ui
+        .data(|data| data.get_temp::<f32>(handle_id))
+        .unwrap_or(band.height() / 2.0);
+    split_at(pointer.y - caught - place.top, place.shared)
+}
+
+/// "Limit 1,000": a limit's name, the same in every look.
+fn limit_name(limit: u32, locale: Locale) -> String {
+    if limit == 0 {
+        return gettext(locale, "No limit").into_owned();
+    }
+    format!(
+        "{} {}",
+        gettext(locale, "Limit"),
+        crate::i18n::number(locale, u64::from(limit))
+    )
+}
+
+/// A limit's rows as the look writes them: "1,000", the terminal's
+/// "1000", or "No limit" for 0.
+pub(crate) fn limit_words(limit: u32, look: &Look, locale: Locale) -> String {
+    match limit {
+        0 => look.label(&gettext(locale, "No limit")),
+        _ if look.terminal => limit.to_string(),
+        _ => crate::i18n::number(locale, u64::from(limit)),
+    }
+}
+
+/// A limit as the look reads it: "Limit 1,000", or the terminal's "limit
+/// 1000", or "No limit". Where room is `short`, the number alone.
+fn limit_text(limit: u32, short: bool, look: &Look, locale: Locale) -> String {
+    let number = limit_words(limit, look, locale);
+    if short || limit == 0 {
+        number
+    } else {
+        format!("{} {number}", look.label(&gettext(locale, "Limit")))
+    }
+}
+
+/// A time as the editor writes it, in the menus and in what a run says:
+/// "45 s", "1 min", "1 min 30 s"; the terminal's (`terminal`) "45s", "1m",
+/// "1m 30s". A time typed into the file by hand reads the same way.
+pub(crate) fn time_words(secs: u32, terminal: bool, locale: Locale) -> String {
+    let (minutes, rest) = (secs / 60, secs % 60);
+    match (terminal, minutes, rest) {
+        (true, 0, _) => format!("{secs}s"),
+        (true, _, 0) => format!("{minutes}m"),
+        (true, _, _) => format!("{minutes}m {rest}s"),
+        (false, 0, _) => {
+            gettext(locale, "{seconds} s").replace("{seconds}", &crate::i18n::number(locale, secs))
+        }
+        (false, _, 0) => ngettext(locale, "{n} min", "{n} min", minutes)
+            .replace("{n}", &crate::i18n::number(locale, minutes)),
+        (false, _, _) => gettext(locale, "{minutes} min {seconds} s")
+            .replace("{minutes}", &crate::i18n::number(locale, minutes))
+            .replace("{seconds}", &crate::i18n::number(locale, rest)),
+    }
+}
+
+/// "Timeout 30 s", or "No timeout": a timeout's name, the same in every
+/// look.
+fn timeout_name(secs: Option<u32>, locale: Locale) -> String {
+    match secs {
+        None => gettext(locale, "No timeout").into_owned(),
+        Some(secs) => format!(
+            "{} {}",
+            gettext(locale, "Timeout"),
+            time_words(secs, false, locale)
+        ),
+    }
+}
+
+/// A timeout as the look reads it: "Timeout 30 s", or the terminal's
+/// "timeout 30s". Where room is `short`, the time alone, and "Off" for
+/// none.
+fn timeout_text(secs: Option<u32>, short: bool, look: &Look, locale: Locale) -> String {
+    let Some(secs) = secs else {
+        let none = if short {
+            msgid("Off")
+        } else {
+            msgid("No timeout")
+        };
+        return look.label(&none.say(locale));
+    };
+    let time = time_words(secs, look.terminal, locale);
+    if short {
+        time
+    } else {
+        format!("{} {time}", look.label(&gettext(locale, "Timeout")))
+    }
+}
+
+/// The keys that run the statement at the cursor and the whole script, as
+/// the keymap writes them for the look.
+pub(super) fn run_keys(ctx: &egui::Context, look: &Look) -> (Written, Written) {
+    let key = |command| crate::ui::keys::written(ctx, look, command);
+    (key(Command::RunStatement), key(Command::RunAll))
+}
+
+/// The key that formats the script, as the keymap writes it for the look.
+fn format_keys(ctx: &egui::Context, look: &Look) -> Written {
+    crate::ui::keys::written_in(ctx, look, Command::Format, Scope::SqlEditor)
+}
+
+/// How a toolbar menu's button reads: worked out once a frame.
+struct MenuLabel {
+    /// What the menu sets ("Limit").
+    name: String,
+    /// What it is set to, for screen readers ("Limit 1,000").
+    value: String,
+    /// What the button reads, and what it reads where room is short.
+    full: String,
+    short: String,
+}
+
+impl MenuLabel {
+    fn text(&self, short: bool) -> &str {
+        if short { &self.short } else { &self.full }
+    }
+}
+
+/// What the toolbar shows of one editor, and what it draws with.
+#[derive(Clone, Copy)]
+struct Bar<'a> {
+    tab: ConnTabId,
+    id: TabId,
+    /// "Query 3", as the look names things.
+    title: &'a str,
+    limit: u32,
+    /// The timeout in seconds.
+    secs: Option<u32>,
+    limit_label: &'a MenuLabel,
+    timeout_label: &'a MenuLabel,
+    /// The editor's read-write run is in flight: Run and Run all wait.
+    writing: bool,
+    /// What Run runs: the selection, the whole tab (the settings' Whole
+    /// tab), or the statement at the cursor. Run all runs the selection
+    /// too where there is one.
+    runs: Runs,
+    /// The transaction the editor's runs are in now.
+    mode: RunMode,
+    /// Whether the switch changes that, or why the editor cannot write.
+    writes: Result<(), NoWrites>,
+    locale: Locale,
+    look: &'a Look,
+    palette: &'a Palette,
+}
+
+/// Run and Run all, the transaction the editor's runs are in, and the
+/// limit and timeout they run with.
+fn toolbar(
+    ui: &mut Ui,
+    paint: Paint,
+    tab: ConnTabId,
+    id: TabId,
+    workspace: &Workspace,
+    settings: &Settings,
+) -> Vec<Action> {
+    let Paint {
+        locale,
+        palette,
+        look,
+    } = paint;
+    let Some(sql) = workspace.sql_tab(id) else {
+        return Vec::new();
+    };
+    let (mode, writes) = (workspace.run_mode(sql), workspace.sql_writes());
+    let title = look
+        .label(&gettext(locale, "Query {n}"))
+        .replace("{n}", &sql.number.to_string());
+    let limit = sql.limit;
+    let secs = sql
+        .timeout
+        .map(|timeout| u32::try_from(timeout.as_secs()).unwrap_or(u32::MAX));
+    let limit_label = MenuLabel {
+        name: gettext(locale, "Limit").into_owned(),
+        value: limit_name(limit, locale),
+        full: limit_text(limit, false, &look, locale),
+        short: limit_text(limit, true, &look, locale),
+    };
+    let timeout_label = MenuLabel {
+        name: gettext(locale, "Timeout").into_owned(),
+        value: timeout_name(secs, locale),
+        full: timeout_text(secs, false, &look, locale),
+        short: timeout_text(secs, true, &look, locale),
+    };
+    let bar = Bar {
+        tab,
+        id,
+        title: &title,
+        limit,
+        secs,
+        limit_label: &limit_label,
+        timeout_label: &timeout_label,
+        writing: sql.is_writing(),
+        runs: if sql.selected.is_some() {
+            Runs::Selection
+        } else {
+            match settings.run_scope {
+                crate::settings::RunScope::Statement => Runs::Statement,
+                crate::settings::RunScope::All => Runs::All,
+            }
+        },
+        mode,
+        writes,
+        locale,
+        look: &look,
+        palette: &palette,
+    };
+    let mut actions = Vec::new();
+    // 48 (macOS) or 40 (terminal), and a rule.
+    let height = if look.terminal { 41.0 } else { 49.0 };
+    egui::Panel::top(Id::new(("sql-toolbar", tab.0, id.0)))
+        .exact_size(height)
+        .resizable(false)
+        .show_separator_line(false)
+        .frame(Frame::new().fill(palette.window))
+        .show(ui, |ui| {
+            let rect = ui.max_rect();
+            let rule = if look.terminal {
+                palette.outline
+            } else {
+                palette.surface_hover
+            };
+            widgets::hline(ui, rect.x_range(), rect.bottom() - 0.5, rule);
+            if look.terminal {
+                terminal_toolbar(ui, rect, &bar, &mut actions);
+            } else {
+                mac_toolbar(ui, rect, &bar, &mut actions);
+            }
+        });
+    actions
+}
+
+/// How the two menus draw: their labels short or in full, and (macOS)
+/// with or without their chevrons.
+#[derive(Clone, Copy)]
+struct MenuShape {
+    short: bool,
+    chevron: bool,
+}
+
+/// The widths of the Limit and the Timeout menu's buttons.
+fn menu_widths(ui: &Ui, shape: MenuShape, bar: &Bar<'_>) -> [f32; 2] {
+    [bar.limit_label, bar.timeout_label]
+        .map(|label| menu_width(ui, label.text(shape.short), shape.chevron, bar.look))
+}
+
+/// The Limit menu, then the Timeout menu, in `rects`.
+fn menus(
+    ui: &mut Ui,
+    rects: [Rect; 2],
+    shape: MenuShape,
+    bar: &Bar<'_>,
+    actions: &mut Vec<Action>,
+) {
+    let Bar {
+        tab,
+        id,
+        locale,
+        look,
+        palette,
+        ..
+    } = *bar;
+    // The settings' choices, and the tab's own in its place where the file
+    // set another.
+    let limits = Settings::sql_limits_with(bar.limit);
+    let picked = menu(
+        ui,
+        rects[0],
+        bar.limit_label,
+        shape,
+        (look, palette),
+        || {
+            limits
+                .iter()
+                .map(|choice| menu::Choice {
+                    text: limit_text(*choice, false, look, locale),
+                    name: Some(limit_name(*choice, locale)),
+                    selected: *choice == bar.limit,
+                    disabled: None,
+                })
+                .collect()
+        },
+    );
+    if let Some(limit) = picked.and_then(|index| limits.get(index))
+        && *limit != bar.limit
+    {
+        actions.push(Action::SetSqlLimit {
+            tab,
+            sql_tab: id,
+            limit: *limit,
+        });
+    }
+    let timeouts = Settings::sql_timeouts_with(bar.secs);
+    let picked = menu(
+        ui,
+        rects[1],
+        bar.timeout_label,
+        shape,
+        (look, palette),
+        || {
+            timeouts
+                .iter()
+                .map(|choice| menu::Choice {
+                    text: timeout_text(*choice, false, look, locale),
+                    name: Some(timeout_name(*choice, locale)),
+                    selected: *choice == bar.secs,
+                    disabled: None,
+                })
+                .collect()
+        },
+    );
+    if let Some(secs) = picked.and_then(|index| timeouts.get(index))
+        && *secs != bar.secs
+    {
+        actions.push(Action::SetSqlTimeout {
+            tab,
+            sql_tab: id,
+            secs: *secs,
+        });
+    }
+}
+
+/// Why a tab of a writable connection to production cannot be switched to
+/// Read-write: its runs are to be confirmed first, with their statements
+/// on screen, and that question is not built yet.
+pub(super) const UNCONFIRMED: Msgid =
+    msgid("Read-write runs on a production connection are not available yet.");
+
+/// The switch's two segments, in the order it draws them.
+const MODES: [RunMode; 2] = [RunMode::ReadOnly, RunMode::ReadWrite];
+
+/// A mode as its segment of the switch names it.
+fn mode_name(mode: RunMode) -> Msgid {
+    match mode {
+        RunMode::ReadOnly => msgid("Read-only"),
+        RunMode::ReadWrite => msgid("Read-write"),
+    }
+}
+
+/// What a mode does, as its segment says on hover.
+fn mode_does(mode: RunMode) -> Msgid {
+    match mode {
+        RunMode::ReadOnly => msgid("Runs are rolled back. Nothing is changed."),
+        RunMode::ReadWrite => {
+            msgid("A run that changes data is committed when every statement succeeds.")
+        }
+    }
+}
+
+/// Why no editor of the connection can write, as the Read-write segment
+/// says where it cannot be picked.
+fn no_writes(no: NoWrites) -> Msgid {
+    match no {
+        NoWrites::ReadOnlyConnection => msgid("This connection opens read-only."),
+        NoWrites::Unconfirmed => UNCONFIRMED,
+    }
+}
+
+/// What the segment of the mode in use says on hover: what the mode does,
+/// and on a connection whose editors cannot write, why not.
+fn switch_tip(bar: &Bar<'_>) -> String {
+    let say = |text: Msgid| text.say(bar.locale);
+    let does = say(mode_does(bar.mode));
+    match bar.writes {
+        Ok(()) => does.into_owned(),
+        Err(no @ NoWrites::ReadOnlyConnection) => format!(
+            "{}. {}",
+            say(msgid(
+                "Every query runs in a read-only transaction that is rolled back"
+            )),
+            say(no_writes(no))
+        ),
+        Err(no @ NoWrites::Unconfirmed) => format!("{does} {}", say(no_writes(no))),
+    }
+}
+
+/// The role a segment of the switch reads in. macOS: the chosen one a
+/// weight heavier, as every segmented control's.
+fn switch_role(look: &Look, chosen: bool) -> TextRole {
+    match (look.terminal, chosen) {
+        (true, _) => TextRole::OBody,
+        (false, true) => TextRole::FormLabel,
+        (false, false) => TextRole::Secondary,
+    }
+}
+
+/// The widths of the switch's two segments. macOS: 10 at the sides of the
+/// words, and in the chosen Read-only a 10 pt lock and 5 before them. The
+/// terminal: 6 at the sides.
+fn switch_cells(ui: &Ui, bar: &Bar<'_>) -> [f32; 2] {
+    let look = bar.look;
+    MODES.map(|mode| {
+        let chosen = mode == bar.mode;
+        let words = look.label(&mode_name(mode).say(bar.locale));
+        let words = switch_role(look, chosen).width(ui.ctx(), look.faces, &words);
+        if look.terminal {
+            return 6.0 + words + 6.0;
+        }
+        let lock = if chosen && mode == RunMode::ReadOnly {
+            10.0 + 5.0
+        } else {
+            0.0
+        };
+        (10.0 + lock + words + 10.0).ceil()
+    })
+}
+
+/// The switch's width. macOS: a 2 pt track round its segments. The
+/// terminal: the segments, 6 apart.
+fn switch_width(ui: &Ui, bar: &Bar<'_>) -> f32 {
+    let cells: f32 = switch_cells(ui, bar).iter().sum();
+    if bar.look.terminal {
+        cells + 6.0
+    } else {
+        2.0 + cells + 2.0
+    }
+}
+
+/// The corners of the switch's track and of a segment in it, from the
+/// look's own: 7 and 5 on macOS, as the design's segmented control.
+fn track_corner(look: &Look) -> CornerRadius {
+    CornerRadius::same(look.radius.saturating_sub(1))
+}
+
+fn segment_corner(look: &Look) -> CornerRadius {
+    CornerRadius::same(look.radius.saturating_sub(3))
+}
+
+/// The switch in `rect`: Read-only and Read-write, the transaction the
+/// editor's runs are in chosen. macOS: a sunken track with the chosen
+/// segment raised, Read-only behind a lock and Read-write in the warning
+/// tone. The terminal: the chosen segment in a box, the other muted.
+/// Where no editor can write it is drawn as a control that is off, and
+/// its Read-write segment says why. Returns the mode picked this frame,
+/// when it is another than the one in use.
+fn switch(ui: &mut Ui, rect: Rect, bar: &Bar<'_>) -> Option<RunMode> {
+    let Bar {
+        locale,
+        look,
+        palette,
+        mode,
+        writes,
+        ..
+    } = *bar;
+    // A control that is off, as the design's: all of it at 45 %.
+    let fade = |color: Color32| match writes {
+        Ok(()) => color,
+        Err(NoWrites::ReadOnlyConnection | NoWrites::Unconfirmed) => color.gamma_multiply(0.45),
+    };
+    let painter = ui.painter().clone();
+    let (pad, gap) = if look.terminal {
+        (0.0, 6.0)
+    } else {
+        (2.0, 0.0)
+    };
+    if !look.terminal {
+        painter.rect_filled(rect, track_corner(look), fade(palette.surface));
+    }
+    let group = ui.id().with("transaction-modes");
+    let mut left = rect.left() + pad;
+    let mut picked = None;
+    for (index, (choice, width)) in MODES.into_iter().zip(switch_cells(ui, bar)).enumerate() {
+        let cell = Rect::from_min_max(
+            pos2(left, rect.top() + pad),
+            pos2(left + width, rect.bottom() - pad),
+        );
+        left += width + gap;
+        let chosen = choice == mode;
+        let name = mode_name(choice).say(locale);
+        let id = ui.id().with(("transaction-mode", index));
+        // A segment that cannot be picked answers no press, and still
+        // takes the keyboard, as a button that cannot be pressed does: the
+        // keyboard can then read why.
+        let reason = match writes {
+            Err(no) if !chosen => Some(no_writes(no).say(locale)),
+            _ => None,
+        };
+        let response = match (&reason, writes) {
+            (Some(_), _) => ui.interact(cell, id, Sense::focusable_noninteractive()),
+            // One Tab stop for the switch; the arrows choose inside it.
+            (None, Ok(())) => {
+                let (response, arrow) =
+                    focus::segment(ui, cell, id, group, (index, MODES.len()), chosen);
+                picked = arrow.and_then(|index| MODES.get(index).copied()).or(picked);
+                if response.clicked() {
+                    picked = Some(choice);
+                }
+                response
+            }
+            (None, Err(_)) => ui.interact(cell, id, Sense::hover()),
+        };
+        response.widget_info(|| {
+            WidgetInfo::selected(WidgetType::Button, reason.is_none(), chosen, name.as_ref())
+        });
+        if let Some(reason) = &reason {
+            ui.ctx().accesskit_node_builder(response.id, |node| {
+                node.set_description(reason.as_ref());
+            });
+        }
+        let ring = if look.terminal {
+            focus::Ring::Inset { radius: 0 }
+        } else {
+            focus::Ring::Edge {
+                radius: look.radius.saturating_sub(3),
+            }
+        };
+        focus::hint(ui, &response, cell, ring);
+        let lit = reason.is_none() && response.hovered();
+        if look.terminal {
+            if chosen {
+                painter.rect_stroke(
+                    cell,
+                    CornerRadius::same(3),
+                    Stroke::new(1.0, fade(palette.outline)),
+                    StrokeKind::Inside,
+                );
+            }
+        } else if chosen {
+            let corner = segment_corner(look);
+            painter.add(
+                egui::epaint::Shadow {
+                    offset: [0, 1],
+                    blur: 2,
+                    spread: 0,
+                    color: fade(Color32::from_black_alpha(26)),
+                }
+                .as_shape(cell, corner),
+            );
+            painter.rect_filled(cell, corner, fade(palette.window));
+        } else if lit {
+            painter.rect_filled(cell, segment_corner(look), palette.surface_hover);
+        }
+        let ink = fade(match (chosen, choice) {
+            (true, RunMode::ReadWrite) => palette.warning,
+            (true, RunMode::ReadOnly) => palette.text,
+            (false, _) if look.terminal && lit => palette.text,
+            (false, _) if look.terminal => palette.dim,
+            (false, _) => palette.secondary,
+        });
+        let words = look.label(&name);
+        let text = Text::one(look, switch_role(look, chosen), &words, ink);
+        let center = cell.center().y;
+        if !look.terminal && chosen && choice == RunMode::ReadOnly {
+            Icon::Lock.image(ink, 10.0).paint_at(
+                ui,
+                Rect::from_center_size(pos2(cell.left() + 15.0, center), vec2(10.0, 10.0)),
+            );
+            widgets::paint_text(ui, cell.left() + 25.0, center, text);
+        } else {
+            text.layout(ui.ctx()).paint_center(&painter, cell.center());
+        }
+        let tip = match &reason {
+            Some(reason) => {
+                if focus::shown(&response) {
+                    response.show_tooltip_text(reason.as_ref());
+                }
+                reason.to_string()
+            }
+            None if chosen => switch_tip(bar),
+            None => mode_does(choice).say(locale).into_owned(),
+        };
+        let _ = response.on_hover_text(tip);
+    }
+    picked.filter(|picked| *picked != mode)
+}
+
+/// What Run runs now.
+#[derive(Clone, Copy)]
+enum Runs {
+    Statement,
+    All,
+    Selection,
+}
+
+/// Run or Run all in `rect`, with what it does on hover. Neither can be
+/// pressed while the editor's read-write run is in flight, and says so: a
+/// new run would cancel a transaction that may be about to commit.
+fn run_button(
+    ui: &mut Ui,
+    button: ButtonSpec<'_>,
+    rect: Rect,
+    all: bool,
+    bar: &Bar<'_>,
+    actions: &mut Vec<Action>,
+) {
+    let explained = gettext(
+        bar.locale,
+        match (bar.runs, all) {
+            (Runs::Selection, _) => "Run the selection",
+            (Runs::All, _) | (Runs::Statement, true) => "Run every statement",
+            (Runs::Statement, false) => "Run the statement at the cursor",
+        },
+    );
+    if bar.writing {
+        let waits = WRITING.say(bar.locale);
+        button
+            .disabled(&waits)
+            .show_at(ui, rect, bar.look, bar.palette);
+        return;
+    }
+    let response = button.show_at(ui, rect, bar.look, bar.palette);
+    if response.on_hover_text(explained).clicked() {
+        actions.push(Action::RunSql {
+            tab: bar.tab,
+            sql_tab: bar.id,
+            all,
+        });
+    }
+}
+
+/// macOS: Run and Run all, a divider and Format; at the right the
+/// Read-only or Read-write switch, then the Limit and Timeout menus.
+fn mac_toolbar(ui: &mut Ui, rect: Rect, bar: &Bar<'_>, actions: &mut Vec<Action>) {
+    let Bar {
+        locale,
+        look,
+        palette,
+        ..
+    } = *bar;
+    let center = rect.top() + (rect.height() - 1.0) / 2.0;
+    let (left, right) = (rect.left() + SIDE, rect.right() - SIDE);
+    let labels = [
+        gettext(locale, "Run"),
+        gettext(locale, "Run all"),
+        gettext(locale, "Format"),
+    ];
+    let (run_keys, all_keys) = run_keys(ui.ctx(), look);
+    let format_keys = format_keys(ui.ctx(), look);
+    // Run: 14 at its sides, a 12 pt arrow, 8 apart. Run all: 12 and 6.
+    // Format: 10, and no border.
+    let buttons = |keys: bool| {
+        let run = ButtonSpec::new(&labels[0])
+            .icon(Icon::Play)
+            .icon_size(12.0)
+            .primary()
+            .padding(14.0)
+            .gap(8.0);
+        let all = ButtonSpec::new(&labels[1]);
+        let format = ButtonSpec::new(&labels[2]).quiet().padding(10.0);
+        if keys {
+            [
+                run.shortcut(&run_keys),
+                all.shortcut(&all_keys),
+                format.shortcut(&format_keys),
+            ]
+        } else {
+            [run, all, format]
+        }
+    };
+    let note_width = switch_width(ui, bar);
+    // Everything 8 apart, and 16 between the two ends (8 at the tightest).
+    // What gives way as the room runs out: the buttons' keys (the help
+    // says them too), then the switch, then Format (its key formats too),
+    // and only then the menus' words, which alone say what "1,000" and
+    // "30 s" are; then the menus' chevrons, and last the menus (the run
+    // buttons stay).
+    let shapes = [(false, true), (true, true), (true, false)]
+        .map(|(short, chevron)| MenuShape { short, chevron });
+    // Each width is measured once.
+    let menu_sizes = shapes.map(|shape| menu_widths(ui, shape, bar));
+    let widths = [false, true].map(|keys| buttons(keys).map(|b| b.width(ui, look)));
+    let room = right - left;
+    // The divider before Format: a rule 20 tall with 4 at its sides.
+    let divider = 4.0 + 1.0 + 4.0;
+    let needs = |shape: usize, switch: bool, keys: bool, format: bool| {
+        let [run, all, format_width] = widths[usize::from(keys)];
+        let format = if format {
+            8.0 + divider + 8.0 + format_width
+        } else {
+            0.0
+        };
+        let switch = if switch { note_width + 8.0 } else { 0.0 };
+        let between = if shapes[shape].chevron { 16.0 } else { 8.0 };
+        run + 8.0 + all + format + between + switch + menu_sizes[shape].iter().sum::<f32>() + 8.0
+    };
+    let fit = [
+        (0, true, true, true),
+        (0, true, false, true),
+        (0, false, false, true),
+        (0, false, false, false),
+        (1, false, false, false),
+        (2, false, false, false),
+    ]
+    .into_iter()
+    .find(|(shape, switch, keys, format)| needs(*shape, *switch, *keys, *format) <= room);
+    let keys = fit.is_some_and(|(_, _, keys, _)| keys);
+    // Where each piece sits, then the pieces from left to right: the Tab
+    // key and screen readers meet them in the order they are made.
+    let [run, all, format] = buttons(keys);
+    let [run_width, all_width, format_width] = widths[usize::from(keys)];
+    let place = |x: f32, width: f32| Rect::from_min_size(pos2(x, center - 16.0), vec2(width, 32.0));
+    let run_place = place(left, run_width);
+    let all_place = place(run_place.right() + 8.0, all_width);
+    run_button(ui, run, run_place, false, bar, actions);
+    run_button(ui, all, all_place, true, bar, actions);
+    let Some((shape, switched, _, formats)) = fit else {
+        return;
+    };
+    if formats {
+        let rule = all_place.right() + 8.0 + divider / 2.0;
+        widgets::vline(
+            ui,
+            rule,
+            egui::Rangef::new(center - 10.0, center + 10.0),
+            palette.outline,
+        );
+        let format_place = place(all_place.right() + 8.0 + divider + 8.0, format_width);
+        let response = format.show_at(ui, format_place, look, palette);
+        if response
+            .on_hover_text(gettext(locale, "Format the SQL"))
+            .clicked()
+        {
+            actions.push(Action::FormatSql {
+                tab: bar.tab,
+                sql_tab: bar.id,
+            });
+        }
+    }
+    let [limit_width, timeout_width] = menu_sizes[shape];
+    let shape = shapes[shape];
+    let menu_rect = |right: f32, width: f32| {
+        Rect::from_min_size(pos2(right - width, center - 14.0), vec2(width, 28.0))
+    };
+    let timeout = menu_rect(right, timeout_width);
+    let limit = menu_rect(timeout.left() - 8.0, limit_width);
+    if switched {
+        let pill = Rect::from_min_size(
+            pos2(limit.left() - 8.0 - note_width, center - 13.0),
+            vec2(note_width, 26.0),
+        );
+        if let Some(mode) = switch(ui, pill, bar) {
+            actions.push(Action::SetSqlMode {
+                tab: bar.tab,
+                sql_tab: bar.id,
+                mode,
+            });
+        }
+    }
+    menus(ui, [limit, timeout], shape, bar, actions);
+}
+
+/// Omarchy: the tab's title, the `read-only` or `read-write` switch and a
+/// muted `· limit 1000 · timeout 30s`, each part of which opens its menu;
+/// at the right `run` and `run all` with their keys.
+fn terminal_toolbar(ui: &mut Ui, rect: Rect, bar: &Bar<'_>, actions: &mut Vec<Action>) {
+    let Bar {
+        locale,
+        look,
+        palette,
+        ..
+    } = *bar;
+    let center = rect.top() + (rect.height() - 1.0) / 2.0;
+    let (left, right) = (rect.left() + SIDE, rect.right() - SIDE);
+    let labels = [gettext(locale, "Run"), gettext(locale, "Run all")];
+    let texts = [look.label(&labels[0]), look.label(&labels[1])];
+    let (run_keys, all_keys) = run_keys(ui.ctx(), look);
+    // 10 at their sides inside a 1 pt border, and a space before the keys.
+    let buttons = |keys: bool| {
+        let run = ButtonSpec::new(&texts[0])
+            .label(&labels[0])
+            .icon(Icon::Play)
+            .icon_size(10.0)
+            .primary()
+            .role(TextRole::OGroup);
+        let all = ButtonSpec::new(&texts[1]).label(&labels[1]).hint();
+        let (run, all) = if keys {
+            (run.shortcut(&run_keys), all.shortcut(&all_keys))
+        } else {
+            (run, all)
+        };
+        [run, all].map(|button| button.shortcut_role(TextRole::OBody).padding(11.0).gap(8.0))
+    };
+    let role = TextRole::OBody;
+    let width = |role: TextRole, text: &str| role.width(ui.ctx(), look.faces, text);
+    let (title_width, note_width, dot) = (
+        width(TextRole::OTableTitle, bar.title),
+        switch_width(ui, bar),
+        width(role, " · "),
+    );
+    // Everything 14 apart. What gives way as the room runs out: the
+    // buttons' keys (the status line says them too), then the switch, then
+    // the title (the tab says it too), and only then the menus' words,
+    // which alone say what "1000" and "30s" are; last the menus (the
+    // buttons stay).
+    let shapes = [false, true].map(|short| MenuShape {
+        short,
+        chevron: false,
+    });
+    // Each width is measured once.
+    let menu_sizes = shapes.map(|shape| menu_widths(ui, shape, bar));
+    let run_widths = [false, true].map(|keys| buttons(keys).map(|b| b.width(ui, look)));
+    let room = right - left;
+    let needs = |shape: usize, keys: bool, note: bool, title: bool| {
+        let buttons: f32 = run_widths[usize::from(keys)].iter().sum();
+        let title = if title { title_width + 14.0 } else { 0.0 };
+        let note = if note { note_width + dot } else { 0.0 };
+        title + note + menu_sizes[shape].iter().sum::<f32>() + dot + 14.0 + buttons + 14.0
+    };
+    let fit = [
+        (0, true, true, true),
+        (0, false, true, true),
+        (0, false, false, true),
+        (0, false, false, false),
+        (1, false, false, false),
+    ]
+    .into_iter()
+    .find(|(shape, keys, note, title)| needs(*shape, *keys, *note, *title) <= room);
+    let keys = fit.is_some_and(|(_, keys, ..)| keys);
+    // The run buttons' places, from the right; they are made after the
+    // menus, so the Tab key and screen readers meet the bar from left to
+    // right.
+    let mut x = right;
+    let mut places = [Rect::NOTHING; 2];
+    for (place, width) in places.iter_mut().zip(run_widths[usize::from(keys)]).rev() {
+        *place = Rect::from_min_size(pos2(x - width, center - 13.0), vec2(width, 26.0));
+        x -= width + 14.0;
+    }
+    if let Some((shape, _, noted, title)) = fit {
+        let dot_text = || Text::one(look, role, " · ", palette.dim);
+        let mut x = left;
+        if title {
+            x += widgets::paint_label(
+                ui,
+                x,
+                center,
+                Text::one(look, TextRole::OTableTitle, bar.title, palette.text),
+            ) + 14.0;
+        }
+        let line = role.row_height(ui.ctx(), look.faces);
+        if noted {
+            let words = Rect::from_min_size(
+                pos2(x, center - line / 2.0 - 2.0),
+                vec2(note_width, line + 4.0),
+            );
+            if let Some(mode) = switch(ui, words, bar) {
+                actions.push(Action::SetSqlMode {
+                    tab: bar.tab,
+                    sql_tab: bar.id,
+                    mode,
+                });
+            }
+            x += note_width;
+            x += widgets::paint_text(ui, x, center, dot_text());
+        }
+        // The menus read as one line with the switch: their words, a dot
+        // apart.
+        let [limit_width, timeout_width] = menu_sizes[shape];
+        let shape = shapes[shape];
+        let menu_rect = |left: f32, width: f32| {
+            Rect::from_min_size(
+                pos2(left, center - line / 2.0 - 2.0),
+                vec2(width, line + 4.0),
+            )
+        };
+        let limit = menu_rect(x, limit_width);
+        let after = limit.right() + widgets::paint_text(ui, limit.right(), center, dot_text());
+        let timeout = menu_rect(after, timeout_width);
+        menus(ui, [limit, timeout], shape, bar, actions);
+    }
+    for ((button, place), all) in buttons(keys).into_iter().zip(places).zip([false, true]) {
+        run_button(ui, button, place, all, bar, actions);
+    }
+}
+
+/// The role a menu's button reads in.
+fn menu_role(look: &Look) -> TextRole {
+    TextRole::pick(look, TextRole::Secondary, TextRole::OBody)
+}
+
+/// The width of a menu's button reading `text`. macOS: a 1 pt border, 10
+/// of padding, the words and, with its chevron, 6 and the 10 pt chevron.
+/// The terminal: the words.
+fn menu_width(ui: &Ui, text: &str, chevron: bool, look: &Look) -> f32 {
+    let text = menu_role(look).width(ui.ctx(), look.faces, text);
+    if look.terminal {
+        text
+    } else {
+        let chevron = if chevron { 6.0 + 10.0 } else { 0.0 };
+        (1.0 + 10.0 + text + chevron + 10.0 + 1.0).ceil()
+    }
+}
+
+/// A menu's button in `rect`, and its choices while it is open (`choices`
+/// is asked for them only then). Returns the index of the choice picked
+/// this frame.
+fn menu(
+    ui: &mut Ui,
+    rect: Rect,
+    label: &MenuLabel,
+    shape: MenuShape,
+    (look, palette): (&Look, &Palette),
+    choices: impl FnOnce() -> Vec<menu::Choice>,
+) -> Option<usize> {
+    let response = ui.interact(rect, ui.id().with(("menu", &label.name)), Sense::click());
+    response.widget_info(|| {
+        let mut info = WidgetInfo::labeled(WidgetType::ComboBox, true, &label.name);
+        info.current_text_value = Some(label.value.clone());
+        info
+    });
+    let center = rect.center().y;
+    let role = menu_role(look);
+    let text = label.text(shape.short);
+    if look.terminal {
+        // Muted words that light up under the pointer, as the bar's other
+        // notes that answer a click.
+        let color = if response.hovered() || response.has_focus() {
+            palette.text
+        } else {
+            palette.dim
+        };
+        widgets::paint_text(ui, rect.left(), center, Text::one(look, role, text, color));
+    } else {
+        let corner = CornerRadius::same(look.radius);
+        let fill = if response.hovered() {
+            palette.panel
+        } else {
+            palette.window
+        };
+        ui.painter().rect_filled(rect, corner, fill);
+        ui.painter().rect_stroke(
+            rect,
+            corner,
+            Stroke::new(widgets::hairline(ui), palette.border),
+            StrokeKind::Inside,
+        );
+        widgets::paint_text(
+            ui,
+            rect.left() + 11.0,
+            center,
+            Text::one(look, role, text, palette.text),
+        );
+        if shape.chevron {
+            Icon::ChevronDown.image(palette.dim, 10.0).paint_at(
+                ui,
+                Rect::from_center_size(pos2(rect.right() - 16.0, center), vec2(10.0, 10.0)),
+            );
+        }
+    }
+    let radius = if look.terminal { 0 } else { look.radius };
+    crate::ui::focus::hint(
+        ui,
+        &response,
+        rect,
+        crate::ui::focus::Ring::Outer { radius },
+    );
+    // Where its button reads short, the menu says what it sets on hover.
+    let response = if shape.short {
+        response.on_hover_text(label.value.as_str())
+    } else {
+        response
+    };
+    menu::choices(&response, rect.width(), look, palette, choices)
+}
+
+/// Whether the last run ended and ran something. A run that failed as a
+/// whole ran nothing, and leaves no last run.
+fn ran(sql: &SqlTab) -> bool {
+    !sql.is_running()
+        && sql
+            .last_run()
+            .is_some_and(|run| !run.outcome.results.is_empty())
+}
+
+/// "5 rows · 14 ms" for the result that shows. With none to show, in a run
+/// sent to write, what its last statement changed: "12 rows affected ·
+/// 14 ms".
+fn run_summary(sql: &SqlTab, locale: Locale) -> Option<String> {
+    use native-sql-database-client-windows_db::StatementOutcome;
+    if !ran(sql) {
+        return None;
+    }
+    let counted = |count: u64, phrase: std::borrow::Cow<'static, str>, took| {
+        crate::i18n::fill(
+            &phrase,
+            &[
+                ("{n}", &crate::i18n::number(locale, count)),
+                ("{took}", &format::elapsed(locale, took)),
+            ],
+        )
+    };
+    if let Some((_, result)) = sql.shown() {
+        let StatementOutcome::Rows { rows, .. } = &result.outcome else {
+            return None;
+        };
+        let count = rows.len() as u64;
+        let phrase = ngettext(locale, "{n} row · {took}", "{n} rows · {took}", count);
+        return Some(counted(count, phrase, result.elapsed));
+    }
+    let run = sql.last_run()?;
+    let last = run.outcome.results.last()?;
+    match &last.outcome {
+        StatementOutcome::Done {
+            affected: Some(count),
+            ..
+        } if run.mode == native-sql-database-client-windows_db::ScriptMode::Write => {
+            let phrase = ngettext(
+                locale,
+                "{n} row affected · {took}",
+                "{n} rows affected · {took}",
+                *count,
+            );
+            Some(counted(*count, phrase, last.elapsed))
+        }
+        _ => None,
+    }
+}
+
+/// What became of the last run's transaction: "rolled back" for a run of
+/// a Read-only editor, "nothing to commit" for a run of reads in
+/// Read-write (sent read-only all the same), and for a run sent to write
+/// how it ended. Where the database could not undo everything, that is
+/// what is said, whatever the end; and a commit that failed after the
+/// database had committed part by itself reads as what it left, partly
+/// committed.
+fn end_words(run: &crate::model::SqlRun) -> Msgid {
+    use native-sql-database-client-windows_db::ScriptEnd;
+    if run.mode == native-sql-database-client-windows_db::ScriptMode::ReadOnly {
+        return match run.chosen {
+            RunMode::ReadOnly => msgid("rolled back"),
+            RunMode::ReadWrite => msgid("nothing to commit"),
+        };
+    }
+    if run.outcome.rollback_warning.is_some() {
+        return msgid("not fully rolled back");
+    }
+    match &run.outcome.end {
+        ScriptEnd::Committed => msgid("committed"),
+        ScriptEnd::RolledBack | ScriptEnd::Partly { committed: 0 } => msgid("rolled back"),
+        ScriptEnd::CommitFailed { committed: 0, .. } => msgid("commit failed"),
+        ScriptEnd::Partly { .. } | ScriptEnd::CommitFailed { .. } => msgid("partly committed"),
+    }
+}
+
+/// "Read-only · rolled back", "Read-write · committed", "Read-write ·
+/// nothing to commit": the footer's note of the last run, by the mode the
+/// switch showed when it was sent.
+fn end_note(sql: &SqlTab, locale: Locale) -> Option<String> {
+    let run = sql.last_run().filter(|_| ran(sql))?;
+    let chosen = match run.chosen {
+        RunMode::ReadOnly => msgid("Read-only"),
+        RunMode::ReadWrite => msgid("Read-write"),
+    };
+    Some(format!(
+        "{} · {}",
+        chosen.say(locale),
+        end_words(run).say(locale)
+    ))
+}
+
+/// The macOS and standard footer: the result's rows and time and what
+/// became of the transaction; at the right the cursor and the server.
+fn footer(
+    ui: &mut Ui,
+    paint: Paint,
+    tab: ConnTabId,
+    id: TabId,
+    workspace: &Workspace,
+    settings: &Settings,
+) {
+    let Paint {
+        locale,
+        palette,
+        look,
+    } = paint;
+    let Some(sql) = workspace.sql_tab(id) else {
+        return;
+    };
+    let (line, column) = sql.line_col();
+    let cursor = gettext(locale, "Ln {line}, Col {column}")
+        .replace("{line}", &line.to_string())
+        .replace("{column}", &column.to_string());
+    let summary = run_summary(sql, locale);
+    let note = end_note(sql, locale);
+    let version = workspace.server_version.value.clone();
+    // Vim's mode leads, where the editor has the keyboard.
+    let mode = vim_mode(ui.ctx(), &look, tab, workspace, settings)
+        .and_then(crate::vim::Mode::label)
+        .map(|label| label.say(locale).into_owned());
+    egui::Panel::bottom(Id::new(("sql-footer", tab.0, id.0)))
+        .exact_size(33.0)
+        .resizable(false)
+        .show_separator_line(false)
+        .frame(Frame::new().fill(palette.panel))
+        .show(ui, |ui| {
+            let rect = ui.max_rect();
+            widgets::hline(ui, rect.x_range(), rect.top() + 0.5, palette.outline);
+            let center = rect.top() + 1.0 + (rect.height() - 1.0) / 2.0;
+            // The status bar's grey, as a table's footer.
+            let status = palette.secondary.lerp_to_gamma(palette.dim, 0.5);
+            let role = widgets::secondary(&look);
+            let width = |text: &str| role.width(ui.ctx(), look.faces, text);
+            // 20 in from the ends, everything 16 apart. What gives way as
+            // the room runs out: the transaction, the server, the result.
+            let (left, right, gap) = (rect.left() + 20.0, rect.right() - 20.0, 16.0);
+            let pieces = |keep: usize| {
+                let start: Vec<&str> = [(&summary, 1), (&note, 3)]
+                    .into_iter()
+                    .filter(|(_, level)| keep >= *level)
+                    .filter_map(|(text, _)| text.as_deref())
+                    .collect();
+                (start, version.as_deref().filter(|_| keep >= 2))
+            };
+            let needs = |keep: usize| {
+                let (start, end) = pieces(keep);
+                start
+                    .into_iter()
+                    .chain(end)
+                    .chain(mode.as_deref())
+                    .map(|text| width(text) + gap)
+                    .sum::<f32>()
+                    + width(&cursor)
+            };
+            let keep = (0..=3)
+                .rev()
+                .find(|keep| needs(*keep) <= right - left)
+                .unwrap_or(0);
+            let (start, end) = pieces(keep);
+            let text = |text: &str| Text::one(&look, role, text, status);
+            // Left to right, as it reads: the right end's places first.
+            let mut x = right;
+            let mut places = Vec::new();
+            for piece in end.into_iter().chain([cursor.as_str()]) {
+                x -= width(piece);
+                places.push((piece, x));
+                x -= gap;
+            }
+            let mut x = left;
+            if let Some(mode) = &mode {
+                let text = Text::one(&look, role, mode, palette.accent);
+                x += widgets::paint_label(ui, x, center, text) + gap;
+            }
+            for piece in start {
+                x += widgets::paint_label(ui, x, center, text(piece)) + gap;
+            }
+            for (piece, x) in places.into_iter().rev() {
+                widgets::paint_label(ui, x, center, text(piece));
+            }
+        });
+}
+
+/// Vim's mode in the SQL editor in front of `workspace`, the connection
+/// tab `tab`, while it has the keyboard and the keybindings are vim's.
+pub fn vim_mode(
+    ctx: &egui::Context,
+    look: &Look,
+    tab: ConnTabId,
+    workspace: &Workspace,
+    settings: &Settings,
+) -> Option<crate::vim::Mode> {
+    let vim = settings.editor_keys_in(look.terminal) == crate::settings::EditorKeys::Vim;
+    let sql = workspace.active_sql_tab()?;
+    let editor = super::sql_text::editor_id(tab, sql.id);
+    (vim && ctx.memory(|memory| memory.has_focus(editor))).then_some(sql.vim.mode)
+}
+
+/// The right end of the terminal's status line on an editor: "ln 12:21 ·
+/// 5 rows · 14 ms · rolled back", or after a run sent to write "ln 3:1 ·
+/// 12 rows affected · 14 ms · committed". `None` where no editor is in
+/// front of `workspace`.
+pub fn status_summary(workspace: &Workspace, locale: Locale) -> Option<String> {
+    let sql = workspace.active_sql_tab()?;
+    let (line, column) = sql.line_col();
+    let mut parts = vec![
+        gettext(locale, "ln {line}:{column}")
+            .replace("{line}", &line.to_string())
+            .replace("{column}", &column.to_string()),
+    ];
+    parts.extend(run_summary(sql, locale));
+    if let Some(run) = sql.last_run().filter(|_| ran(sql)) {
+        parts.push(end_words(run).say(locale).into_owned());
+    }
+    Some(parts.join(" · "))
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::accesskit::Role;
+    use egui::{Key, Modifiers};
+
+    use super::*;
+    use crate::model::RunMode;
+    use crate::testing::{Harness, bounds, done_outcome, node, write_outcome};
+
+    /// A SQL editor on a connection that takes writes, drawn in `look`,
+    /// with `text` typed into it, opened as the connection has it
+    /// (`editor.run.new_tab = "connection"`): read-write.
+    fn editor(look: Look, text: &str) -> (Harness, ConnTabId, TabId) {
+        let mut harness = Harness::new();
+        harness.set_look(look);
+        harness.app.settings.new_tab = crate::settings::NewTab::Connection;
+        let tab = harness.connect_fake_as(false);
+        harness.press(Key::T, Modifiers::COMMAND);
+        harness.frame(vec![egui::Event::Paste(text.into())]);
+        harness.settle();
+        let id = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+        (harness, tab, id)
+    }
+
+    fn set_mode(harness: &mut Harness, tab: ConnTabId, id: TabId, mode: RunMode) {
+        harness.app.apply(Action::SetSqlMode {
+            tab,
+            sql_tab: id,
+            mode,
+        });
+    }
+
+    /// Whether the button `name` cannot be pressed, and what it says of
+    /// that.
+    fn button(harness: &mut Harness, name: &str) -> (bool, Option<String>) {
+        let tree = harness.settle();
+        let id = node(&tree, name, Role::Button).unwrap_or_else(|| panic!("no {name}"));
+        let (_, node) = tree.nodes.iter().find(|(node, _)| *node == id).unwrap();
+        (node.is_disabled(), node.description().map(str::to_owned))
+    }
+
+    /// A SQL editor on a connection that opens read-only, drawn in `look`.
+    fn read_only_editor(look: Look) -> (Harness, ConnTabId, TabId) {
+        let mut harness = Harness::new();
+        harness.set_look(look);
+        let tab = harness.connect_fake();
+        harness.press(Key::T, Modifiers::COMMAND);
+        let id = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+        (harness, tab, id)
+    }
+
+    fn mode_of(harness: &Harness, tab: ConnTabId, id: TabId) -> RunMode {
+        let workspace = harness.app.workspace(tab).unwrap();
+        workspace.run_mode(workspace.sql_tab(id).unwrap())
+    }
+
+    /// What the tab itself is set to, whatever its session lets it run as:
+    /// where no editor can write, that is what a switch must not change.
+    fn own_mode(harness: &Harness, tab: ConnTabId, id: TabId) -> RunMode {
+        let workspace = harness.app.workspace(tab).unwrap();
+        workspace.sql_tab(id).unwrap().mode
+    }
+
+    /// The switch's segment named `name`.
+    fn segment<'a>(tree: &'a egui::accesskit::TreeUpdate, name: &str) -> &'a egui::accesskit::Node {
+        let id = node(tree, name, Role::Button).unwrap_or_else(|| panic!("no {name}"));
+        let (_, segment) = tree.nodes.iter().find(|(node, _)| *node == id).unwrap();
+        segment
+    }
+
+    /// The segment the switch has chosen.
+    fn chosen(harness: &mut Harness) -> Vec<&'static str> {
+        let tree = harness.settle();
+        ["Read-only", "Read-write"]
+            .into_iter()
+            .filter(|name| segment(&tree, name).toggled() == Some(egui::accesskit::Toggled::True))
+            .collect()
+    }
+
+    /// The colour a segment's words are painted in, as `look` writes them.
+    fn segment_color(harness: &Harness, look: &Look, mode: RunMode) -> Option<egui::Color32> {
+        harness.painted_color(&look.label(mode_name(mode).english()))
+    }
+
+    #[test]
+    fn the_switch_shows_both_modes_and_a_click_sets_the_tabs() {
+        for look in Look::ALL {
+            // A tab of a writable connection opens in Read-write, and that
+            // segment reads in the warning colour.
+            let (mut harness, tab, id) = editor(look, "SELECT 1");
+            assert_eq!(chosen(&mut harness), ["Read-write"], "{}", look.name);
+            let warning = Some(harness.app.palette.warning);
+            assert_eq!(
+                segment_color(&harness, &look, RunMode::ReadWrite),
+                warning,
+                "{}",
+                look.name
+            );
+            harness.click("Read-only");
+            assert_eq!(
+                mode_of(&harness, tab, id),
+                RunMode::ReadOnly,
+                "{}",
+                look.name
+            );
+            assert_eq!(chosen(&mut harness), ["Read-only"], "{}", look.name);
+            // Neither segment is in the warning colour now.
+            for mode in MODES {
+                let color = segment_color(&harness, &look, mode);
+                assert!(color.is_some(), "{mode:?} in {}", look.name);
+                assert_ne!(color, warning, "{mode:?} in {}", look.name);
+            }
+            // Picking the mode in use changes nothing; the other one
+            // switches back.
+            harness.click("Read-only");
+            assert_eq!(mode_of(&harness, tab, id), RunMode::ReadOnly);
+            harness.click("Read-write");
+            assert_eq!(
+                mode_of(&harness, tab, id),
+                RunMode::ReadWrite,
+                "{}",
+                look.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_arrows_choose_in_the_switch_and_the_keyboard_follows() {
+        for look in Look::ALL {
+            let (mut harness, tab, id) = editor(look, "SELECT 1");
+            let focus = |harness: &mut Harness, name: &str| {
+                let tree = harness.settle();
+                let target = node(&tree, name, Role::Button).expect("the segment");
+                harness.frame(vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        target_tree: egui::accesskit::TreeId::ROOT,
+                        target_node: target,
+                        action: egui::accesskit::Action::Focus,
+                        data: None,
+                    },
+                )]);
+            };
+            focus(&mut harness, "Read-write");
+            harness.press(Key::ArrowLeft, Modifiers::NONE);
+            assert_eq!(
+                mode_of(&harness, tab, id),
+                RunMode::ReadOnly,
+                "{}",
+                look.name
+            );
+            // The keyboard is on the segment it chose: the next arrow
+            // goes back.
+            harness.press(Key::ArrowRight, Modifiers::NONE);
+            assert_eq!(
+                mode_of(&harness, tab, id),
+                RunMode::ReadWrite,
+                "{}",
+                look.name
+            );
+        }
+    }
+
+    #[test]
+    fn mod_shift_m_switches_the_mode_of_the_editor_on_screen() {
+        let chord = Modifiers::COMMAND | Modifiers::SHIFT;
+        // Omarchy has no chord for it: its prompt sets the mode.
+        let (mut harness, tab, id) = editor(Look::omarchy(), "SELECT 1");
+        let before = mode_of(&harness, tab, id);
+        harness.press(Key::M, chord);
+        assert_eq!(mode_of(&harness, tab, id), before);
+        for look in [Look::standard(), Look::macos()] {
+            let (mut harness, tab, id) = editor(look, "SELECT 1");
+            // With the keyboard in the editor, where it is while typing.
+            harness.press(Key::M, chord);
+            assert_eq!(
+                mode_of(&harness, tab, id),
+                RunMode::ReadOnly,
+                "{}",
+                look.name
+            );
+            // The editor did not take the key for a letter.
+            let text = &harness
+                .app
+                .workspace(tab)
+                .unwrap()
+                .sql_tab(id)
+                .unwrap()
+                .text;
+            assert_eq!(text, "SELECT 1", "{}", look.name);
+            harness.press(Key::M, chord);
+            assert_eq!(
+                mode_of(&harness, tab, id),
+                RunMode::ReadWrite,
+                "{}",
+                look.name
+            );
+        }
+        // The keymap has it for those looks, and none for Omarchy.
+        let keymap = crate::keymap::Keymap::default();
+        let key = |layout| keymap.label(layout, Command::ToggleSqlMode);
+        assert_eq!(key(crate::keymap::Layout::Mac), "⇧⌘M");
+        assert_eq!(key(crate::keymap::Layout::Windows), "Ctrl+Shift+M");
+        assert_eq!(key(crate::keymap::Layout::Omarchy), "");
+    }
+
+    #[test]
+    fn the_prompt_sets_a_sql_tabs_mode_with_ro_and_rw() {
+        use crate::ui::tests::type_key;
+        let (mut harness, tab, id) = editor(Look::omarchy(), "SELECT 1");
+        let line = |harness: &mut Harness, text: &str| {
+            type_key(harness, Key::Colon, ":");
+            harness.frame(vec![egui::Event::Text(text.into())]);
+            harness.settle();
+            harness.press(Key::Enter, Modifiers::NONE);
+        };
+        let refused = |harness: &Harness| {
+            let workspace = harness.app.workspace(tab).unwrap();
+            workspace.command_error.clone()
+        };
+        // In the text a colon is typed: the prompt is normal mode's.
+        type_key(&mut harness, Key::Colon, ":");
+        assert!(harness.app.workspace(tab).unwrap().command.is_none());
+        harness.press(Key::Backspace, Modifiers::NONE);
+        harness.press(Key::Escape, Modifiers::NONE);
+        // A tab of a connection that can write starts read-write.
+        assert_eq!(mode_of(&harness, tab, id), RunMode::ReadWrite);
+        line(&mut harness, "ro");
+        assert_eq!(mode_of(&harness, tab, id), RunMode::ReadOnly);
+        assert_eq!(refused(&harness), None);
+        line(&mut harness, "rw");
+        assert_eq!(mode_of(&harness, tab, id), RunMode::ReadWrite);
+        line(&mut harness, "ro");
+        // A table's lines are no commands of an editor's, and the lines
+        // of what is not built yet are claimed and do nothing. Vim's `:w`
+        // does nothing and says nothing.
+        for text in ["w", "e!", "diff", "commit", "rollback", "12"] {
+            line(&mut harness, text);
+            let said = (text != "w").then_some(text);
+            assert_eq!(refused(&harness).as_deref(), said);
+            assert_eq!(mode_of(&harness, tab, id), RunMode::ReadOnly, "{text}");
+        }
+    }
+
+    /// What a hover over the segment named `name` shows.
+    fn hovered(harness: &mut Harness, name: &str) -> Vec<String> {
+        let tree = harness.settle();
+        let at = bounds(&tree, name, Role::Button).expect("the segment");
+        crate::ui::tests::hover(harness, at.center())
+    }
+
+    /// Asserts that the Read-write segment cannot be picked and says
+    /// `reason`: to a screen reader, to the keyboard while it is on it,
+    /// and on hover.
+    fn read_write_is_off(harness: &mut Harness, reason: &str, look: &Look) {
+        let tree = harness.settle();
+        let off = node(&tree, "Read-write", Role::Button).expect("the segment");
+        let segment = segment(&tree, "Read-write");
+        assert!(segment.is_disabled(), "{}", look.name);
+        assert_eq!(segment.description(), Some(reason), "{}", look.name);
+        assert!(!harness.has(reason), "{}", look.name);
+        harness.frame(vec![egui::Event::AccessKitActionRequest(
+            egui::accesskit::ActionRequest {
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: off,
+                action: egui::accesskit::Action::Focus,
+                data: None,
+            },
+        )]);
+        assert!(harness.has(reason), "{}", look.name);
+        harness.press(Key::Escape, Modifiers::NONE);
+        let shown = hovered(harness, "Read-write");
+        assert!(shown.iter().any(|label| label == reason), "{}", look.name);
+    }
+
+    #[test]
+    fn on_a_read_only_connection_the_switch_is_off_and_the_key_does_nothing() {
+        for look in Look::ALL {
+            let (mut harness, tab, id) = read_only_editor(look);
+            assert_eq!(chosen(&mut harness), ["Read-only"], "{}", look.name);
+            read_write_is_off(&mut harness, "This connection opens read-only.", &look);
+            harness.click("Read-write");
+            harness.press(Key::M, Modifiers::COMMAND | Modifiers::SHIFT);
+            assert_eq!(
+                own_mode(&harness, tab, id),
+                RunMode::ReadOnly,
+                "{}",
+                look.name
+            );
+            // On hover the segment in use says why it is the only one.
+            let shown = hovered(&mut harness, "Read-only");
+            let tip = "Every query runs in a read-only transaction that is rolled back. This \
+                       connection opens read-only.";
+            assert!(shown.iter().any(|label| label == tip), "{}", look.name);
+        }
+    }
+
+    #[test]
+    fn a_segment_says_on_hover_what_its_mode_does() {
+        let tips = [
+            ("Read-only", "Runs are rolled back. Nothing is changed."),
+            (
+                "Read-write",
+                "A run that changes data is committed when every statement succeeds.",
+            ),
+        ];
+        for look in Look::ALL {
+            let (mut harness, tab, id) = editor(look, "SELECT 1");
+            // The chosen segment and the other one both say it.
+            for mode in MODES {
+                set_mode(&mut harness, tab, id, mode);
+                for (name, tip) in tips {
+                    let shown = hovered(&mut harness, name);
+                    assert!(
+                        shown.iter().any(|label| label == tip),
+                        "{name} in {mode:?} in {}",
+                        look.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn on_production_the_read_write_segment_is_shown_and_cannot_be_picked() {
+        for look in Look::ALL {
+            let (mut harness, tab, id) = editor(look, "SELECT 1");
+            // The tab an editor opened on production is: in Read-only.
+            set_mode(&mut harness, tab, id, RunMode::ReadOnly);
+            harness.app.workspace_mut(tab).unwrap().environment =
+                crate::env::Environment::Production;
+            read_write_is_off(&mut harness, UNCONFIRMED.english(), &look);
+            harness.click("Read-write");
+            assert_eq!(
+                own_mode(&harness, tab, id),
+                RunMode::ReadOnly,
+                "{}",
+                look.name
+            );
+            harness.press(Key::M, Modifiers::COMMAND | Modifiers::SHIFT);
+            assert_eq!(
+                own_mode(&harness, tab, id),
+                RunMode::ReadOnly,
+                "{}",
+                look.name
+            );
+            // The segment in use says why on hover.
+            let shown = hovered(&mut harness, "Read-only");
+            let tip = format!(
+                "Runs are rolled back. Nothing is changed. {}",
+                UNCONFIRMED.english()
+            );
+            assert!(shown.contains(&tip), "{}", look.name);
+        }
+    }
+
+    #[test]
+    fn run_and_run_all_wait_for_a_read_write_run_in_flight() {
+        for look in Look::ALL {
+            let (mut harness, tab, id) = editor(look, "DELETE FROM users WHERE id = 1");
+            set_mode(&mut harness, tab, id, RunMode::ReadWrite);
+            for name in ["Run", "Run all"] {
+                assert!(!button(&mut harness, name).0, "{name} in {}", look.name);
+            }
+            harness.press(Key::Enter, Modifiers::COMMAND);
+            let sent = harness.app.backend.sent.len();
+            for name in ["Run", "Run all"] {
+                assert_eq!(
+                    button(&mut harness, name),
+                    (true, Some(WRITING.english().to_owned())),
+                    "{name} in {}",
+                    look.name
+                );
+                // Nor does a press of it reach the run.
+                harness.click(name);
+            }
+            harness.press(Key::Enter, Modifiers::COMMAND | Modifiers::SHIFT);
+            assert_eq!(harness.app.backend.sent.len(), sent, "{}", look.name);
+            // The way to stop it stays.
+            assert!(harness.has("Cancel query"), "{}", look.name);
+            let done = vec![done_outcome(Some(1))];
+            let committed = write_outcome(done, native-sql-database-client-windows_db::ScriptEnd::Committed);
+            harness.answer_sql(Ok(committed), None);
+            for name in ["Run", "Run all"] {
+                assert!(!button(&mut harness, name).0, "{name} in {}", look.name);
+            }
+        }
+    }
+
+    #[test]
+    fn the_footer_says_how_a_read_write_run_ended() {
+        use native-sql-database-client-windows_db::{Error, ScriptEnd};
+        let failed = |committed| ScriptEnd::CommitFailed {
+            error: Error::query("a deferred constraint"),
+            committed,
+        };
+        let warned = Some("could not be rolled back".to_owned());
+        for (end, warning, words) in [
+            (ScriptEnd::Committed, None, "committed"),
+            (ScriptEnd::RolledBack, None, "rolled back"),
+            (ScriptEnd::Partly { committed: 1 }, None, "partly committed"),
+            (failed(0), None, "commit failed"),
+            // Part of it is written all the same: said as what it left.
+            (failed(1), None, "partly committed"),
+            (
+                ScriptEnd::RolledBack,
+                warned.clone(),
+                "not fully rolled back",
+            ),
+            (
+                ScriptEnd::Partly { committed: 1 },
+                warned,
+                "not fully rolled back",
+            ),
+        ] {
+            for look in Look::ALL {
+                let script = "CREATE TABLE notes (n);\nUPDATE notes SET n = 1 WHERE n = 0";
+                let (mut harness, tab, id) = editor(look, script);
+                set_mode(&mut harness, tab, id, RunMode::ReadWrite);
+                harness.press(Key::Enter, Modifiers::COMMAND | Modifiers::SHIFT);
+                // Nothing is said of a run that is still going.
+                assert!(!harness.has("Read-write · committed"));
+                let mut outcome = write_outcome(
+                    vec![done_outcome(None), done_outcome(Some(12))],
+                    end.clone(),
+                );
+                outcome.rollback_warning = warning.clone();
+                harness.answer_sql(Ok(outcome), None);
+                let context = format!("{words} in {}", look.name);
+                if look.terminal {
+                    // The terminal's status line, which has no footer.
+                    let workspace = harness.app.workspace(tab).unwrap();
+                    let status =
+                        status_summary(workspace, harness.app.locale).expect("an editor shows");
+                    let (_, said) = status.split_once(" · ").expect("after the cursor");
+                    assert_eq!(
+                        said,
+                        format!("12 rows affected · 14 ms · {words}"),
+                        "{context}"
+                    );
+                } else {
+                    assert!(harness.has("12 rows affected · 14 ms"), "{context}");
+                    let note = format!("Read-write · {words}");
+                    assert!(harness.has(&note), "{note} in {}", look.name);
+                    assert!(!harness.has("Read-only · rolled back"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_run_of_reads_in_a_read_write_tab_has_nothing_to_commit() {
+        for look in Look::ALL {
+            let (mut harness, tab, id) = editor(look, "SELECT 1");
+            set_mode(&mut harness, tab, id, RunMode::ReadWrite);
+            harness.press(Key::Enter, Modifiers::COMMAND);
+            // Sent read-only all the same.
+            let sql = harness.app.workspace(tab).unwrap().sql_tab(id).unwrap();
+            assert!(!sql.is_writing(), "{}", look.name);
+            let rows = crate::testing::script_outcome(vec![crate::testing::rows_outcome(3)]);
+            harness.answer_sql(Ok(rows), None);
+            let said = |harness: &mut Harness| {
+                if look.terminal {
+                    let workspace = harness.app.workspace(tab).unwrap();
+                    let status = status_summary(workspace, harness.app.locale);
+                    status
+                        .expect("an editor shows")
+                        .ends_with("3 rows · 14 ms · nothing to commit")
+                } else {
+                    harness.has("3 rows · 14 ms") && harness.has("Read-write · nothing to commit")
+                }
+            };
+            assert!(said(&mut harness), "{}", look.name);
+            assert!(!harness.has("Read-only · rolled back"), "{}", look.name);
+            // The note is the run's: switching the mode afterwards does
+            // not rewrite it.
+            set_mode(&mut harness, tab, id, RunMode::ReadOnly);
+            harness.settle();
+            assert!(said(&mut harness), "{}", look.name);
+        }
+        // In a Read-only tab the same run is rolled back.
+        let (mut harness, tab, id) = editor(Look::standard(), "SELECT 1");
+        set_mode(&mut harness, tab, id, RunMode::ReadOnly);
+        harness.press(Key::Enter, Modifiers::COMMAND);
+        let rows = crate::testing::script_outcome(vec![crate::testing::rows_outcome(3)]);
+        harness.answer_sql(Ok(rows), None);
+        assert!(harness.has("Read-only · rolled back"));
+        assert!(!harness.has("Read-write · nothing to commit"));
+        // A statement that counted rows in a read-only run is no change
+        // that stayed: the footer does not count it.
+        let (mut harness, tab, id) = editor(Look::standard(), "UPDATE notes SET n = 1");
+        set_mode(&mut harness, tab, id, RunMode::ReadOnly);
+        harness.press(Key::Enter, Modifiers::COMMAND);
+        let counted = crate::testing::script_outcome(vec![done_outcome(Some(12))]);
+        harness.answer_sql(Ok(counted), None);
+        assert!(!harness.has("12 rows affected · 14 ms"));
+        assert!(harness.has("Read-only · rolled back"));
+    }
+
+    #[test]
+    fn run_stays_while_a_read_only_run_is_in_flight() {
+        let (mut harness, _, _) = editor(Look::standard(), "SELECT 1");
+        harness.press(Key::Enter, Modifiers::COMMAND);
+        for name in ["Run", "Run all"] {
+            assert!(!button(&mut harness, name).0, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_editor_takes_its_share_of_the_room() {
+        assert_eq!(editor_height(0.45, 600.0), 270.0);
+        assert_eq!(editor_height(0.5, 401.0), 201.0);
+        // The same share of more room is more of it.
+        assert_eq!(editor_height(0.45, 800.0), 360.0);
+    }
+
+    #[test]
+    fn both_panes_keep_their_least_height() {
+        assert_eq!(editor_height(0.0, 600.0), MIN_PANE);
+        assert_eq!(editor_height(1.0, 600.0), 600.0 - MIN_PANE);
+        assert_eq!(editor_height(0.05, 600.0), MIN_PANE);
+        // Room for no more than the two least heights: they take them.
+        assert_eq!(editor_height(0.9, 160.0), MIN_PANE);
+        // Less than that: the panes share what there is.
+        assert_eq!(editor_height(0.9, 100.0), 50.0);
+        assert_eq!(editor_height(0.1, 100.0), 50.0);
+        assert_eq!(editor_height(0.45, 0.0), 0.0);
+        assert_eq!(editor_height(0.45, -9.0), 0.0);
+    }
+
+    #[test]
+    fn a_dragged_band_gives_a_share_that_keeps_the_least_heights() {
+        assert_eq!(split_at(300.0, 600.0), Some(0.5));
+        assert_eq!(split_at(-50.0, 600.0), Some(MIN_PANE / 600.0));
+        assert_eq!(split_at(5_000.0, 600.0), Some((600.0 - MIN_PANE) / 600.0));
+        assert_eq!(split_at(10.0, 0.0), None);
+        // The share a drag gives puts the band where the drag did.
+        for height in [80.0, 137.0, 300.0, 520.0] {
+            let split = split_at(height, 600.0).unwrap();
+            assert_eq!(editor_height(split, 600.0), height);
+        }
+    }
+
+    #[test]
+    fn a_time_is_its_minutes_and_its_seconds() {
+        let locale = Locale::default();
+        for (secs, standard, terminal) in [
+            (5, "5 s", "5s"),
+            (45, "45 s", "45s"),
+            (60, "1 min", "1m"),
+            (90, "1 min 30 s", "1m 30s"),
+            (300, "5 min", "5m"),
+            (3_600, "60 min", "60m"),
+        ] {
+            assert_eq!(time_words(secs, false, locale), standard);
+            assert_eq!(time_words(secs, true, locale), terminal);
+        }
+    }
+}

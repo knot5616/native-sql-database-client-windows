@@ -1,0 +1,135 @@
+//! What the adapter of every database provides.
+
+use crate::agent::{Catalog, ColumnName, Limits, Read, Sources};
+use crate::{
+    CancelHandle, ChangeSet, Ddl, Lookup, LookupPage, ObjectInfo, ObjectRef, Result, RowPage,
+    RowQuery, ScriptMode, ScriptOutcome, StopFlag, Structure, WriteOutcome,
+};
+
+/// An open session with one kind of database. [`crate::Connection`] holds
+/// one and forwards to it, and says there what each of these does.
+///
+/// No method has a default but `list_tree` and `open`. An adapter answers
+/// every other one, if only to say that it has nothing to list: a default
+/// would answer for a new database without anyone choosing it. The
+/// defaults of those two are the reads each stands for, one after the
+/// other, which is right for every database and only slower than one that
+/// sends them together.
+pub(crate) trait Adapter {
+    fn is_encrypted(&self) -> bool;
+
+    fn cancel_handle(&self) -> CancelHandle;
+
+    async fn server_version(&self) -> Result<String>;
+
+    async fn session_zone(&self) -> Result<Option<String>>;
+
+    async fn list_databases(&self) -> Result<Vec<String>>;
+
+    async fn list_schemas(&self) -> Result<Vec<String>>;
+
+    async fn list_objects(&self, schema: &str) -> Result<Vec<ObjectInfo>>;
+
+    /// See [`crate::Connection::list_tree`]. The schemas are listed first
+    /// and `schema`'s objects after them, apart: the objects are listed
+    /// even when the schemas failed. An adapter that sends both in one
+    /// message where a refusal stops the rest (MySQL's) says so.
+    async fn list_tree(&self, schema: &str) -> (Result<Vec<String>>, Result<Vec<ObjectInfo>>) {
+        let schemas = self.list_schemas().await;
+        let objects = self.list_objects(schema).await;
+        (schemas, objects)
+    }
+
+    async fn describe(&self, object: &ObjectRef) -> Result<Structure>;
+
+    async fn ddl(&self, object: &ObjectRef) -> Result<Ddl>;
+
+    async fn fetch_rows(&self, query: &RowQuery) -> Result<RowPage>;
+
+    /// See [`crate::Connection::open`]. The structure is read first and the
+    /// page after it, the page read even when the structure failed, unless
+    /// `page_stop` says it was cancelled meanwhile.
+    async fn open(
+        &self,
+        object: &ObjectRef,
+        query: &RowQuery,
+        page_stop: &StopFlag,
+    ) -> (Result<Structure>, Result<RowPage>) {
+        let structure = self.describe(object).await;
+        let page = page_unless_stopped(self, query, page_stop).await;
+        (structure, page)
+    }
+
+    async fn count_rows(&self, query: &RowQuery) -> Result<u64>;
+
+    /// See [`crate::Connection::export_statement`].
+    async fn export_statement(&self, query: &RowQuery, columns: &[String]) -> Result<String>;
+
+    /// See [`crate::Connection::stream_rows`]; `batch` is at least 1.
+    async fn stream_rows(
+        &self,
+        query: &RowQuery,
+        columns: &[String],
+        batch: usize,
+        to: &tokio::sync::mpsc::Sender<crate::Streamed>,
+        stop: &StopFlag,
+    ) -> Result<u64>;
+
+    /// See [`crate::Connection::stream_statement`]: `text` is one statement
+    /// that reads, with no `;` after it; `batch` is at least 1.
+    async fn stream_statement(
+        &self,
+        text: &str,
+        batch: usize,
+        to: &tokio::sync::mpsc::Sender<crate::Streamed>,
+        stop: &StopFlag,
+    ) -> Result<u64>;
+
+    async fn lookup(&self, lookup: &Lookup) -> Result<LookupPage>;
+
+    /// `texts` are statements [`crate::sql::refusal`] has let through.
+    async fn run_script(
+        &self,
+        texts: Vec<String>,
+        limit: u32,
+        mode: ScriptMode,
+        stop: &StopFlag,
+    ) -> Result<ScriptOutcome>;
+
+    /// `read` has passed [`crate::agent::check_read`] for this database's
+    /// dialect. The outcome is a read-only script's of one statement, or
+    /// [`crate::Error::Agent`] where it reads what `sources` hide, or a
+    /// column they mask otherwise than as it is; with it, whether each
+    /// of its result columns is a masked column's, as the database says
+    /// where each comes from (none where nothing is masked).
+    async fn run_read(
+        &self,
+        read: &Read,
+        limits: Limits,
+        sources: &Sources,
+        stop: &StopFlag,
+    ) -> Result<(ScriptOutcome, Vec<bool>)>;
+
+    /// What the database's catalog says for what an agent's connection
+    /// hides and masks: its relations, what each reads, the users'
+    /// functions, and the columns of the tables `masked` names.
+    async fn agents_catalog(&self, masked: &[ColumnName]) -> Result<Catalog>;
+
+    /// `changes` have passed their own check, and the session may write.
+    async fn write(&self, changes: &ChangeSet, stop: &StopFlag) -> Result<WriteOutcome>;
+}
+
+/// The page of an open, read on its own after its structure: answered as
+/// cancelled, and never sent, when `page_stop` says a cancel of it came
+/// while the structure was read. A queued page cancelled that way would
+/// have been skipped.
+pub(crate) async fn page_unless_stopped<A: Adapter + ?Sized>(
+    adapter: &A,
+    query: &RowQuery,
+    page_stop: &StopFlag,
+) -> Result<RowPage> {
+    if page_stop.is_stopped() {
+        return Err(crate::Error::Cancelled);
+    }
+    adapter.fetch_rows(query).await
+}

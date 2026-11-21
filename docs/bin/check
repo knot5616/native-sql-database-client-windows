@@ -1,0 +1,39 @@
+#!/bin/sh
+# Builds the website as the Docs workflow publishes it, into docs/_site, and
+# checks what was built. Run it before pushing a change to the site.
+set -eu
+cd "$(dirname "$0")/.."
+
+# html-proofer reads pages in Ruby's default encoding. In an ASCII locale it
+# fails to read every page and still reports success.
+export RUBYOPT="-EUTF-8"
+export JEKYLL_ENV=production
+
+bundle exec jekyll build --strict_front_matter --destination _site
+
+# docs/ also holds the project's specs and plans, and this script. They are
+# not the website.
+for stray in superpowers bin; do
+  if [ -e "_site/$stray" ]; then
+    echo "check: docs/$stray was published; see exclude in _config.yml" >&2
+    exit 1
+  fi
+done
+
+# Every page loads Simple Analytics once (_includes/jekyll_vitepress), and
+# counts a visit without JavaScript once. The pages are parsed, so a tag
+# left in an HTML comment does not count.
+bundle exec ruby -rnokogiri -e '
+  script = %q(script[src="https://scripts.simpleanalyticscdn.com/latest.js"])
+  image = %q(noscript img[src="https://queue.simpleanalyticscdn.com/noscript.gif"])
+  Dir["_site/**/*.html"].sort.each do |page|
+    html = Nokogiri::HTML(File.read(page))
+    { script => "head", image => "body" }.each do |tag, part|
+      next if html.css(tag).size == 1 && html.css("#{part} #{tag}").size == 1
+      abort "check: #{page} does not have #{tag} in its #{part} exactly once"
+    end
+  end
+'
+
+# The site is served under /native-sql-database-client-windows (baseurl in _config.yml).
+bundle exec htmlproofer _site --disable-external --swap-urls '^/native-sql-database-client-windows:'

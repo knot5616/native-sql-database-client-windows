@@ -1,0 +1,192 @@
+[workspace]
+members = [".", "crates/native-sql-database-client-windows-appkit", "crates/native-sql-database-client-windows-core", "crates/native-sql-database-client-windows-db", "crates/native-sql-database-client-windows-mcp", "crates/native-sql-database-client-windows-menubar", "crates/native-sql-database-client-windows-sqlite-ffi"]
+resolver = "3"
+
+[workspace.package]
+# The app's version, which every release bumps (AGENTS.md, Releasing).
+# Each package whose `CARGO_PKG_VERSION` is the app's takes it from here,
+# so they cannot disagree.
+version = "0.7.0"
+edition = "2024"
+rust-version = "1.98"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+
+[package]
+name = "native-sql-database-client-windows"
+version.workspace = true
+description = "A native database client for PostgreSQL, MySQL, SQLite and BigQuery"
+license = "MIT"
+repository = "https://github.com/igor-alexandrov/native-sql-database-client-windows"
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+default-run = "native-sql-database-client-windows"
+
+[lints]
+workspace = true
+
+[lib]
+name = "native-sql-database-client-windows"
+path = "src/lib.rs"
+
+[[bin]]
+name = "native-sql-database-client-windows"
+path = "src/main.rs"
+
+[dependencies]
+# Errors at the binary edge (startup, eframe) where callers only report them.
+anyhow = "1"
+# Command-line flags: --verbose and the demo/screenshot flags.
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+# The whole UI. glow keeps the binary and dependency tree small; a 2D table
+# browser does not need wgpu. AccessKit exposes controls to screen readers and
+# to the headless tests. `links` opens the About dialog's link to the source
+# in the browser, through webbrowser: the one crate it adds, since its own
+# (url, log, objc2) are in the tree already.
+eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "glow", "links", "persistence", "wayland", "x11"] }
+egui = "0.36"
+# SVG loading for the Lucide icons.
+egui_extras = { version = "0.36", features = ["svg"] }
+# Writes --demo-shot screenshots as PNG.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# `--features shots`: render test frames to PNG through wgpu, for visual
+# review (tests only; never in release builds).
+egui_kittest = { version = "0.36", optional = true, default-features = false, features = ["wgpu"] }
+# Shared foundation with spotifast (crmne/fastframe). Every crate comes from
+# the same tag; move them together.
+fastframe-text = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
+fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
+fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
+# Palettes, presets, and following the Omarchy theme live.
+fastframe-theme = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
+# The gettext calls the views make (`crate::i18n`, native-sql-database-client-windows-core's).
+fastframe-i18n = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
+# Log file for bug reports and a panic log without payloads.
+fastframe-log = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
+# Self-update from GitHub releases (native-sql-database-client-windows-core's `update`): the
+# entrypoint runs the helper that installs an update.
+fastframe-update = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
+# The app beneath its interface: its state and edits, the backend, the
+# settings, the keymap and the theme's data (src/lib.rs re-exports each of
+# its modules). The crate boundary keeps it off the interface.
+native-sql-database-client-windows-core = { path = "crates/native-sql-database-client-windows-core" }
+# The database layer (no UI dependencies).
+native-sql-database-client-windows-db = { path = "crates/native-sql-database-client-windows-db" }
+# The MCP server agents reach the saved connections through. The backend
+# runs it, and is its gateway to the databases (native-sql-database-client-windows-core's
+# `backend::agents`); `native-sql-database-client-windows mcp` and the Agents views name its types.
+native-sql-database-client-windows-mcp = { path = "crates/native-sql-database-client-windows-mcp" }
+# The menu bar on macOS and Windows, built with muda from `src/menu.rs`'s
+# model. Empty elsewhere.
+native-sql-database-client-windows-menubar = { path = "crates/native-sql-database-client-windows-menubar" }
+# The window the menu bar attaches to (`src/menu/bar.rs`), which eframe's
+# creation context hands out; eframe already builds this version.
+raw-window-handle = "0.6"
+# The native dialog a failed start is shown in (src/entrypoint.rs).
+rfd = "0.17"
+# --demo runs in a private, self-removing directory.
+tempfile = "3"
+# The person's clock and time zone, for the times of agents' calls, and the
+# zone database a `timestamptz` value is shown in. The version and the
+# features env_logger already brings in: nothing new is built.
+jiff = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The unified title bar the tabs share with the window buttons.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSGeometry"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSView", "NSWindow", "NSToolbar", "NSControl", "NSButton", "objc2-core-foundation"] }
+# Quit (Cmd+Q, the app menu, the Dock) reaches the app as a close request for
+# its window, which a tab with pending changes holds back to ask first
+# (`App::hold_close`); without the feature AppKit ends the process and
+# nothing is asked. The crate eframe already builds, from the fork patched
+# in below and at the version it resolves to: the feature adds no crate.
+winit = { version = "0.30.13", default-features = false, features = ["macos-quit-as-close"] }
+
+[dev-dependencies]
+# The test hooks and the data fixtures the interface's tests stand on.
+native-sql-database-client-windows-core = { path = "crates/native-sql-database-client-windows-core", features = ["testing"] }
+# The promo's runtime, which serves its scenes to the recorder
+# (src/promo/). The core builds every feature it needs already.
+tokio = { version = "1", features = ["rt"] }
+# Reads a promo scenario (src/promo/scenario.rs). The version and the
+# features the core builds.
+toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
+# Reads the bundled fonts' metrics, to hold the ones typography/fonts.rs
+# writes down. The version and the features the core builds.
+skrifa = { version = "0.44", default-features = false, features = ["std"] }
+# Checks that what packaging/sign-checksums.sh signs with OpenSSL verifies
+# under ring, as fastframe-update verifies it (tests/update_release.rs).
+# Already in the tree through rustls.
+ring = "0.17"
+
+# A target-specific build dependency is chosen by the host, so only a build
+# on Windows compiles this; Linux and macOS builds never see it.
+[target.'cfg(windows)'.build-dependencies]
+# Embeds the icon and the version details into native-sql-database-client-windows.exe (build.rs), for
+# Explorer, shortcuts and the Apps list. It writes the .rc file and runs the
+# Windows SDK's rc.exe, which it finds through the registry. With default
+# features off (no [package.metadata] reading through toml) it adds one
+# crate: its only dependency, version_check, is already in the tree.
+# embed-resource does the same through cc, toml, vswhom and winreg, and wants
+# a hand-written .rc file.
+winresource = { version = "0.1.31", default-features = false }
+
+[features]
+shots = ["dep:egui_kittest"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# A release build as CI's relay step on Windows needs it: no debug
+# assertions, so the program is the GUI program a person installs
+# (`src/main.rs`). Its tests need nothing of the release's optimization,
+# which took eight of the job's minutes.
+[profile.release-check]
+inherits = "release"
+opt-level = 1
+lto = "off"
+codegen-units = 256
+
+# Immediate-mode layout is too slow at opt-level 0 to try the app in
+# development. Dependencies are optimized; the app crate stays incremental.
+[profile.dev.package."*"]
+opt-level = 2
+
+[patch.crates-io]
+# crmne/egui apps-0.36.2, the revision fastframe's getting-started guide
+# names, shared with spotifast: bidi shaping, Wayland frame-callback pacing,
+# and the clipboard through winit's data device on Wayland, on egui 0.36.2
+# (which carries the busy-loop fix itself). Every egui crate from one
+# revision.
+ecolor = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
+eframe = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
+egui = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
+egui-winit = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
+egui_extras = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
+egui_glow = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
+egui-wgpu = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
+egui_kittest = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
+emath = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
+epaint = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
+epaint_default_fonts = { git = "https://github.com/crmne/egui", rev = "6ce633ba5f7f64d19ef6d204f9377da560bb546b" }
+# crmne/winit apps-0.30, used by the eframe fork above. It moves with egui:
+# winit makes one wl_data_device per seat (for file drops), and egui-winit
+# reads and writes the clipboard through it rather than through
+# smithay-clipboard's own. Hyprland sends the selection only to a client's
+# first data device, so with two of them paste never worked there (#115).
+# The branch's tip: two macOS fixes past ed7caa90, the revision the egui
+# fork and fastframe's guide name, which this one builds on.
+winit = { git = "https://github.com/crmne/winit", rev = "0bed9dc0a7db02590a279fb8bac795fa39ee6948" }

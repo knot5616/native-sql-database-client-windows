@@ -1,0 +1,1891 @@
+//! The body of a picker tab: the saved connections, grouped, with search,
+//! New connection, and each connection's actions.
+
+use std::collections::HashMap;
+
+use egui::{CornerRadius, Rect, Sense, Stroke, StrokeKind, WidgetInfo, WidgetType, pos2, vec2};
+
+use crate::app::App;
+use crate::connections::{ConnectionId, SavedConnection, SavedConnections};
+use crate::i18n::{Msgid, fill, gettext, msgid, pmsgid};
+use crate::keymap::Command;
+use crate::model::{Action, ConnTabContent, PickerState};
+use crate::style::Icon;
+use crate::theme::{Look, Palette};
+use crate::typography::{Text, TextRole};
+use crate::ui::menu;
+use crate::ui::states;
+use crate::ui::widgets::{self, ButtonSpec};
+use crate::update::release::Os;
+
+/// The header's height, per look (its rule below included).
+fn header_height(look: &Look) -> f32 {
+    if look.terminal { 41.0 } else { 65.0 }
+}
+
+/// The line the header's contents centre on, below its top (over the rule).
+pub fn header_line(look: &Look) -> f32 {
+    (header_height(look) - 1.0) / 2.0
+}
+
+/// The terminal look's filter line under the header (rule included).
+const FILTER_LINE: f32 = 37.0;
+
+/// A connection row's height: macOS 64 and its rule, terminal 52.
+fn row_height(look: &Look) -> f32 {
+    if look.terminal { 52.0 } else { 65.0 }
+}
+
+/// The footer's height, per look (its rule above included).
+fn footer_height(look: &Look) -> f32 {
+    if look.terminal { 31.0 } else { 37.0 }
+}
+
+/// Space at the sides: macOS 24, terminal 14 (the footer 12).
+fn side(look: &Look) -> f32 {
+    if look.terminal { 14.0 } else { 24.0 }
+}
+
+/// How far below its galley's top a text's baseline sits.
+fn baseline(laid: &crate::typography::Laid) -> f32 {
+    laid.galley
+        .rows
+        .first()
+        .and_then(|row| row.glyphs.first())
+        .map_or(laid.height() * 0.8, |glyph| glyph.pos.y)
+}
+
+/// Connections under one heading: those sharing a name, then the local
+/// and the remote rest.
+pub struct Group<'a> {
+    pub title: String,
+    pub connections: Vec<&'a SavedConnection>,
+}
+
+/// `connections` in groups: a name two or more share heads a group of its
+/// own; the others go under Local or Remote by where they connect.
+pub fn groups<'a>(connections: &[&'a SavedConnection]) -> Vec<Group<'a>> {
+    let mut named: Vec<Group<'a>> = Vec::new();
+    let mut local = Vec::new();
+    let mut remote = Vec::new();
+    for connection in connections {
+        let shared = connections
+            .iter()
+            .filter(|other| other.name == connection.name)
+            .count()
+            > 1;
+        if shared {
+            match named
+                .iter_mut()
+                .find(|group| group.title == connection.name)
+            {
+                Some(group) => group.connections.push(connection),
+                None => named.push(Group {
+                    title: connection.name.clone(),
+                    connections: vec![connection],
+                }),
+            }
+        } else if is_local(connection) {
+            local.push(*connection);
+        } else {
+            remote.push(*connection);
+        }
+    }
+    named.sort_by_key(|group| group.title.to_lowercase());
+    for (title, connections) in [("Local", local), ("Remote", remote)] {
+        if !connections.is_empty() {
+            named.push(Group {
+                title: title.into(),
+                connections,
+            });
+        }
+    }
+    named
+}
+
+/// Whether a connection stays on this machine: a file, or a local host
+/// without a tunnel.
+fn is_local(connection: &SavedConnection) -> bool {
+    use native-sql-database-client-windows_db::Driver;
+    let spec = &connection.spec;
+    match spec.driver {
+        Driver::Sqlite | Driver::Files => true,
+        Driver::Postgres | Driver::MySql => {
+            spec.ssh.is_none() && crate::model::is_local_host(&spec.host)
+        }
+        Driver::BigQuery => false,
+    }
+}
+
+/// The connections the picker lists, in its order: grouped and filtered by
+/// the search. Keys move through this list.
+pub fn visible(connections: &SavedConnections, search: &str) -> Vec<ConnectionId> {
+    let found = connections.search(search);
+    groups(&found)
+        .into_iter()
+        .flat_map(|group| group.connections.into_iter().map(|c| c.id.clone()))
+        .collect()
+}
+
+/// How a connection's TLS reads in the list, and whether it is fine.
+fn tls_label(connection: &SavedConnection) -> (String, Option<bool>) {
+    use native-sql-database-client-windows_db::{Driver, TlsMode};
+    if is_local(connection) {
+        return ("Local".into(), None);
+    }
+    match connection.spec.driver {
+        // HTTPS to Google's API, verified against the system roots: the
+        // database TLS modes are not its to set.
+        Driver::BigQuery => ("HTTPS".into(), Some(true)),
+        Driver::Postgres | Driver::MySql | Driver::Sqlite | Driver::Files => {
+            let text = match connection.spec.tls {
+                TlsMode::Disable => "no TLS",
+                TlsMode::Prefer => "prefer",
+                TlsMode::Require => "require",
+                TlsMode::VerifyCa => "verify-ca",
+                TlsMode::VerifyFull => "verify-full",
+            };
+            (
+                text.into(),
+                Some(matches!(
+                    connection.spec.tls,
+                    TlsMode::VerifyFull | TlsMode::VerifyCa
+                )),
+            )
+        }
+    }
+}
+
+/// How a connection's tunnel reads in the list.
+fn ssh_label(connection: &SavedConnection) -> String {
+    match &connection.spec.ssh {
+        Some(ssh) => format!("SSH via {}", ssh.host),
+        None => "No SSH".into(),
+    }
+}
+
+/// The terminal look's note at the footer's right, where its passwords go.
+fn terminal_secrets(look: &Look) -> Msgid {
+    if look.keychain(Os::current()) {
+        msgid("secrets: keychain")
+    } else {
+        msgid("secrets: keyring")
+    }
+}
+
+/// What the picker's body asks of the app, answered by its router before
+/// the picker's tab is lent.
+struct Asked {
+    /// The picker's tab, which its actions name.
+    tab: crate::model::ConnTabId,
+    /// Where each saved connection opens, and what agents may do on it.
+    openings: HashMap<ConnectionId, Opening>,
+}
+
+impl Asked {
+    /// Where `connection`'s row opens: in the picker's tab, where no
+    /// answer was built for it.
+    fn opening(&self, connection: &SavedConnection) -> Opening {
+        self.openings
+            .get(&connection.id)
+            .copied()
+            .unwrap_or(Opening {
+                tab: self.tab,
+                open: None,
+                agents: None,
+            })
+    }
+}
+
+/// Builds the body's answers: each saved connection's tab, if one shows
+/// it, and what agents may do on it where they can reach the app.
+fn asked(app: &App) -> Asked {
+    let tab = app.active_tab_id();
+    let openings = app
+        .connections
+        .connections
+        .iter()
+        .map(|connection| {
+            let opening = Opening {
+                tab,
+                open: app.tab_showing(&connection.id),
+                agents: crate::endpoint::AVAILABLE.then(|| app.agents_access(connection)),
+            };
+            (connection.id.clone(), opening)
+        })
+        .collect();
+    Asked { tab, openings }
+}
+
+/// A picker tab's router: the backdrop and the header's frame, the
+/// notices under it, the header's title, count and New connection, then
+/// the body. The header's contents come after the notices, so New
+/// connection keeps its place after their buttons in the focus order.
+pub fn show(app: &mut App, ui: &mut egui::Ui) {
+    let paint = super::Paint::of(app);
+    let full = ui.max_rect();
+    let header = frame(ui, &paint, full);
+    // The notices, under the header: the window's own buttons keep its line.
+    let mut under = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(
+        pos2(full.left(), header.bottom()),
+        full.max,
+    )));
+    let (height, noticed) = super::notices(
+        &mut under,
+        paint,
+        app.notice.as_deref(),
+        &app.agents_held,
+        &app.connections.connections,
+    );
+    app.actions.extend(noticed);
+    // macOS: the header is the title bar, beside the window buttons.
+    let inset = app.titlebar.inset / ui.ctx().zoom_factor();
+    let total = app.connections.connections.len();
+    let (line, headed) = self::header(ui, paint, header, inset, total, &app.keymap);
+    app.actions.extend(headed);
+    let asked = self::asked(app);
+    let index = app.active;
+    let ConnTabContent::Picker(picker) = &mut app.tabs[index].content else {
+        return;
+    };
+    let room = Room {
+        full,
+        below: header.bottom() + height,
+        line,
+    };
+    let bodied = body(
+        ui,
+        paint,
+        room,
+        picker,
+        (&app.connections, &app.sources),
+        &app.keymap,
+        &asked,
+    );
+    app.actions.extend(bodied);
+}
+
+/// The picker's backdrop and its header's frame: the header's fill, its
+/// rule and the area that drags the window. Returns the header's rect.
+fn frame(ui: &mut egui::Ui, paint: &super::Paint, full: Rect) -> Rect {
+    let (palette, look) = (&paint.palette, &paint.look);
+    let backdrop = if look.terminal {
+        palette.window
+    } else {
+        palette.panel.lerp_to_gamma(palette.surface, 0.64)
+    };
+    ui.painter().rect_filled(full, CornerRadius::ZERO, backdrop);
+    let header = Rect::from_min_size(full.min, vec2(full.width(), header_height(look)));
+    let drag = ui.interact(
+        header,
+        ui.id().with("picker-drag"),
+        Sense::CLICK | Sense::DRAG,
+    );
+    if drag.drag_started() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+    let header_fill = if look.terminal {
+        palette.panel
+    } else {
+        palette.window
+    };
+    ui.painter()
+        .rect_filled(header, CornerRadius::ZERO, header_fill);
+    widgets::hline(ui, header.x_range(), header.bottom() - 0.5, palette.outline);
+    header
+}
+
+/// Where the header's contents sit, which the macOS search shares.
+#[derive(Clone, Copy)]
+struct Line {
+    /// The line they centre on.
+    y: f32,
+    /// Where the count ends.
+    count_right: f32,
+    /// Where New connection begins.
+    new_left: f32,
+}
+
+/// The header's contents in `header`: the title, how many connections
+/// there are (`total`) and New connection, `inset` clear of the window's
+/// buttons. Returns where they sit and what they ask for.
+fn header(
+    ui: &mut egui::Ui,
+    paint: super::Paint,
+    header: Rect,
+    inset: f32,
+    total: usize,
+    keymap: &crate::keymap::Keymap,
+) -> (Line, Vec<Action>) {
+    let super::Paint {
+        locale,
+        palette,
+        look,
+    } = paint;
+    let mut actions = Vec::new();
+    let side = side(&look);
+    let y = header.top() + header_line(&look);
+    let mut x = header.left() + side.max(inset + 12.0);
+    let title = if look.terminal {
+        gettext(locale, "connections").into_owned()
+    } else {
+        gettext(locale, "Connections").into_owned()
+    };
+    // The title and its count share a baseline, 10 apart (12 in the
+    // terminal, where they sit centred).
+    let title_role = TextRole::pick(&look, TextRole::ScreenTitle, TextRole::OScreenTitle);
+    let count_role = widgets::body(&look);
+    let title_text = Text::one(&look, title_role, &title, palette.text).layout(ui.ctx());
+    let count_text = Text::one(&look, count_role, &total.to_string(), palette.dim).layout(ui.ctx());
+    let (title_base, count_base) = (baseline(&title_text), baseline(&count_text));
+    let (title_middle, count_middle) = (title_text.middle(), count_text.middle());
+    title_text.paint_left(ui.painter(), x, y);
+    x += title_text.width() + if look.terminal { 12.0 } else { 10.0 };
+    let count_y = if look.terminal {
+        y
+    } else {
+        y - title_middle + title_base - count_base + count_middle
+    };
+    x += count_text.paint_left(ui.painter(), x, count_y);
+    // New connection, at the right.
+    let right = header.right() - side;
+    let new_label = if look.terminal {
+        "+ new".to_owned()
+    } else {
+        gettext(locale, "New connection").into_owned()
+    };
+    let new_key = keymap.key(paint.layout(), Command::NewConnection);
+    let new = if look.terminal {
+        ButtonSpec::new(&new_label)
+            .primary()
+            .role(TextRole::OGroup)
+            .shortcut(&new_key)
+            .shortcut_role(TextRole::OBody)
+            // The design's 1 pt border and 10 of padding.
+            .padding(11.0)
+            .gap(8.0)
+    } else {
+        ButtonSpec::new(&new_label)
+            .primary()
+            .icon(Icon::Plus)
+            .shortcut(&new_key)
+            .padding(14.0)
+            .gap(8.0)
+    };
+    let height = if look.terminal { 26.0 } else { 34.0 };
+    let width = new.width(ui, &look);
+    let place = Rect::from_min_size(pos2(right - width, y - height / 2.0), vec2(width, height));
+    let button = new
+        .label(&gettext(locale, "New connection"))
+        .show_at(ui, place, &look, &palette);
+    if button.clicked() {
+        actions.push(Action::NewConnection);
+    }
+    let line = Line {
+        y,
+        count_right: x,
+        new_left: place.left(),
+    };
+    (line, actions)
+}
+
+/// Where the body goes: the picker's whole rect, how far down the header
+/// and the notices reach, and the header's line.
+#[derive(Clone, Copy)]
+struct Room {
+    full: Rect,
+    below: f32,
+    line: Line,
+}
+
+/// The picker's body in `room`: the search, which edits `picker`'s, the
+/// footer with its keys or the question before a delete, and the list of
+/// the `saved` connections. Returns what it asks for.
+fn body(
+    ui: &mut egui::Ui,
+    paint: super::Paint,
+    room: Room,
+    picker: &mut PickerState,
+    (saved, sources): (
+        &SavedConnections,
+        &HashMap<ConnectionId, crate::model::SourceFacts>,
+    ),
+    keymap: &crate::keymap::Keymap,
+    asked: &Asked,
+) -> Vec<Action> {
+    let super::Paint {
+        locale,
+        palette,
+        look,
+    } = paint;
+    let Room { full, below, line } = room;
+    let (y, x) = (line.y, line.count_right);
+    let tab = asked.tab;
+    let mut actions = Vec::new();
+    let side = side(&look);
+    // The picker's keys, as the keymap writes them for the look.
+    let key = |command: Command| keymap.key(paint.layout(), command);
+    let new_key = key(Command::NewConnection);
+    let (connect, edit) = (key(Command::Connect), key(Command::EditConnection));
+    let (duplicate, delete) = (
+        key(Command::DuplicateConnection),
+        key(Command::DeleteConnection),
+    );
+    let (moves, filter) = (
+        key(Command::MoveInConnections),
+        key(Command::FilterConnections),
+    );
+    let agent_access = key(Command::ChangeAgentAccess);
+    let answers = (
+        key(Command::ConfirmDeleteConnection),
+        key(Command::KeepConnection),
+    );
+    // Search.
+    let focus = std::mem::take(&mut picker.focus_search);
+    let (field, style, hint) = if look.terminal {
+        // The terminal filters on its own line under the header.
+        let line = Rect::from_min_size(pos2(full.left(), below), vec2(full.width(), FILTER_LINE));
+        widgets::hline(ui, line.x_range(), line.bottom() - 0.5, palette.outline);
+        (
+            Rect::from_min_max(
+                pos2(line.left() + side - 8.0, line.top()),
+                pos2(line.right() - side, line.bottom() - 1.0),
+            ),
+            widgets::FieldStyle {
+                fill: None,
+                boxed: false,
+                role: TextRole::OBody,
+            },
+            gettext(locale, "filter connections"),
+        )
+    } else {
+        // 24 past the count (and the header's 12 gap).
+        let left = x + 12.0 + 24.0;
+        // The design's 320 is its content: with 10 of padding and a
+        // 1 pt border each side the box is 342 by 36.
+        let right = (left + 342.0).min(line.new_left - 16.0);
+        (
+            Rect::from_min_max(pos2(left, y - 18.0), pos2(right.max(left), y + 18.0)),
+            widgets::FieldStyle {
+                fill: Some(palette.panel.lerp_to_gamma(palette.surface, 0.36)),
+                boxed: true,
+                role: TextRole::UiBody,
+            },
+            gettext(locale, "Find connection…"),
+        )
+    };
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(field));
+    let response = widgets::filter_field(
+        &mut child,
+        &mut picker.search,
+        &hint,
+        field.size(),
+        style,
+        &look,
+        &palette,
+    );
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "Search connections"));
+    if focus {
+        response.request_focus();
+    }
+    let PickerState {
+        search,
+        selected,
+        folded,
+        deleting,
+        ..
+    } = &*picker;
+
+    // Footer. While the list asks whether to delete a connection, the
+    // question stands in place of the keys, and the footer grows to hold
+    // all of it: a long name wraps it.
+    let footer_side = if look.terminal { 12.0 } else { side };
+    let skin = (&look, &palette, locale);
+    let question = deleting
+        .as_ref()
+        .and_then(|conn| saved.get(conn))
+        .map(|connection| {
+            let width = full.width() - 2.0 * footer_side;
+            DeleteQuestion::lay(ui, connection, &answers, skin, width)
+        });
+    // Each line past the first adds its height; one line keeps the
+    // footer's own.
+    let height = footer_height(&look) + question.as_ref().map_or(0.0, DeleteQuestion::below);
+    let footer = Rect::from_min_max(pos2(full.left(), full.bottom() - height), full.max);
+    ui.painter()
+        .rect_filled(footer, CornerRadius::ZERO, palette.panel);
+    widgets::hline(ui, footer.x_range(), footer.top() + 0.5, palette.outline);
+    let footer_y = footer.top() + 1.0 + (footer.height() - 1.0) / 2.0;
+    if let Some(question) = question {
+        question.show(ui, (footer, footer_side, footer_y), tab, skin, &mut actions);
+    } else {
+        let small = widgets::secondary(&look);
+        // The terminal look floats no toast: what was just done (the font
+        // size a key changed) takes the keyring's note's place while it is
+        // said.
+        let said = look
+            .terminal
+            .then(|| super::toast::said(ui.ctx()))
+            .flatten()
+            .map(|said| look.label(&said));
+        if look.terminal {
+            let words = [
+                msgid("move"),
+                msgid("connect / show"),
+                msgid("edit"),
+                msgid("new"),
+                msgid("duplicate"),
+                msgid("delete"),
+                pmsgid("key hint", "filter"),
+                msgid("agent access"),
+            ]
+            .map(|word| word.say(locale));
+            let mut hints = vec![
+                (&moves, &*words[0], true),
+                (&connect, &*words[1], true),
+                (&edit, &*words[2], true),
+                (&new_key, &*words[3], true),
+                (&duplicate, &*words[4], true),
+                (&delete, &*words[5], true),
+                (&filter, &*words[6], true),
+            ];
+            // Where agents can reach the app.
+            if crate::endpoint::AVAILABLE {
+                hints.push((&agent_access, &*words[7], true));
+            }
+            // What does not fit beside the keyring's note gives way, from the
+            // end: the window may be as narrow as 720.
+            let secrets = terminal_secrets(&look).say(locale);
+            let note = said.as_deref().unwrap_or(&secrets);
+            let note = widgets::measure(ui, Text::one(&look, small, note, palette.dim));
+            let room = footer.width() - 2.0 * footer_side - note - 24.0;
+            while hints.len() > 1
+                && widgets::key_hints_width(ui, &hints, 16.0, &look, &palette) > room
+            {
+                hints.pop();
+            }
+            widgets::key_hints(
+                ui,
+                (footer.left() + footer_side, footer_y),
+                &hints,
+                16.0,
+                &look,
+                &palette,
+            );
+        } else {
+            let hints = [
+                format!("{connect} connect"),
+                format!("{edit} edit"),
+                format!("{duplicate} duplicate"),
+                format!("{delete} delete"),
+            ];
+            let status = palette.secondary.lerp_to_gamma(palette.dim, 0.5);
+            let mut x = footer.left() + footer_side;
+            for hint in hints {
+                x += widgets::paint_text(ui, x, footer_y, Text::one(&look, small, &hint, status))
+                    + 18.0;
+            }
+        }
+        let secrets = if let Some(said) = said.clone() {
+            said
+        } else if look.terminal {
+            terminal_secrets(&look).say(locale).into_owned()
+        } else if look.keychain(Os::current()) {
+            gettext(locale, "Passwords are stored in the macOS Keychain").into_owned()
+        } else {
+            gettext(locale, "Passwords are stored in the system keyring").into_owned()
+        };
+        let color = if said.is_some() {
+            palette.text
+        } else if look.terminal {
+            palette.dim
+        } else {
+            palette.secondary.lerp_to_gamma(palette.dim, 0.5)
+        };
+        widgets::paint_text_right(
+            ui,
+            footer.right() - footer_side,
+            footer_y,
+            Text::one(&look, small, &secrets, color),
+        );
+    }
+
+    // The list.
+    let top = if look.terminal {
+        below + FILTER_LINE
+    } else {
+        below
+    };
+    let body = Rect::from_min_max(pos2(full.left(), top), pos2(full.right(), footer.top()));
+    let mut list = ui.new_child(egui::UiBuilder::new().max_rect(body));
+    let found = saved.search(search);
+    if saved.connections.is_empty() {
+        // First launch: why the list is empty, and the one next step.
+        let keyring = if look.keychain(Os::current()) {
+            gettext(locale, "native-sql-database-client-windows stores passwords in the macOS Keychain.")
+        } else {
+            gettext(locale, "native-sql-database-client-windows stores passwords in the system keyring.")
+        };
+        let text = format!(
+            "{} {keyring}",
+            gettext(
+                locale,
+                "Add a PostgreSQL, MySQL or SQLite database, or a folder of data files, to \
+                 start browsing."
+            )
+        );
+        let (title, text) = (
+            look.label(&gettext(locale, "No connections yet")),
+            look.label(&text),
+        );
+        let notice = states::Notice {
+            icon: Icon::Database,
+            title: &title,
+            text: &text,
+        };
+        let name = look.label(&gettext(locale, "New connection"));
+        let add = states::key_button(&name, &new_key, &look)
+            .label("New connection")
+            .salt("empty");
+        let add = if look.terminal {
+            add
+        } else {
+            add.primary().icon(Icon::Plus).padding(14.0).gap(8.0)
+        };
+        if states::empty(&mut list, body, &notice, vec![add], &look, &palette).is_some() {
+            actions.push(Action::NewConnection);
+        }
+    } else if found.is_empty() {
+        list.add_space(40.0);
+        list.vertical_centered(|ui| {
+            let text = gettext(locale, "No connections match");
+            Text::one(&look, widgets::body(&look), &text, palette.secondary)
+                .layout(ui.ctx())
+                .label(ui);
+        });
+    } else {
+        let now = crate::util::now_secs();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(&mut list, |ui| {
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                // macOS: 20 above the groups and between them. Terminal: 8.
+                ui.add_space(if look.terminal { 8.0 } else { 20.0 });
+                for (number, group) in groups(&found).into_iter().enumerate() {
+                    if number > 0 && !look.terminal {
+                        ui.add_space(20.0);
+                    }
+                    let open = !folded.contains(&group.title);
+                    group_header(ui, &group, open, side, &look, &palette, &mut actions, tab);
+                    if !open {
+                        continue;
+                    }
+                    let skin = RowSkin {
+                        look: &look,
+                        palette: &palette,
+                        locale,
+                        now,
+                        side,
+                    };
+                    if look.terminal {
+                        for connection in &group.connections {
+                            terminal_row(
+                                ui,
+                                connection,
+                                (saved, sources.get(&connection.id)),
+                                selected.as_ref(),
+                                asked.opening(connection),
+                                skin,
+                                &mut actions,
+                            );
+                        }
+                    } else {
+                        let rows = group.connections.len() as f32;
+                        // A card with a 1 pt border round its rows.
+                        let card = Rect::from_min_size(
+                            pos2(ui.max_rect().left() + side, ui.cursor().top()),
+                            vec2(
+                                ui.max_rect().width() - 2.0 * side,
+                                rows * row_height(&look) + 2.0,
+                            ),
+                        );
+                        let corner = CornerRadius::same(10);
+                        ui.painter().rect_filled(card, corner, palette.window);
+                        let border_shape = ui.painter().add(egui::Shape::Noop);
+                        ui.add_space(1.0);
+                        for (index, connection) in group.connections.iter().enumerate() {
+                            mac_row(
+                                ui,
+                                card.shrink(1.0),
+                                index,
+                                connection,
+                                (saved, sources.get(&connection.id)),
+                                selected.as_ref(),
+                                asked.opening(connection),
+                                skin,
+                                &mut actions,
+                            );
+                        }
+                        ui.add_space(1.0);
+                        ui.painter().set(
+                            border_shape,
+                            egui::epaint::RectShape::stroke(
+                                card,
+                                corner,
+                                Stroke::new(widgets::hairline(ui), palette.outline),
+                                StrokeKind::Inside,
+                            ),
+                        );
+                    }
+                }
+                ui.add_space(20.0);
+            });
+    }
+    actions
+}
+
+/// A group's heading: a chevron that folds it, its title and count.
+#[allow(clippy::too_many_arguments)] // one call site per look
+fn group_header(
+    ui: &mut egui::Ui,
+    group: &Group<'_>,
+    open: bool,
+    side: f32,
+    look: &Look,
+    palette: &Palette,
+    actions: &mut Vec<Action>,
+    tab: crate::model::ConnTabId,
+) {
+    // macOS: the heading's line and 8 below it. Terminal: 4 above a 30 pt
+    // row.
+    let height = if look.terminal { 34.0 } else { 16.0 + 8.0 };
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &group.title));
+    let title = &group.title;
+    let count = group.connections.len().to_string();
+    if look.terminal {
+        let y = rect.top() + 4.0 + 15.0;
+        let x = rect.left() + side;
+        let glyph = if open { "▾" } else { "▸" };
+        let role = TextRole::OBody;
+        let mut left = x;
+        left += widgets::paint_text(ui, left, y, Text::one(look, role, glyph, palette.dim)) + 6.0;
+        left += widgets::paint_text(
+            ui,
+            left,
+            y,
+            Text::one(look, TextRole::OGroup, title, palette.text),
+        ) + 6.0;
+        widgets::paint_text(ui, left, y, Text::one(look, role, &count, palette.dim));
+    } else {
+        let y = rect.top() + 8.0;
+        let x = rect.left() + side + 4.0;
+        let icon = if open {
+            Icon::ChevronDown
+        } else {
+            Icon::ChevronRight
+        };
+        icon.image(palette.dim, 12.0).paint_at(
+            ui,
+            Rect::from_center_size(pos2(x + 6.0, y), vec2(12.0, 12.0)),
+        );
+        let width = widgets::paint_text(
+            ui,
+            x + 20.0,
+            y,
+            Text::one(look, TextRole::GroupLabel, title, palette.secondary),
+        );
+        widgets::paint_text(
+            ui,
+            x + 20.0 + width + 8.0,
+            y,
+            Text::one(look, TextRole::Secondary, &count, palette.dim),
+        );
+    }
+    if response.clicked() {
+        actions.push(Action::FoldConnectionGroup {
+            tab,
+            group: group.title.clone(),
+        });
+    }
+}
+
+/// How rows draw.
+#[derive(Clone, Copy)]
+struct RowSkin<'a> {
+    look: &'a Look,
+    palette: &'a Palette,
+    locale: crate::i18n::Locale,
+    now: u64,
+    side: f32,
+}
+
+/// Where a row's connection opens: the picker's tab, or the tab that has
+/// it open already.
+#[derive(Clone, Copy)]
+struct Opening {
+    tab: crate::model::ConnTabId,
+    open: Option<crate::model::ConnTabId>,
+    /// What agents may do on it, as in force; `None` where agents cannot
+    /// reach the app, which then shows nothing of them.
+    agents: Option<crate::connections::AgentAccess>,
+}
+
+impl Opening {
+    /// What choosing the row does: an open connection shows, another
+    /// connects in the picker's tab.
+    fn choose(self, connection: &SavedConnection) -> Action {
+        match self.open {
+            Some(open) => Action::ActivateConnTab(open),
+            None => self.connect(connection),
+        }
+    }
+
+    /// Connects in the picker's tab, open already or not.
+    fn connect(self, connection: &SavedConnection) -> Action {
+        Action::Connect {
+            tab: self.tab,
+            conn: connection.id.clone(),
+        }
+    }
+}
+
+/// Where a connection points, as the rows say it: host and port, then the
+/// database (a file's name for SQLite).
+pub(crate) fn target(connection: &SavedConnection) -> (String, String) {
+    use native-sql-database-client-windows_db::Driver;
+    let spec = &connection.spec;
+    match spec.driver {
+        // A BigQuery summary is the project alone.
+        Driver::Sqlite | Driver::BigQuery => (spec.summary(), String::new()),
+        Driver::Files => (spec.summary(), String::new()),
+        Driver::Postgres | Driver::MySql => (
+            format!("{}:{}", spec.host, spec.port),
+            format!("/{}", spec.database),
+        ),
+    }
+}
+
+/// What a macOS row says of a connection that keeps files, where a
+/// server's says its user, host and security: the line under the name,
+/// the middle column's two lines, and for a Files connection what goes
+/// where TLS and SSH go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileRowText {
+    pub second: String,
+    pub middle: (String, String),
+    pub right: Option<(Msgid, Msgid)>,
+}
+
+/// [`FileRowText`] of `connection`, with what a scan of its files found
+/// (`facts`, which may be on its way). `None` for a server's.
+pub(crate) fn file_row_text(
+    connection: &SavedConnection,
+    facts: Option<&crate::model::SourceFacts>,
+) -> Option<FileRowText> {
+    use crate::model::SourceFacts;
+    use native-sql-database-client-windows_db::Driver;
+    use native-sql-database-client-windows_db::files::{Source, shown, size_text};
+    let spec = &connection.spec;
+    match spec.driver {
+        Driver::Postgres | Driver::MySql | Driver::BigQuery => None,
+        Driver::Sqlite => {
+            let path = spec.sqlite_path.as_deref()?;
+            let second = match facts {
+                Some(SourceFacts::File { size }) => format!("SQLite · {}", size_text(*size)),
+                Some(SourceFacts::Files(_)) | None => "SQLite".to_owned(),
+            };
+            let folder = path
+                .parent()
+                .map(|folder| format!("{}{}", shown(folder), std::path::MAIN_SEPARATOR))
+                .unwrap_or_default();
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Some(FileRowText {
+                second,
+                middle: (folder, name),
+                right: None,
+            })
+        }
+        Driver::Files => {
+            let source = spec.files.as_ref()?;
+            let scan = match facts {
+                Some(SourceFacts::Files(scan)) => Some(scan),
+                Some(SourceFacts::File { .. }) | None => None,
+            };
+            let second = match scan {
+                Some(scan) => format!(
+                    "Files · {} · {}",
+                    match scan.files.len() {
+                        1 => "1 file".to_owned(),
+                        count => format!("{count} files"),
+                    },
+                    size_text(scan.total_size())
+                ),
+                None => "Files".to_owned(),
+            };
+            let names = scan.map(|scan| scan.names().join(", ")).unwrap_or_default();
+            let middle = match source {
+                Source::Folder(folder) => (shown(folder), names),
+                Source::Files(_) => (
+                    source.summary(),
+                    source.folder().map(shown).unwrap_or_default(),
+                ),
+            };
+            Some(FileRowText {
+                second,
+                middle,
+                // Editing files is not built: every one reads only.
+                right: Some((msgid("Read-only"), msgid("No joins"))),
+            })
+        }
+    }
+}
+
+/// The terminal look's line under a Files connection's name: `files ·
+/// ~/Data/bookshop-exports · 4 files · 2.5 gb`. `None` for any other.
+pub(crate) fn terminal_files_line(
+    connection: &SavedConnection,
+    facts: Option<&crate::model::SourceFacts>,
+) -> Option<String> {
+    use native-sql-database-client-windows_db::Driver;
+    match connection.spec.driver {
+        Driver::Files => {}
+        Driver::Postgres | Driver::MySql | Driver::Sqlite | Driver::BigQuery => return None,
+    }
+    let text = file_row_text(connection, facts)?;
+    let source = match &connection.spec.files {
+        Some(native-sql-database-client-windows_db::files::Source::Folder(folder)) => native-sql-database-client-windows_db::files::shown(folder),
+        Some(source) => source.summary(),
+        None => String::new(),
+    };
+    let counted = text.second.strip_prefix("Files").unwrap_or_default();
+    // The look's case for its words, and the path as it is.
+    Some(format!("files · {source}{}", counted.to_lowercase()))
+}
+
+/// The row's own response, answering a click by selecting and a double
+/// click, Enter or a screen reader by choosing it: an open connection
+/// shows, another connects.
+fn row_response(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    connection: &SavedConnection,
+    opening: Opening,
+    (look, palette, locale): (&Look, &Palette, crate::i18n::Locale),
+    actions: &mut Vec<Action>,
+) -> egui::Response {
+    let tab = opening.tab;
+    let response = ui.interact(
+        rect,
+        ui.id().with(("connection", &connection.id.0)),
+        Sense::click(),
+    );
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &connection.name));
+    // A row of a list that scrolls: the ring inside it.
+    crate::ui::focus::hint(
+        ui,
+        &response,
+        rect,
+        crate::ui::focus::Ring::Inset {
+            radius: look.radius.saturating_sub(2),
+        },
+    );
+    let activated = response.double_clicked()
+        || (response.clicked() && !response.clicked_by(egui::PointerButton::Primary));
+    if activated {
+        actions.push(opening.choose(connection));
+    } else if response.clicked() {
+        actions.push(Action::SelectConnection {
+            tab,
+            conn: Some(connection.id.clone()),
+        });
+    }
+    let id = connection.id.clone();
+    menu::context(&response, look, palette, |ui| {
+        let item = |ui: &mut egui::Ui, text: Msgid| {
+            menu::Item::action(&text.say(locale))
+                .show(ui, look, palette)
+                .clicked()
+        };
+        // An open connection shows, and can be opened once more.
+        if opening.open.is_some() {
+            if item(ui, msgid("Show")) {
+                actions.push(opening.choose(connection));
+            }
+            if item(ui, msgid("Connect again")) {
+                actions.push(opening.connect(connection));
+            }
+        } else if item(ui, msgid("Connect")) {
+            actions.push(opening.connect(connection));
+        }
+        if item(ui, msgid("Edit…")) {
+            actions.push(Action::EditConnection(id.clone()));
+        }
+        if item(ui, msgid("Duplicate")) {
+            actions.push(Action::DuplicateConnection(id.clone()));
+        }
+        if item(ui, msgid("Delete")) {
+            actions.push(Action::AskDeleteConnection(id.clone()));
+        }
+        if let Some(access) = opening.agents {
+            agents_part(ui, &id, access, (look, palette, locale), actions);
+        }
+    });
+    response
+}
+
+/// The footer's question before a connection is deleted, in place of its
+/// keys: what goes, then Cancel and Delete on macOS and Windows, and the
+/// letters that answer in the terminal look. Laid out before the footer,
+/// whose height it sets.
+struct DeleteQuestion {
+    /// What it says, for screen readers.
+    said: String,
+    /// What it paints: the question, and in the terminal look its letters,
+    /// wrapped to the footer's room.
+    laid: crate::typography::Laid,
+    /// macOS and Windows: Cancel and Delete, from the right.
+    buttons: Vec<(String, bool)>,
+}
+
+impl DeleteQuestion {
+    fn lay(
+        ui: &egui::Ui,
+        connection: &SavedConnection,
+        (yes, no): &(crate::keymap::Written, crate::keymap::Written),
+        (look, palette, locale): (&Look, &Palette, crate::i18n::Locale),
+        width: f32,
+    ) -> Self {
+        let say = |text: Msgid| look.label(&text.say(locale));
+        let words = match saved_secrets(connection, say) {
+            Some(secrets) => say(msgid(
+                "Delete {connection} and its saved {secrets}? This can't be undone.",
+            ))
+            .replace("{secrets}", &secrets),
+            None => say(msgid("Delete {connection}? This can't be undone.")),
+        };
+        // The terminal look writes its words in lower case, and the name as
+        // it was typed: two names apart only in case stay apart.
+        let said = words.replace("{connection}", &connection.name);
+        let body = widgets::body(look);
+        if look.terminal {
+            let text = Text::new(look)
+                .add(body, &said, palette.warning)
+                .space(body, "  ")
+                .add(body, yes.as_str(), palette.accent)
+                .add(body, &format!(" {}", say(msgid("yes"))), palette.secondary)
+                .space(body, "  ")
+                .add(body, no.as_str(), palette.accent)
+                .add(body, &format!(" {}", say(msgid("no"))), palette.secondary);
+            let laid = text.wrap(width.max(40.0)).layout(ui.ctx());
+            let buttons = Vec::new();
+            return Self {
+                said,
+                laid,
+                buttons,
+            };
+        }
+        let buttons = vec![(say(msgid("Cancel")), false), (say(msgid("Delete")), true)];
+        let taken: f32 = buttons
+            .iter()
+            .map(|(label, deletes)| question_button(label, *deletes, look).width(ui, look) + 8.0)
+            .sum();
+        let room = (width - taken - 16.0).max(40.0);
+        let laid = Text::one(look, body, &said, palette.text)
+            .wrap(room)
+            .layout(ui.ctx());
+        Self {
+            said,
+            laid,
+            buttons,
+        }
+    }
+
+    /// How much taller than its first line the question is: what its
+    /// other lines add to the footer.
+    fn below(&self) -> f32 {
+        let first = self.laid.galley.rows.first().map_or(0.0, |row| row.size.y);
+        (self.laid.height() - first).max(0.0)
+    }
+
+    fn show(
+        &self,
+        ui: &mut egui::Ui,
+        (footer, side, y): (Rect, f32, f32),
+        tab: crate::model::ConnTabId,
+        (look, palette, _): (&Look, &Palette, crate::i18n::Locale),
+        actions: &mut Vec<Action>,
+    ) {
+        widgets::announce(ui, footer, &self.said);
+        let mut right = footer.right() - side;
+        for (label, deletes) in &self.buttons {
+            let button = question_button(label, *deletes, look);
+            let width = button.width(ui, look);
+            let at = Rect::from_center_size(pos2(right - width / 2.0, y), vec2(width, 28.0));
+            if button.show_at(ui, at, look, palette).clicked() {
+                actions.push(Action::AnswerDeleteConnection {
+                    tab,
+                    delete: *deletes,
+                });
+            }
+            right = at.left() - 8.0;
+        }
+        self.laid.paint_left(ui.painter(), footer.left() + side, y);
+    }
+}
+
+/// What of `connection` the keyring holds, which goes with it: "password",
+/// "key's passphrase", "password and SSH password". `None` when nothing.
+fn saved_secrets(connection: &SavedConnection, say: impl Fn(Msgid) -> String) -> Option<String> {
+    use crate::connections::PasswordMode;
+    use native-sql-database-client-windows_db::SshAuth;
+    let password = connection.password == PasswordMode::Keyring;
+    let ssh = (connection.ssh_secret == PasswordMode::Keyring).then(|| {
+        match connection.spec.ssh.as_ref().map(|ssh| &ssh.auth) {
+            Some(SshAuth::Password) => say(msgid("SSH password")),
+            Some(SshAuth::KeyFile { .. }) => say(msgid("key's passphrase")),
+            Some(SshAuth::Agent) | None => say(msgid("SSH secret")),
+        }
+    });
+    match (password, ssh) {
+        (false, None) => None,
+        (true, None) => Some(say(msgid("password"))),
+        (false, Some(ssh)) => Some(ssh),
+        (true, Some(ssh)) => Some(fill(
+            &say(msgid("password and {secret}")),
+            &[("{secret}", &ssh)],
+        )),
+    }
+}
+
+/// One of the question's buttons: Delete in the danger color.
+fn question_button<'a>(label: &'a str, deletes: bool, look: &Look) -> ButtonSpec<'a> {
+    let button = states::button(label, look).salt("delete-connection-question");
+    if deletes { button.danger() } else { button }
+}
+
+/// The Agents part of a row's menus: what agents may do on it, the
+/// editor at its Agents part, and its Agents tab.
+fn agents_part(
+    ui: &mut egui::Ui,
+    conn: &ConnectionId,
+    access: crate::connections::AgentAccess,
+    (look, palette, locale): (&Look, &Palette, crate::i18n::Locale),
+    actions: &mut Vec<Action>,
+) {
+    use crate::connections::AgentAccess;
+    menu::heading(ui, &gettext(locale, "Agents"), look, palette);
+    for (level, word) in [
+        (AgentAccess::Off, msgid("Off")),
+        (AgentAccess::Read, msgid("Read")),
+    ] {
+        let text = word.say(locale);
+        let name = gettext(locale, "Agents {level}").replace("{level}", &text);
+        if menu::Item::choice(&text, access == level)
+            .name(&name)
+            .show(ui, look, palette)
+            .clicked()
+            && access != level
+        {
+            actions.push(Action::SetAgentAccess {
+                conn: conn.clone(),
+                access: level,
+            });
+        }
+    }
+    let limits = gettext(locale, "Tables, columns and limits…");
+    if menu::Item::action(&limits)
+        .show(ui, look, palette)
+        .clicked()
+    {
+        actions.push(Action::EditAgents {
+            conn: conn.clone(),
+            allow: false,
+        });
+    }
+    let show = gettext(locale, "Show Agents tab");
+    if menu::Item::action(&show).show(ui, look, palette).clicked() {
+        actions.push(Action::ShowAgentsOn(conn.clone()));
+    }
+}
+
+/// What agents may do, in a word: Off or Read.
+fn agents_level(access: crate::connections::AgentAccess, locale: crate::i18n::Locale) -> String {
+    match access {
+        crate::connections::AgentAccess::Off => gettext(locale, "Off"),
+        crate::connections::AgentAccess::Read => gettext(locale, "Read"),
+    }
+    .into_owned()
+}
+
+/// The words on the button that chooses a row, and its accessible name:
+/// Show for a connection that is open, Connect for another.
+fn choose_labels(
+    connection: &SavedConnection,
+    opening: Opening,
+    locale: crate::i18n::Locale,
+) -> (String, String) {
+    let (text, label) = if opening.open.is_some() {
+        (msgid("Show"), msgid("Show {name}"))
+    } else {
+        (msgid("Connect"), msgid("Connect to {name}"))
+    };
+    (
+        text.say(locale).into_owned(),
+        fill(&label.say(locale), &[("{name}", &connection.name)]),
+    )
+}
+
+/// macOS: a row of the card, a colour bar at its left edge, columns for
+/// the name, where it points, its security and when it was last used.
+#[allow(clippy::too_many_arguments)] // one call site
+fn mac_row(
+    ui: &mut egui::Ui,
+    card: Rect,
+    index: usize,
+    connection: &SavedConnection,
+    (store, facts): (
+        &crate::connections::SavedConnections,
+        Option<&crate::model::SourceFacts>,
+    ),
+    selected: Option<&ConnectionId>,
+    opening: Opening,
+    skin: RowSkin<'_>,
+    actions: &mut Vec<Action>,
+) {
+    let RowSkin {
+        look,
+        palette,
+        locale,
+        now,
+        ..
+    } = skin;
+    let height = row_height(look);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let rect = Rect::from_min_max(
+        pos2(card.left(), rect.top()),
+        pos2(card.right(), rect.bottom()),
+    );
+    let response = row_response(
+        ui,
+        rect,
+        connection,
+        opening,
+        (look, palette, locale),
+        actions,
+    );
+    let is_selected = selected == Some(&connection.id);
+    let rows = (card.height() / height).round() as usize;
+    // The card's inner corners: its 10 less its border.
+    let round = |on: bool| if on { 9 } else { 0 };
+    let corner = CornerRadius {
+        nw: round(index == 0),
+        ne: round(index == 0),
+        sw: round(index + 1 == rows),
+        se: round(index + 1 == rows),
+    };
+    if is_selected {
+        ui.painter().rect_filled(
+            rect,
+            corner,
+            palette.window.lerp_to_gamma(palette.accent, 0.08),
+        );
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, corner, palette.panel);
+    }
+    // Each row's rule under it, the grid's lightest line.
+    if index + 1 < rows {
+        widgets::hline(ui, rect.x_range(), rect.bottom() - 0.5, palette.surface);
+    }
+    let env = connection.environment;
+    let colors = crate::env::env_colors(env, crate::env::Platform::of(look), palette);
+    let bar = Rect::from_min_size(rect.min, vec2(6.0, rect.height()));
+    ui.painter().rect_filled(
+        bar,
+        CornerRadius {
+            nw: corner.nw,
+            sw: corner.sw,
+            ne: 0,
+            se: 0,
+        },
+        colors.base(),
+    );
+    // Two lines 3 apart, centred in the 64 pt row.
+    let top = rect.top() + 22.7;
+    let bottom = rect.top() + 42.0;
+    // The columns: a 6 pt bar, 300 for the name, the host taking the rest,
+    // 150 for TLS and SSH, 190 for last use, 110 of room, 250 of actions.
+    // Where agents can reach the app, their 140 come out of the room and
+    // the host while the host keeps 160; in a narrower window the column
+    // steps back, and the row is as it was. The menu has the Agents part.
+    let rest = rect.width() - (6.0 + 300.0 + 150.0 + 190.0 + 250.0);
+    let agents_width = match opening.agents {
+        Some(_) if rest >= 140.0 + 160.0 => 140.0,
+        _ => 0.0,
+    };
+    let room = match agents_width > 0.0 {
+        true => (rest - 140.0 - 160.0).min(110.0),
+        false => 110.0,
+    };
+    let host_width = (rest - agents_width - room).max(120.0);
+    let name_x = rect.left() + 6.0 + 16.0;
+    let host_x = rect.left() + 306.0 + 12.0;
+    let security_x = rect.left() + 306.0 + host_width + 12.0;
+    let agents_x = security_x + 150.0;
+    let used_x = agents_x + agents_width;
+    let name_width = widgets::paint_text(
+        ui,
+        name_x,
+        top,
+        Text::one(
+            look,
+            TextRole::UiBodySemibold,
+            &connection.name,
+            palette.text,
+        ),
+    );
+    let badge = super::workspace::env_badge(
+        ui,
+        name_x + name_width + 8.0,
+        top,
+        env,
+        &colors,
+        super::workspace::Badge::Mac,
+        look,
+    );
+    if opening.open.is_some() {
+        // Open in a tab already: an outlined tag in the accent, 8 on.
+        let text = gettext(locale, "open");
+        let laid = Text::one(look, TextRole::Shortcut, &text, palette.accent).layout(ui.ctx());
+        let tag = Rect::from_min_size(
+            pos2(
+                name_x + name_width + 8.0 + badge + 8.0,
+                top - (laid.height() + 2.0) / 2.0,
+            ),
+            vec2(laid.width() + 14.0, laid.height() + 2.0),
+        );
+        ui.painter().rect_stroke(
+            tag,
+            CornerRadius::same(10),
+            Stroke::new(
+                widgets::hairline(ui),
+                palette.window.lerp_to_gamma(palette.accent, 0.45),
+            ),
+            StrokeKind::Inside,
+        );
+        laid.paint_left(ui.painter(), tag.left() + 7.0, top);
+        widgets::announce(ui, tag, &text);
+    }
+    let files = file_row_text(connection, facts);
+    let user = &connection.spec.user;
+    let second = match &files {
+        Some(files) => files.second.clone(),
+        None if user.is_empty() => connection.spec.driver.label().to_owned(),
+        None => format!("{} · {user}", connection.spec.driver.label()),
+    };
+    let small = TextRole::Secondary;
+    widgets::paint_label(
+        ui,
+        name_x,
+        bottom,
+        Text::one(look, small, &second, palette.dim),
+    );
+    let (host, database) = match &files {
+        Some(files) => files.middle.clone(),
+        None => target(connection),
+    };
+    let host_role = TextRole::GridCell;
+    let shown = crate::ui::grid::ellipsize(&host, host_width - 24.0, false, |text| {
+        host_role.width(ui.ctx(), look.faces, text)
+    });
+    widgets::paint_label(
+        ui,
+        host_x,
+        top,
+        Text::one(look, host_role, &shown, palette.text),
+    );
+    if !database.is_empty() {
+        let database_role = TextRole::MonoSecondary;
+        let shown = crate::ui::grid::ellipsize(&database, host_width - 24.0, false, |text| {
+            database_role.width(ui.ctx(), look.faces, text)
+        });
+        widgets::paint_label(
+            ui,
+            host_x,
+            bottom,
+            Text::one(look, database_role, &shown, palette.dim),
+        );
+    }
+    // A Files connection says whether it writes and what it joins where a
+    // server says its TLS and its tunnel.
+    if let Some((writes, joins)) = files.as_ref().and_then(|files| files.right) {
+        let writes = writes.say(locale);
+        widgets::paint_label(
+            ui,
+            security_x,
+            top,
+            Text::one(look, small, &writes, palette.secondary),
+        );
+        let joins = joins.say(locale);
+        widgets::paint_label(
+            ui,
+            security_x,
+            bottom,
+            Text::one(look, small, &joins, palette.dim),
+        );
+    } else {
+        let (tls, verified) = tls_label(connection);
+        let tls_color = match verified {
+            Some(true) => palette.success,
+            Some(false) => palette.warning,
+            None => palette.dim,
+        };
+        Icon::Lock.image(tls_color, 11.0).paint_at(
+            ui,
+            Rect::from_center_size(pos2(security_x + 5.5, top), vec2(11.0, 11.0)),
+        );
+        widgets::paint_label(
+            ui,
+            security_x + 16.0,
+            top,
+            Text::one(look, small, &tls, tls_color),
+        );
+        widgets::paint_label(
+            ui,
+            security_x,
+            bottom,
+            Text::one(look, small, &ssh_label(connection), palette.dim),
+        );
+    }
+    // What agents may do: the word over the level, dimmed when Off.
+    if let Some(access) = opening.agents.filter(|_| agents_width > 0.0) {
+        let level = agents_level(access, locale);
+        let color = match access {
+            crate::connections::AgentAccess::Off => palette.dim,
+            crate::connections::AgentAccess::Read => palette.text,
+        };
+        let word = gettext(locale, "Agents");
+        widgets::paint_label(
+            ui,
+            agents_x,
+            top,
+            Text::one(look, small, &word, palette.dim),
+        );
+        widgets::paint_label(ui, agents_x, bottom, Text::one(look, small, &level, color));
+        let place = Rect::from_min_max(pos2(agents_x, rect.top()), pos2(used_x, rect.bottom()));
+        widgets::announce(ui, place, &format!("{word} {level}"));
+    }
+    let when = crate::connections::when(locale, store.last_used(&connection.id), now);
+    widgets::paint_label(
+        ui,
+        used_x,
+        rect.center().y,
+        Text::one(
+            look,
+            small,
+            &gettext(locale, "Last used {when}").replace("{when}", &when),
+            palette.dim,
+        ),
+    );
+    // Edit, more, and Connect (Show, for a connection that is open): on
+    // the selected row and under the pointer. Connect is always there for
+    // keyboards and screen readers.
+    let shown = is_selected || ui.rect_contains_pointer(rect);
+    let y = rect.center().y;
+    let (connect_text, connect_label) = choose_labels(connection, opening, locale);
+    // 16 in from the right, 6 apart, 30 tall.
+    let connect = ButtonSpec::new(&connect_text)
+        .primary()
+        .label(&connect_label)
+        .salt(&connection.id.0)
+        .padding(14.0)
+        .radius(7);
+    let width = connect.width(ui, look);
+    let place = Rect::from_min_size(
+        pos2(rect.right() - 16.0 - width, y - 15.0),
+        vec2(width, 30.0),
+    );
+    let response = if shown {
+        connect.show_at(ui, place, look, palette)
+    } else {
+        connect.hidden_at(ui, place)
+    };
+    if response.clicked() {
+        actions.push(opening.choose(connection));
+    }
+    let more_place =
+        Rect::from_min_size(pos2(place.left() - 6.0 - 30.0, y - 15.0), vec2(30.0, 30.0));
+    let edit_label = format!("{} {}", gettext(locale, "Edit"), connection.name);
+    let edit_text = gettext(locale, "Edit");
+    let edit = ButtonSpec::new(&edit_text)
+        .label(&edit_label)
+        .salt(&connection.id.0)
+        .radius(7);
+    let edit_width = edit.width(ui, look);
+    let edit_place = Rect::from_min_size(
+        pos2(more_place.left() - 6.0 - edit_width, y - 15.0),
+        vec2(edit_width, 30.0),
+    );
+    let response = if shown {
+        edit.show_at(ui, edit_place, look, palette)
+    } else {
+        edit.hidden_at(ui, edit_place)
+    };
+    if response.clicked() {
+        actions.push(Action::EditConnection(connection.id.clone()));
+    }
+    let more_label =
+        gettext(locale, "More actions for {connection}").replace("{connection}", &connection.name);
+    let more = ButtonSpec::new("")
+        .icon(Icon::Ellipsis)
+        .gap(0.0)
+        .padding(8.0)
+        .label(&more_label)
+        .salt(&connection.id.0)
+        .radius(7);
+    let response = if shown {
+        more.show_at(ui, more_place, look, palette)
+    } else {
+        more.hidden_at(ui, more_place)
+    };
+    let id = connection.id.clone();
+    menu::under(&response, 0.0, look, palette, |ui| {
+        let duplicate = gettext(locale, "Duplicate");
+        if menu::Item::action(&duplicate)
+            .show(ui, look, palette)
+            .clicked()
+        {
+            actions.push(Action::DuplicateConnection(id.clone()));
+        }
+        let delete = format!("{} {}", gettext(locale, "Delete"), connection.name);
+        if menu::Item::action(&gettext(locale, "Delete"))
+            .show(ui, look, palette)
+            .on_hover_text(&delete)
+            .clicked()
+        {
+            actions.push(Action::AskDeleteConnection(id.clone()));
+        }
+        if let Some(access) = opening.agents {
+            agents_part(ui, &id, access, (look, palette, locale), actions);
+        }
+    });
+}
+
+/// The terminal look: the environment tag, the name over where it points
+/// and how, and when it was last used at the right.
+#[allow(clippy::too_many_arguments)] // one call site
+fn terminal_row(
+    ui: &mut egui::Ui,
+    connection: &SavedConnection,
+    (store, facts): (
+        &crate::connections::SavedConnections,
+        Option<&crate::model::SourceFacts>,
+    ),
+    selected: Option<&ConnectionId>,
+    opening: Opening,
+    skin: RowSkin<'_>,
+    actions: &mut Vec<Action>,
+) {
+    let RowSkin {
+        look,
+        palette,
+        locale,
+        now,
+        side,
+    } = skin;
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), row_height(look)), Sense::hover());
+    let response = row_response(
+        ui,
+        rect,
+        connection,
+        opening,
+        (look, palette, locale),
+        actions,
+    );
+    let is_selected = selected == Some(&connection.id);
+    let center = rect.center().y;
+    if is_selected {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, palette.selection);
+        // The cursor: an accent block centred in the 22 pt first column.
+        let cursor = Text::one(look, TextRole::OGroup, "▌", palette.accent).layout(ui.ctx());
+        cursor.paint_center(ui.painter(), pos2(rect.left() + 11.0, center));
+    } else if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, palette.text.gamma_multiply(0.05));
+    }
+    // Columns: 22 for the cursor, 110 for the badge, the rest for the
+    // name and its line, 96 for last use (14 in from the right).
+    let env = connection.environment;
+    let colors = crate::env::env_colors(env, crate::env::Platform::of(look), palette);
+    super::workspace::env_badge(
+        ui,
+        rect.left() + 22.0,
+        center,
+        env,
+        &colors,
+        super::workspace::Badge::Plain,
+        look,
+    );
+    let text_x = rect.left() + 22.0 + 110.0;
+    // A 13 pt name and a 12 pt line, 3 apart, centred.
+    let top = center - 9.8;
+    let bottom = center + 9.8;
+    let name_width = widgets::paint_text(
+        ui,
+        text_x,
+        top,
+        Text::one(look, TextRole::OGroup, &connection.name, palette.text),
+    );
+    if opening.open.is_some() {
+        // Open in a tab already: the word in the accent, 10 on.
+        widgets::paint_label(
+            ui,
+            text_x + name_width + 10.0,
+            top,
+            Text::one(
+                look,
+                TextRole::OBody,
+                &gettext(locale, "open"),
+                palette.accent,
+            ),
+        );
+    }
+    let spec = &connection.spec;
+    let mut line = spec.summary();
+    if let Some(at) = line.find(" via ") {
+        line.truncate(at);
+    }
+    let small = TextRole::OSecondary;
+    let (tls, verified) = tls_label(connection);
+    let tls = if verified.is_some() {
+        format!("tls {tls}")
+    } else {
+        tls.to_lowercase()
+    };
+    let tls_color = match verified {
+        Some(true) => palette.success,
+        Some(false) => palette.warning,
+        None => palette.dim,
+    };
+    let ssh = match &spec.ssh {
+        Some(ssh) => format!("ssh {}", ssh.host),
+        None => "no ssh".into(),
+    };
+    // What agents may do, at the line's end: "· agents read".
+    let (agents, agents_color) = match opening.agents {
+        Some(access) => (
+            format!(
+                " · {}",
+                gettext(locale, "agents {level}")
+                    .replace("{level}", &agents_level(access, locale).to_lowercase())
+            ),
+            match access {
+                crate::connections::AgentAccess::Off => palette.dim,
+                crate::connections::AgentAccess::Read => palette.text,
+            },
+        ),
+        None => (String::new(), palette.dim),
+    };
+    // "dev@localhost:5433/bookshop_development · tls verify-full · no ssh",
+    // the separators kept with their neighbours as the design writes them.
+    // A Files connection's line is its own: what it opens, and how much.
+    let said = match terminal_files_line(connection, facts) {
+        Some(files) => Text::new(look).add(small, &files, palette.dim),
+        None => Text::new(look)
+            .add(small, &format!("{line} ·"), palette.dim)
+            .space(small, " ")
+            .add(small, &tls, tls_color)
+            .space(small, " ")
+            .add(small, &format!("· {ssh}"), palette.dim),
+    };
+    widgets::paint_label(ui, text_x, bottom, said.add(small, &agents, agents_color));
+    let when =
+        crate::connections::when(locale, store.last_used(&connection.id), now).to_lowercase();
+    widgets::paint_text_right(
+        ui,
+        rect.right() - side,
+        center,
+        Text::one(look, small, &when, palette.dim),
+    );
+    // Connect (Show, for a connection that is open), for screen readers
+    // and the tests; the keys do it here.
+    let (_, choose) = choose_labels(connection, opening, locale);
+    let hit = Rect::from_min_size(pos2(rect.right() - side - 1.0, rect.top()), vec2(1.0, 1.0));
+    if ButtonSpec::new(&choose)
+        .salt(&connection.id.0)
+        .hidden_at(ui, hit)
+        .clicked()
+    {
+        actions.push(opening.choose(connection));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn choosing_a_row_shows_an_open_connection_and_connects_another() {
+        let connection = SavedConnection {
+            id: ConnectionId::new(),
+            name: "Fixture".into(),
+            environment: crate::env::Environment::Dev,
+            read_only: None,
+            password: crate::connections::PasswordMode::None,
+            ssh_secret: crate::connections::PasswordMode::None,
+            spec: native-sql-database-client-windows_db::ConnectSpec::sqlite("/tmp/fixture.db"),
+            agents: Default::default(),
+        };
+        let picker = crate::model::ConnTabId(1);
+        let open = crate::model::ConnTabId(2);
+        let connects = |action: Action| {
+            let Action::Connect { tab, conn } = action else {
+                return false;
+            };
+            tab == picker && conn == connection.id
+        };
+        // Not open: choosing it connects in the picker's tab.
+        let closed = Opening {
+            tab: picker,
+            open: None,
+            agents: None,
+        };
+        assert!(connects(closed.choose(&connection)));
+        // Open: choosing it shows that tab, and it can still connect again
+        // (the row menu's Connect again, and Shift+Enter).
+        let opened = Opening {
+            tab: picker,
+            open: Some(open),
+            agents: None,
+        };
+        assert!(matches!(
+            opened.choose(&connection),
+            Action::ActivateConnTab(tab) if tab == open
+        ));
+        assert!(connects(opened.connect(&connection)));
+    }
+
+    fn saved(spec: native-sql-database-client-windows_db::ConnectSpec) -> SavedConnection {
+        SavedConnection {
+            id: ConnectionId::new(),
+            name: "Bookshop exports".into(),
+            environment: crate::env::Environment::Local,
+            read_only: Some(true),
+            password: crate::connections::PasswordMode::None,
+            ssh_secret: crate::connections::PasswordMode::None,
+            spec,
+            agents: Default::default(),
+        }
+    }
+
+    fn scan(folder: &str, names: &[&str]) -> crate::model::SourceFacts {
+        use native-sql-database-client-windows_db::files::{Format, Found, Scan};
+        crate::model::SourceFacts::Files(Scan {
+            files: names
+                .iter()
+                .map(|name| Found {
+                    path: format!("{folder}/{name}").into(),
+                    format: Format::of(std::path::Path::new(name)).unwrap(),
+                    size: 625_000_000,
+                    name: name.split('.').next().unwrap_or_default().to_owned(),
+                })
+                .collect(),
+            missing: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn a_files_rows_say_how_many_files_and_what_they_become() {
+        use native-sql-database-client-windows_db::files::Source;
+        let folder = saved(native-sql-database-client-windows_db::ConnectSpec::files(Source::Folder(
+            "/data/bookshop-exports".into(),
+        )));
+        let facts = scan(
+            "/data/bookshop-exports",
+            &[
+                "orders.csv",
+                "customers.parquet",
+                "events.ndjson",
+                "returns.csv",
+            ],
+        );
+        let text = file_row_text(&folder, Some(&facts)).unwrap();
+        assert_eq!(text.second, "Files · 4 files · 2.5 GB");
+        assert_eq!(
+            text.middle,
+            (
+                "/data/bookshop-exports".to_owned(),
+                "orders, customers, events, returns".to_owned()
+            )
+        );
+        assert_eq!(
+            text.right
+                .map(|(writes, joins)| (writes.english(), joins.english())),
+            Some(("Read-only", "No joins"))
+        );
+        assert_eq!(
+            terminal_files_line(&folder, Some(&facts)).as_deref(),
+            Some("files · /data/bookshop-exports · 4 files · 2.5 gb")
+        );
+        // The path keeps its case in the terminal look's line.
+        let cased = saved(native-sql-database-client-windows_db::ConnectSpec::files(Source::Folder(
+            "/srv/Data/Bookshop-Exports".into(),
+        )));
+        assert_eq!(
+            terminal_files_line(&cased, None).as_deref(),
+            Some("files · /srv/Data/Bookshop-Exports")
+        );
+        // Before the files are read: the type alone.
+        assert_eq!(file_row_text(&folder, None).unwrap().second, "Files");
+        // A list: its first files, then their folder.
+        let list = saved(native-sql-database-client-windows_db::ConnectSpec::files(Source::Files(vec![
+            "/data/bookshop-exports/orders.csv".into(),
+            "/data/bookshop-exports/customers.parquet".into(),
+        ])));
+        let facts = scan(
+            "/data/bookshop-exports",
+            &["orders.csv", "customers.parquet"],
+        );
+        let text = file_row_text(&list, Some(&facts)).unwrap();
+        assert_eq!(text.second, "Files · 2 files · 1.2 GB");
+        assert_eq!(
+            text.middle,
+            (
+                "orders.csv, customers.parquet".to_owned(),
+                "/data/bookshop-exports".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn a_sqlite_row_says_its_size_and_its_folder_over_its_file() {
+        let sqlite = saved(native-sql-database-client-windows_db::ConnectSpec::sqlite(
+            "/code/bookshop/storage/development.sqlite3",
+        ));
+        let text = file_row_text(
+            &sqlite,
+            Some(&crate::model::SourceFacts::File { size: 12_400_000 }),
+        )
+        .unwrap();
+        assert_eq!(text.second, "SQLite · 12.4 MB");
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(
+            text.middle,
+            (
+                format!("/code/bookshop/storage{sep}"),
+                "development.sqlite3".to_owned()
+            )
+        );
+        assert_eq!(text.right, None);
+        assert_eq!(terminal_files_line(&sqlite, None), None);
+        // A server's row is its own.
+        let (server, _) = native-sql-database-client-windows_db::ConnectSpec::from_url("postgres://me@db/app").unwrap();
+        assert_eq!(file_row_text(&saved(server), None), None);
+    }
+}

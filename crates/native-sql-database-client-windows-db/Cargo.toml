@@ -1,0 +1,86 @@
+[package]
+name = "native-sql-database-client-windows-db"
+version = "0.1.0"
+description = "Access to PostgreSQL, MySQL, SQLite and BigQuery for native-sql-database-client-windows"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Typed errors the app shows to the user as-is.
+thiserror = "2"
+# Connection specs were saved in connections.json, which is still read.
+serde = { version = "1", features = ["derive"] }
+# Adapters are async; SQLite's blocking calls run on spawn_blocking. An SSH
+# tunnel's ProxyCommand or ProxyJump runs as a child process.
+tokio = { version = "1", features = ["rt", "sync", "net", "io-util", "time", "process"] }
+# SSH tunnels, on ring (no aws-lc to build).
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
+# SQLite, compiled in so every platform gets the same, recent version. hooks
+# gives the progress handler that stops a SQL editor script.
+rusqlite = { version = "0.41", features = ["bundled", "hooks"] }
+# A result column's name and declared type, and the names SQLite asks its
+# authorizer about, as bytes: rusqlite panics on ones that are not UTF-8, and
+# reading them past it needs unsafe code, which this crate forbids.
+native-sql-database-client-windows-sqlite-ffi = { path = "../native-sql-database-client-windows-sqlite-ffi" }
+# Parsing postgres:// and mysql:// connection URLs.
+url = "2"
+# Decoding user names, passwords and database names in URLs.
+percent-encoding = "2"
+log = "0.4"
+# Reads the one statement an agent sends through the MCP server, in each
+# database's own dialect, so `agent` can let through the kinds of statement
+# it knows and refuse the rest: the tokenizer in `sql` cannot say what a
+# statement is. Without its default `recursive-protection` (the `recursive`
+# and `stacker` crates, with assembly to build), which guards the parser and
+# not what overflows: `agent` parses on a thread whose stack it sizes itself.
+sqlparser = { version = "0.63", default-features = false, features = ["std"] }
+
+# PostgreSQL, async. Rows are read through its simple-query protocol.
+tokio-postgres = "0.7"
+# The buffer tokio-postgres hands a value to write itself into: an agent's
+# value is sent as text, by a `ToSql` of its own (already in the tree
+# through tokio-postgres).
+bytes = "1"
+# TLS for tokio-postgres on rustls (no OpenSSL to build or ship).
+tokio-postgres-rustls = "0.14"
+# ring rather than aws-lc: no cmake/NASM needed to build on Windows.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# The operating system's trusted roots for verify-ca and verify-full.
+rustls-native-certs = "0.8"
+# Reading a CA file (PEM) the user chose.
+rustls-pki-types = { version = "1", features = ["std"] }
+# Reading PostgreSQL's simple-query row stream one row at a time (already
+# in the tree through tokio-postgres).
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# MySQL, async. rustls on ring (like PostgreSQL); no aws-lc, no OpenSSL.
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
+# mysql_async's own protocol crate (already in the tree), for its reading of
+# `:name` parameters: a raw WHERE or SQL editor text it would rewrite is not
+# run. Moves with mysql_async; mysql.rs fails to compile if the two drift apart.
+mysql_common = { version = "0.37", default-features = false }
+
+# The plans PostgreSQL and MySQL give in JSON, read for the tables an
+# agent's statement would scan (`agent`'s hidden tables). Already in the
+# tree through the app and mysql_async.
+serde_json = "1"
+
+# BigQuery over its REST API (there is no wire protocol), with rustls on
+# ring like the other two network drivers. No cloud-storage load jobs.
+gcp-bigquery-client = { version = "0.28", default-features = false, features = ["rust-tls", "ring"] }
+# BigQuery's BYTES cells are base64 in JSON, and its TIMESTAMP cells
+# seconds since the epoch (both already in the tree).
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std", "alloc"] }
+# Files connections: DuckDB, compiled in, reads CSV, Parquet, JSON and
+# .duckdb files as tables. `parquet` and `json` build those readers into
+# the library; the rest install on first use.
+duckdb = { version = "1.20000.1", features = ["bundled", "parquet", "json"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
+tempfile = "3"

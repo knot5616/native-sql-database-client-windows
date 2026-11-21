@@ -1,0 +1,12 @@
+kind = "app"
+categories = ["Development"]
+icon = "assets/icon/native-sql-database-client-windows-256.png"
+screenshots = ["assets/screenshots/omarchy.png"]
+
+[linux.x86_64]
+asset = "native-sql-database-client-windows-{tag}-x86_64-unknown-linux-gnu.tar.gz"
+exec = "native-sql-database-client-windows-{tag}-x86_64-unknown-linux-gnu/native-sql-database-client-windows"
+
+[linux.aarch64]
+asset = "native-sql-database-client-windows-{tag}-aarch64-unknown-linux-gnu.tar.gz"
+exec = "native-sql-database-client-windows-{tag}-aarch64-unknown-linux-gnu/native-sql-database-client-windows"

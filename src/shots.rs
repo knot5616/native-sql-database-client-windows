@@ -1,0 +1,2359 @@
+//! Screenshots for visual review: `cargo test --features shots --lib
+//! shots -- --ignored` writes PNGs to target/shots/ (Retina scale, light and
+//! dark). Needs a GPU (wgpu); never part of the normal suite.
+
+#![allow(clippy::unwrap_used)]
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use native-sql-database-client-windows_db::{
+    ColumnInfo, ColumnMeta, ConnectSpec, Driver, ForeignKeyInfo, IndexInfo, ObjectInfo, ObjectKind,
+    ObjectRef, RowPage, Structure, Value, ValueKind,
+};
+
+use crate::connections::{ConnectionId, PasswordMode, SavedConnection};
+use crate::env::Environment;
+use crate::model::{Action, Advance, CellPos, ConnTabId, EditStart, RunMode, TabId};
+use crate::testing::Harness;
+
+const SIZE: egui::Vec2 = egui::vec2(1000.0, 650.0);
+
+fn out(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/shots")
+        .join(name)
+}
+
+/// A made-up bookshop: screenshots never show a real project's names or data.
+fn saved() -> SavedConnection {
+    let (spec, _) =
+        ConnectSpec::from_url("postgres://demo@localhost:5432/bookshop_development").unwrap();
+    SavedConnection {
+        id: ConnectionId::new(),
+        name: "Bookshop".into(),
+        environment: Environment::Dev,
+        read_only: None,
+        password: PasswordMode::None,
+        ssh_secret: PasswordMode::None,
+        spec,
+        agents: Default::default(),
+    }
+}
+
+/// The Bookshop's production database behind a bastion, open in the
+/// connection dialog after a Test that passed: the scene the dialog's
+/// mockups show.
+fn edit_production(harness: &mut Harness) {
+    let (mut spec, _) = ConnectSpec::from_url(
+        "postgres://app_readonly@db.example.com:5432/bookshop_production?sslmode=verify-full",
+    )
+    .unwrap();
+    spec.ca_file = Some("ca-bundle.pem".into());
+    spec.ssh = Some(native-sql-database-client-windows_db::SshSpec {
+        host: "bastion.example.com".into(),
+        port: Some(22),
+        user: "deploy".into(),
+        auth: native-sql-database-client-windows_db::SshAuth::KeyFile {
+            path: "~/.ssh/id_ed25519".into(),
+        },
+    });
+    // The picker's scene has this connection already: edit that one.
+    let id = harness
+        .app
+        .connections
+        .connections
+        .iter()
+        .find(|connection| connection.spec.database == "bookshop_production")
+        .map_or_else(ConnectionId::new, |connection| connection.id.clone());
+    harness.app.connections.upsert(SavedConnection {
+        id: id.clone(),
+        name: "Bookshop".into(),
+        environment: Environment::Production,
+        read_only: None,
+        password: PasswordMode::Keyring,
+        ssh_secret: PasswordMode::None,
+        spec,
+        agents: Default::default(),
+    });
+    harness.app.apply(Action::EditConnection(id));
+    if let Some(crate::model::Dialog::Connection(form)) = &mut harness.app.dialog {
+        form.test = crate::model::TestState::Passed;
+        form.test_took = Some(Duration::from_millis(42));
+    }
+}
+
+const TABLES: [&str; 30] = [
+    "addresses",
+    "authors",
+    "book_authors",
+    "book_categories",
+    "book_images",
+    "book_reviews",
+    "books",
+    "carts",
+    "cart_items",
+    "categories",
+    "coupons",
+    "customer_preferences",
+    "customers",
+    "gift_cards",
+    "inventory_movements",
+    "invoices",
+    "newsletter_subscriptions",
+    "order_items",
+    "orders",
+    "payment_methods",
+    "payments",
+    "publishers",
+    "refunds",
+    "returns",
+    "sessions",
+    "shipments",
+    "shipping_zones",
+    "stores",
+    "suppliers",
+    "wishlists",
+];
+
+fn page() -> RowPage {
+    page_of(13)
+}
+
+/// The first `rows` rows of `book_images`.
+fn page_of(rows: i64) -> RowPage {
+    let column = |name: &str, type_name: &str, kind| ColumnMeta {
+        name: name.into(),
+        type_name: type_name.into(),
+        kind,
+    };
+    let rows = (0..rows)
+        .map(|i| {
+            vec![
+                Value::Int(i + 2),
+                Value::Int(1_048_576 + i * 7_919),
+                Value::Text(if i % 2 == 0 { "cover" } else { "preview" }.into()),
+                Value::Text(format!(
+                    r#"{{"id": "books/{}/images/3f9c2a7d.png", "metadata": {{"filename": "cover.png", "height": 1600, "mime_type": "image/png", "size": 184320, "width": 1024}}, "storage": "store"}}"#,
+                    i + 2
+                ).into()),
+                Value::Text("2026-06-03 15:47:52.977704".into()),
+                Value::Null,
+            ]
+        })
+        .collect();
+    RowPage {
+        columns: vec![
+            column("id", "int8", ValueKind::Numeric),
+            column("book_id", "int8", ValueKind::Numeric),
+            column("kind", "varchar", ValueKind::Text),
+            column("image_data", "jsonb", ValueKind::Json),
+            column("created_at", "timestamp", ValueKind::Temporal),
+            column("deleted_at", "timestamp", ValueKind::Temporal),
+        ],
+        rows,
+        has_more: false,
+        ordered_by_key: true,
+        elapsed: Duration::from_millis(3),
+    }
+}
+
+/// What `book_images` describes as: the columns of [`page`], its
+/// primary key, two indexes and one foreign key.
+fn structure() -> Structure {
+    let column = |name: &str, type_name: &str, nullable, default: Option<&str>| ColumnInfo {
+        name: name.into(),
+        type_name: type_name.into(),
+        nullable,
+        default: default.map(Into::into),
+        // Two of them say what they hold, as a Bookshop's author would.
+        comment: match name {
+            "kind" => Some("Cover or preview page".into()),
+            "image_data" => Some("Its width, height and the address of each size".into()),
+            _ => None,
+        },
+        // `kind` has a CHECK (kind IN ('cover', 'preview')).
+        allowed_values: (name == "kind").then(|| vec!["cover".into(), "preview".into()]),
+        generated: false,
+        // `id` is a bigserial: the database numbers it.
+        identity: name == "id",
+    };
+    Structure {
+        columns: vec![
+            column(
+                "id",
+                "bigint",
+                false,
+                Some("nextval('book_images_id_seq'::regclass)"),
+            ),
+            column("book_id", "bigint", false, None),
+            column(
+                "kind",
+                "character varying",
+                false,
+                Some("'cover'::character varying"),
+            ),
+            column("image_data", "jsonb", true, None),
+            column("created_at", "timestamp(6) without time zone", false, None),
+            column("deleted_at", "timestamp(6) without time zone", true, None),
+        ],
+        primary_key: vec!["id".into()],
+        indexes: vec![
+            IndexInfo {
+                name: "book_images_pkey".into(),
+                columns: vec!["id".into()],
+                key_columns: Some(vec!["id".into()]),
+                unique: true,
+                primary: true,
+                method: Some("btree".into()),
+                partial: false,
+            },
+            IndexInfo {
+                name: "index_book_images_on_book_id_and_kind".into(),
+                columns: vec!["book_id".into(), "kind".into()],
+                key_columns: Some(vec!["book_id".into(), "kind".into()]),
+                unique: true,
+                primary: false,
+                method: Some("btree".into()),
+                partial: false,
+            },
+        ],
+        foreign_keys: vec![ForeignKeyInfo {
+            name: Some("fk_rails_3b1d8f0c2e".into()),
+            columns: vec!["book_id".into()],
+            ref_schema: "public".into(),
+            ref_table: "books".into(),
+            ref_columns: vec!["id".into()],
+            on_update: "NO ACTION".into(),
+            on_delete: "CASCADE".into(),
+        }],
+        referenced_by: Vec::new(),
+        comment: Some("The pictures of a book: its cover and the pages of its preview".into()),
+        file: None,
+    }
+}
+
+/// Some of the Bookshop's books, as (id, title): what the picker of
+/// `book_images.book_id` finds. The ids are ones [`page_of`] points at.
+const BOOKS: [(i64, &str); 5] = [
+    (1_048_576, "The Lighthouse Keeper's Daughter"),
+    (1_056_495, "Small Rooms"),
+    (1_064_414, "Small Rooms, Second Edition"),
+    (1_072_333, "Lighthouses of the North Coast"),
+    (1_080_252, "A Year of Tides"),
+];
+
+/// What `books` describes as, as far as a picker reads it: its key and
+/// the column a book is read by.
+fn books_structure() -> Structure {
+    let column = |name: &str, type_name: &str| ColumnInfo {
+        name: name.into(),
+        type_name: type_name.into(),
+        ..ColumnInfo::default()
+    };
+    Structure {
+        // As a structure names PostgreSQL's types: `column_class` reads
+        // `character varying` as text, and not the page's `varchar`.
+        columns: vec![column("id", "bigint"), column("title", "character varying")],
+        primary_key: vec!["id".into()],
+        ..Structure::default()
+    }
+}
+
+/// Answers what a picker of `book_id` asked: the books' columns, then
+/// its lookups.
+fn answer_books(harness: &mut Harness) {
+    harness.answer_structure(books_structure());
+    harness.answer_lookups(&BOOKS);
+}
+
+/// A connected PostgreSQL-looking tab with a table open and row 5 selected.
+fn workspace(harness: &mut Harness) -> ConnTabId {
+    let tab = harness.connect_fake();
+    let saved = saved();
+    let workspace = harness.app.workspace_mut(tab).unwrap();
+    workspace.name = saved.name.clone();
+    workspace.environment = saved.environment;
+    // The fixture's session is read-only; Bookshop's would not be.
+    workspace.access = saved.access();
+    workspace.spec = saved.spec.clone();
+    workspace.driver = Driver::Postgres;
+    workspace.databases.value = Some(vec![
+        "bookshop_development".into(),
+        "bookshop_test".into(),
+        "postgres".into(),
+    ]);
+    tables(harness, tab);
+    tab
+}
+
+/// The Bookshop's tables in the tree of `tab`, `books` and `book_images`
+/// open and row 5 of the second selected.
+fn tables(harness: &mut Harness, tab: ConnTabId) {
+    let workspace = harness.app.workspace_mut(tab).unwrap();
+    workspace.tree.schemas.value = Some(vec!["public".into()]);
+    let node = workspace.tree.nodes.entry("public".into()).or_default();
+    node.expanded = true;
+    node.objects.value = Some(
+        TABLES
+            .iter()
+            .map(|name| ObjectInfo {
+                name: (*name).into(),
+                kind: ObjectKind::Table,
+                estimated_rows: Some(13),
+            })
+            .collect(),
+    );
+    // A second, inactive tab next to the active one.
+    for name in ["books", "book_images"] {
+        harness.app.apply(Action::OpenObject {
+            tab,
+            object: ObjectRef::new("public", name),
+            kind: ObjectKind::Table,
+            pin: true,
+        });
+        harness.answer_rows(page());
+    }
+    let object_tab = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+    harness.app.apply(Action::SelectCell {
+        tab,
+        id: object_tab,
+        cell: CellPos { row: 4, col: 0 },
+    });
+}
+
+/// Bookshop's production database open beside the scene's `own`
+/// connection: the header's second chip, as the mockups show it.
+fn production_beside(harness: &mut Harness, own: ConnTabId) -> ConnTabId {
+    harness.app.apply(Action::ShowConnections);
+    let tab = harness.connect_fake();
+    let (spec, _) = ConnectSpec::from_url(
+        "postgres://app_readonly@db.example.com:5432/bookshop_production?sslmode=verify-full",
+    )
+    .unwrap();
+    let workspace = harness.app.workspace_mut(tab).unwrap();
+    workspace.name = "Bookshop".into();
+    workspace.environment = Environment::Production;
+    // Its box never set: production's default.
+    workspace.access = crate::connections::access(None, workspace.environment);
+    workspace.spec = spec;
+    workspace.driver = Driver::Postgres;
+    harness.app.apply(Action::ActivateConnTab(own));
+    tab
+}
+
+/// `book_images` with its structure known, so its cells can be edited:
+/// the connection and the table's tab.
+fn editable(harness: &mut Harness) -> (ConnTabId, TabId) {
+    let tab = workspace(harness);
+    // The newest describe is the active table's.
+    harness.answer_structure(structure());
+    let id = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+    (tab, id)
+}
+
+/// Types `text` over the value of the cell at `(row, col)` and leaves the
+/// cell: pending, or to fix when its column does not take the text.
+fn retype(
+    harness: &mut Harness,
+    tab: ConnTabId,
+    id: TabId,
+    (row, col): (usize, usize),
+    text: &str,
+) {
+    harness.app.apply(Action::EditCell {
+        tab,
+        id,
+        cell: CellPos { row, col },
+        start: EditStart::Replace(text.into()),
+    });
+    harness
+        .app
+        .apply(crate::testing::leave_edit(&harness.app, tab, id));
+}
+
+/// Image 3 becomes a cover that was deleted this morning: two pending
+/// cells in one row.
+fn retire_image(harness: &mut Harness, tab: ConnTabId, id: TabId) {
+    retype(harness, tab, id, (1, KIND), "cover");
+    retype(harness, tab, id, (1, DELETED_AT), DELETED);
+}
+
+/// The selection back on row 5, off the cells that show a state.
+fn step_aside(harness: &mut Harness, tab: ConnTabId, id: TabId) {
+    harness.app.apply(Action::SelectCell {
+        tab,
+        id,
+        cell: CellPos { row: 4, col: 0 },
+    });
+}
+
+/// What puts a scene on a harness.
+type Scene = fn(&mut Harness);
+
+// Columns of `page` by their place.
+const BOOK_ID: usize = 1;
+const KIND: usize = 2;
+const IMAGE_DATA: usize = 3;
+const CREATED_AT: usize = 4;
+const DELETED_AT: usize = 5;
+
+/// When the scenes' image was deleted.
+const DELETED: &str = "2026-10-04 09:30:00";
+
+/// Editing a table's values, one scene per state. Each is reached as a
+/// user reaches it, through the model, so it is the same state in every
+/// look: the bar, the tints and the dialogs on macOS and Windows; the mode
+/// line, the gutter and the error line on Omarchy.
+const EDITING: [(&str, Scene); 17] = [
+    ("edit-new-row", edit_new_row),
+    ("edit-new-row-filled", edit_new_row_filled),
+    ("edit-new-row-failed", edit_new_row_failed),
+    ("edit-pending", edit_pending),
+    ("edit-delete-row", edit_delete_row),
+    ("edit-review", edit_review),
+    ("edit-field", edit_field),
+    ("edit-key-picker", edit_key_picker),
+    ("edit-key-picker-current", edit_key_picker_current),
+    ("edit-key-missing", edit_key_missing),
+    ("edit-large", edit_large),
+    ("edit-saved", edit_saved),
+    ("edit-failed", edit_failed),
+    ("edit-conflict", edit_conflict),
+    ("edit-conflict-gone", edit_conflict_gone),
+    ("edit-leave", edit_leave),
+    ("edit-production", edit_to_production),
+];
+
+/// The row panel's fields, one scene per state, in every look.
+const ROW_FORM: [(&str, Scene); 11] = [
+    ("row-form-new-row", row_form_new_row),
+    ("row-form-new-row-filled", row_form_new_row_filled),
+    ("row-form-field", row_form_field),
+    ("row-form-key-picker", row_form_key_picker),
+    ("row-form-key-missing", row_form_key_missing),
+    ("row-form-locked", row_form_locked),
+    ("row-form-pending", row_form_pending),
+    ("row-form-read-only", row_form_read_only),
+    ("row-form-tall", row_form_tall),
+    ("row-form-json", row_form_json),
+    ("row-form-json-broken", row_form_json_broken),
+];
+
+/// A new row in the row panel, nothing set in it yet: the form to fill in,
+/// what a save needs first and what the database gives last.
+fn row_form_new_row(harness: &mut Harness) {
+    edit_new_row(harness);
+    let (tab, id) = active(harness);
+    harness.app.apply(Action::CancelEdit { tab, id });
+}
+
+/// The same form with its book given and a kind that is no default any
+/// more: what is set, among what the database will fill.
+fn row_form_new_row_filled(harness: &mut Harness) {
+    edit_new_row(harness);
+    let (tab, id) = active(harness);
+    let new = crate::edit::new_row(0);
+    retype(harness, tab, id, (new, BOOK_ID), "107233");
+    retype(harness, tab, id, (new, KIND), "preview");
+    let cell = CellPos {
+        row: new,
+        col: IMAGE_DATA,
+    };
+    harness.app.apply(Action::SelectCell { tab, id, cell });
+}
+
+/// A field of the row panel being edited: the editor in the value's place,
+/// holding a text its column does not take. The field is red, why stands
+/// under it in the panel's flow, and the key's list hangs under that,
+/// saying no books match. Another field of the row is pending.
+fn row_form_field(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    retype(harness, tab, id, (4, DELETED_AT), DELETED);
+    harness.app.apply(Action::EditField {
+        tab,
+        id,
+        cell: CellPos {
+            row: 4,
+            col: BOOK_ID,
+        },
+        start: EditStart::Value,
+    });
+    let workspace = harness.app.workspace_mut(tab).unwrap();
+    let editor = workspace.object_tab_mut(id).unwrap().edits.editor.as_mut();
+    editor.expect("the panel's editor").text = "107233x".into();
+    // What the field says when its text changed: the check runs.
+    harness.app.apply(Action::EditorTyped { tab, id });
+    // A foreign key's field says why only once a commit took the text and
+    // the column refused it. The commit waits for the list, which is
+    // answered now; the kept Enter then finds the text refused.
+    harness.app.apply(Action::CommitEdit {
+        tab,
+        id,
+        then: Advance::Stay,
+    });
+    answer_books(harness);
+}
+
+/// The same picker in the row panel: the key's field searched for
+/// `rooms`, the two books it finds under it, the first highlighted.
+fn row_form_key_picker(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    harness.app.apply(Action::EditField {
+        tab,
+        id,
+        cell: CellPos {
+            row: 4,
+            col: BOOK_ID,
+        },
+        start: EditStart::Replace("rooms".into()),
+    });
+    answer_books(harness);
+}
+
+/// The same key in the row panel, kept as typed: the field holds `999`,
+/// no book has it, and the words stand under its value. Save is offered.
+fn row_form_key_missing(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    harness.app.apply(Action::EditField {
+        tab,
+        id,
+        cell: CellPos {
+            row: 4,
+            col: BOOK_ID,
+        },
+        start: EditStart::Replace("999".into()),
+    });
+    answer_books(harness);
+    harness.app.apply(Action::CommitEdit {
+        tab,
+        id,
+        then: Advance::Stay,
+    });
+    // The question the kept key raises: no book has it.
+    answer_books(harness);
+}
+
+/// An edit asked for on the key's field: its lock, and why under its value
+/// (the terminal look says it in its mode line).
+fn row_form_locked(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    harness.app.apply(Action::EditField {
+        tab,
+        id,
+        cell: CellPos { row: 4, col: 0 },
+        start: EditStart::Value,
+    });
+}
+
+/// What a field says of its cell: one pending, with what it was and the
+/// way back, one to fix, with what its column refuses, and the keyboard on
+/// a third. The header counts the row's changes.
+fn row_form_pending(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    retype(harness, tab, id, (4, KIND), "preview");
+    retype(harness, tab, id, (4, BOOK_ID), "107233x");
+    let cell = CellPos { row: 4, col: 0 };
+    harness.app.apply(Action::SelectCell { tab, id, cell });
+    let workspace = harness.app.workspace_mut(tab).unwrap();
+    workspace.object_tab_mut(id).unwrap().focus_field = Some(DELETED_AT);
+    // The ring shows once the keyboard is in use.
+    harness.settle();
+    harness.press(egui::Key::ArrowUp, egui::Modifiers::NONE);
+}
+
+/// A text of several lines being edited in the panel: the tall field in
+/// its value's place, with its band.
+fn row_form_tall(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    let cell = CellPos { row: 4, col: KIND };
+    let start = EditStart::Value;
+    harness.app.apply(Action::EditField {
+        tab,
+        id,
+        cell,
+        start,
+    });
+    // Alt+Enter: the field is tall from here on.
+    harness.app.apply(Action::EditorBreak { tab, id });
+    let workspace = harness.app.workspace_mut(tab).unwrap();
+    let editor = workspace.object_tab_mut(id).unwrap().edits.editor.as_mut();
+    editor.expect("the panel's editor").text = "preview\nof the second edition".into();
+    harness.app.apply(Action::EditorTyped { tab, id });
+}
+
+/// A document being edited in the panel, laid out: its lines numbered, its
+/// syntax in colour, and the band saying it is valid.
+fn row_form_json(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    let cell = CellPos {
+        row: 4,
+        col: IMAGE_DATA,
+    };
+    let start = EditStart::Value;
+    harness.app.apply(Action::EditField {
+        tab,
+        id,
+        cell,
+        start,
+    });
+    harness.app.apply(Action::FormatEditor { tab, id });
+}
+
+/// The same with a piece typed after it that breaks it: the editor's line
+/// is the failure's, and the band says what the check says.
+fn row_form_json_broken(harness: &mut Harness) {
+    row_form_json(harness);
+    let tab = harness.app.active_tab_id();
+    let id = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+    let workspace = harness.app.workspace_mut(tab).unwrap();
+    let editor = workspace.object_tab_mut(id).unwrap().edits.editor.as_mut();
+    editor
+        .expect("the panel's editor")
+        .text
+        .push_str(" \"lang\"");
+    harness.app.apply(Action::EditorTyped { tab, id });
+}
+
+/// A row of a read-only connection: the panel's first line says so, and
+/// its values are text to read.
+fn row_form_read_only(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    harness.app.workspace_mut(tab).unwrap().access = native-sql-database-client-windows_db::Access::ReadOnly;
+    let cell = CellPos { row: 4, col: 0 };
+    harness.app.apply(Action::SelectCell { tab, id, cell });
+}
+
+/// Three pending cells in two rows, one of them a book's id that is no
+/// number: the counts, and "1 to fix" where a save would be.
+fn edit_pending(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    retire_image(harness, tab, id);
+    retype(harness, tab, id, (3, BOOK_ID), "107233x");
+    step_aside(harness, tab, id);
+}
+
+/// A row marked for deletion beside a changed one: the row's own fill and
+/// bar, its values struck through, the minus before its key (the
+/// terminal's `-` in the gutter), and the bar that counts it.
+fn edit_delete_row(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    retire_image(harness, tab, id);
+    let cell = CellPos { row: 2, col: 0 };
+    harness.app.apply(Action::SelectCell { tab, id, cell });
+    harness.app.apply(Action::DeleteRow { tab, id });
+    step_aside(harness, tab, id);
+}
+
+/// Review SQL open on those three cells: the statement of the row a save
+/// can send, under its two comments, and the row whose book is no number
+/// as a comment alone. The drawer above the bar on macOS and Windows, the
+/// `:diff` panel above the status line on Omarchy.
+fn edit_review(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    retire_image(harness, tab, id);
+    retype(harness, tab, id, (3, BOOK_ID), "107233x");
+    step_aside(harness, tab, id);
+    let show = true;
+    harness.app.apply(Action::ReviewEdits { tab, id, show });
+}
+
+/// The field open on a cell, holding a text its column does not take: red,
+/// with why. Two cells are pending beside it, for the counts.
+fn edit_field(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    retire_image(harness, tab, id);
+    harness.app.apply(Action::EditCell {
+        tab,
+        id,
+        cell: CellPos {
+            row: 3,
+            col: BOOK_ID,
+        },
+        start: EditStart::Replace("107233x".into()),
+    });
+    // What the field says when its text changed: the check runs.
+    harness.app.apply(Action::EditorTyped { tab, id });
+    // A foreign key's field says why only once a commit took the text and
+    // the column refused it. The commit waits for the list, which is
+    // answered now; the kept Enter then finds the text refused.
+    harness.app.apply(Action::CommitEdit {
+        tab,
+        id,
+        then: Advance::Stay,
+    });
+    answer_books(harness);
+}
+
+/// The picker of a foreign key cell: `light` typed on `book_id`, the two
+/// books it finds under the cell, the first highlighted.
+fn edit_key_picker(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    harness.app.apply(Action::EditCell {
+        tab,
+        id,
+        cell: CellPos {
+            row: 2,
+            col: BOOK_ID,
+        },
+        start: EditStart::Typed("light".into()),
+    });
+    answer_books(harness);
+}
+
+/// The picker on the value of a foreign key cell: the table's first books,
+/// the one the cell points at first and marked as current.
+fn edit_key_picker_current(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    harness.app.apply(Action::EditCell {
+        tab,
+        id,
+        cell: CellPos {
+            row: 1,
+            col: BOOK_ID,
+        },
+        start: EditStart::Value,
+    });
+    answer_books(harness);
+}
+
+/// A key no book has, typed on `book_id` and kept as typed, in the grid
+/// alone: the cell is pending and outlined, the bar counts the warning
+/// ("1 change in 1 row · 1 value names no row"), Save is offered, and the
+/// terminal look says it under the grid. The row panel says it in
+/// `row_form_key_missing`.
+fn edit_key_missing(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    // The grid has its width, and the bar room for all its counts.
+    harness.app.apply(Action::ToggleRowPanel(tab));
+    harness.app.apply(Action::EditCell {
+        tab,
+        id,
+        cell: CellPos {
+            row: 2,
+            col: BOOK_ID,
+        },
+        start: EditStart::Replace("999".into()),
+    });
+    answer_books(harness);
+    harness.app.apply(Action::CommitEdit {
+        tab,
+        id,
+        then: Advance::Stay,
+    });
+    // The question the kept key raises: no book has it.
+    answer_books(harness);
+}
+
+/// The popover, on the JSON column.
+fn edit_large(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    harness.app.apply(Action::EditCell {
+        tab,
+        id,
+        cell: CellPos {
+            row: 4,
+            col: IMAGE_DATA,
+        },
+        start: EditStart::Value,
+    });
+}
+
+/// Just after a save that wrote: the two cells green, and the footer's
+/// "written 2 changes".
+fn edit_saved(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    retire_image(harness, tab, id);
+    step_aside(harness, tab, id);
+    harness.app.apply(Action::WriteEdits { tab, id });
+    // The row as the database holds it now.
+    let mut row = page().rows.swap_remove(1);
+    row[KIND] = Value::Text("cover".into());
+    row[DELETED_AT] = Value::Text(DELETED.into());
+    harness.answer_written(Ok(native-sql-database-client-windows_db::WriteOutcome::Written {
+        inserted: Vec::new(),
+        rows: vec![row],
+        elapsed: Duration::from_millis(14),
+        gone: Vec::new(),
+    }));
+}
+
+/// A new row, its first required cell open: the row's own fill and its
+/// marker, what the database will fill the other cells with, and the bar
+/// that waits for a value. Under the header in the desktop looks; in the
+/// terminal look below the row the cursor was on.
+fn edit_new_row(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    let place = if harness.app.look.terminal {
+        crate::edit::Place::Below(0)
+    } else {
+        crate::edit::Place::Top
+    };
+    harness.app.apply(Action::AddRow { tab, id, place });
+    answer_books(harness);
+}
+
+/// The new row with its book given and the rest still to come, and a
+/// changed cell beside it: what the bar counts, with the selection away.
+fn edit_new_row_filled(harness: &mut Harness) {
+    edit_new_row(harness);
+    let (tab, id) = active(harness);
+    retype(
+        harness,
+        tab,
+        id,
+        (crate::edit::new_row(0), BOOK_ID),
+        "107233",
+    );
+    retype(harness, tab, id, (3, KIND), "cover");
+    step_aside(harness, tab, id);
+}
+
+/// A new row whose save the database refused: the row in red, saying the
+/// database's words, and the bar saying that nothing was saved.
+fn edit_new_row_failed(harness: &mut Harness) {
+    edit_new_row(harness);
+    let (tab, id) = active(harness);
+    let new = crate::edit::new_row(0);
+    retype(harness, tab, id, (new, BOOK_ID), "999");
+    retype(harness, tab, id, (new, CREATED_AT), "2026-10-07 10:42:09");
+    step_aside(harness, tab, id);
+    // Without the row panel, as the failed save of a changed row is shown.
+    harness.app.apply(Action::ToggleRowPanel(tab));
+    harness.app.apply(Action::WriteEdits { tab, id });
+    harness.answer_written(Ok(native-sql-database-client-windows_db::WriteOutcome::FailedInsert {
+        insert: 0,
+        error: native-sql-database-client-windows_db::Error::Query {
+            code: Some("23503".into()),
+            message: "insert or update on table \"book_images\" violates foreign key \
+                      constraint \"fk_rails_3b1d8f0c2e\""
+                .into(),
+            detail: Some("Key (book_id)=(999) is not present in table \"books\".".into()),
+            hint: None,
+            named: Box::default(),
+        },
+    }));
+}
+
+/// The connection's tab and the table's that a scene's `editable` opened.
+fn active(harness: &Harness) -> (ConnTabId, TabId) {
+    let tab = harness.app.active_tab_id();
+    let id = harness.app.workspace(tab).and_then(|w| w.active_tab);
+    (tab, id.expect("the table's tab"))
+}
+
+/// A save the database refused: image 3 was given a book that is not
+/// there. Its row is red and says the database's words; the other row's
+/// change is still pending, and nothing was written.
+fn edit_failed(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    retype(harness, tab, id, (1, BOOK_ID), "999");
+    retype(harness, tab, id, (3, KIND), "cover");
+    step_aside(harness, tab, id);
+    // Without the row panel: beside it, a window this wide leaves the
+    // bar's line no room, and it is cut down to its "…".
+    harness.app.apply(Action::ToggleRowPanel(tab));
+    harness.app.apply(Action::WriteEdits { tab, id });
+    harness.answer_written(Ok(native-sql-database-client-windows_db::WriteOutcome::Failed {
+        row: 0,
+        error: native-sql-database-client-windows_db::Error::Query {
+            code: Some("23503".into()),
+            message: "insert or update on table \"book_images\" violates foreign key \
+                      constraint \"fk_rails_3b1d8f0c2e\""
+                .into(),
+            detail: Some("Key (book_id)=(999) is not present in table \"books\".".into()),
+            hint: None,
+            named: Box::default(),
+        },
+    }));
+}
+
+/// Image 3 goes to the first image's book, as its cover: two pending
+/// cells in one row, saved and not answered yet. Both are in columns whose
+/// names the conflict sheet's first column holds whole.
+fn rebook_image(harness: &mut Harness) -> (ConnTabId, TabId) {
+    let (tab, id) = editable(harness);
+    retype(harness, tab, id, (1, BOOK_ID), "1048576");
+    retype(harness, tab, id, (1, KIND), "cover");
+    step_aside(harness, tab, id);
+    harness.app.apply(Action::WriteEdits { tab, id });
+    (tab, id)
+}
+
+/// A save that found its row changed: someone gave image 3 to another
+/// book in the meantime. The question shows the two columns the user
+/// changed, what was loaded, what the server holds now and the user's:
+/// `book_id` marked, `kind` as it was loaded.
+fn edit_conflict(harness: &mut Harness) {
+    rebook_image(harness);
+    // The row as the database holds it now: with the third image's book.
+    let mut row = page().rows.swap_remove(1);
+    row[BOOK_ID] = Value::Int(1_048_576 + 2 * 7_919);
+    harness.answer_written(Ok(native-sql-database-client-windows_db::WriteOutcome::Conflicts(vec![
+        native-sql-database-client-windows_db::Conflict {
+            row: 0,
+            server: Some(row),
+        },
+    ])));
+}
+
+/// A save that found its row gone: someone deleted image 3 in the
+/// meantime. The question shows what was loaded and the user's, and the
+/// one answer it has.
+fn edit_conflict_gone(harness: &mut Harness) {
+    rebook_image(harness);
+    harness.answer_written(Ok(native-sql-database-client-windows_db::WriteOutcome::Conflicts(vec![
+        native-sql-database-client-windows_db::Conflict {
+            row: 0,
+            server: None,
+        },
+    ])));
+}
+
+/// Closing the tab with three changes pending: save, discard or stay.
+fn edit_leave(harness: &mut Harness) {
+    let (tab, id) = editable(harness);
+    retire_image(harness, tab, id);
+    retype(harness, tab, id, (3, KIND), "cover");
+    step_aside(harness, tab, id);
+    harness.app.apply(Action::CloseTab { tab, id });
+}
+
+/// A save to production, before anything is sent: its statements, and
+/// what confirms them. On Omarchy the statements are in the `:diff` panel,
+/// and the box stands above it and points at it. The production connection
+/// opens writable here (its "Open read-only" box unticked), or nothing
+/// could be saved on it.
+fn edit_to_production(harness: &mut Harness) {
+    let own = workspace(harness);
+    let tab = production_beside(harness, own);
+    harness.app.apply(Action::ActivateConnTab(tab));
+    let workspace = harness.app.workspace_mut(tab).unwrap();
+    workspace.access = crate::connections::access(Some(false), workspace.environment);
+    workspace.databases.value = Some(vec!["bookshop_production".into(), "postgres".into()]);
+    tables(harness, tab);
+    harness.answer_structure(structure());
+    let id = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+    retire_image(harness, tab, id);
+    step_aside(harness, tab, id);
+    harness.app.apply(Action::WriteEdits { tab, id });
+}
+
+fn both(name: &str, scene: impl Fn(&mut Harness)) {
+    for look in crate::theme::Look::ALL {
+        for (light, suffix) in [(true, "light"), (false, "dark")] {
+            let mut harness = Harness::for_shots(SIZE, 2.0, light, look);
+            if look == crate::theme::Look::macos() {
+                // Measured on a macOS 26 window with a unified compact toolbar.
+                harness.app.titlebar = crate::app::TitleBar {
+                    height: 38.0,
+                    inset: 80.0,
+                };
+            }
+            scene(&mut harness);
+            harness.shot(&out(&format!("{name}-{}-{suffix}.png", look.name)));
+        }
+    }
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with --features shots -- --ignored"]
+fn shots() {
+    both("state-first-launch", |_| {});
+    both("picker", |harness| {
+        harness.app.connections.upsert(saved());
+    });
+    both("workspace", |harness| {
+        workspace(harness);
+    });
+    both("workspace-two", |harness| {
+        let tab = workspace(harness);
+        production_beside(harness, tab);
+    });
+    both("picker-open", |harness| {
+        harness.app.connections.upsert(saved());
+        workspace(harness);
+        harness.app.apply(Action::ShowConnections);
+    });
+    both("filter", |harness| {
+        workspace(harness);
+        harness.press(egui::Key::F, egui::Modifiers::COMMAND);
+    });
+    both("dialog", |harness| {
+        edit_production(harness);
+    });
+    both("dialog-new", |harness| {
+        // As the picker's button asks: its key is each look's own.
+        harness.app.apply(Action::NewConnection);
+        let postgres = harness.app.look.label("PostgreSQL");
+        harness.click(&postgres);
+    });
+    both("dialog-bigquery", |harness| {
+        harness.app.apply(Action::NewConnection);
+        let bigquery = harness.app.look.label("BigQuery");
+        harness.click(&bigquery);
+        if let Some(crate::model::Dialog::Connection(form)) = &mut harness.app.dialog {
+            form.name = "Bookshop".into();
+            form.database = "bookshop-analytics".into();
+            form.bigquery_key = "~/.config/gcloud/bookshop.json".into();
+        }
+    });
+    both("state-disconnected", |harness| {
+        let tab = workspace(harness);
+        let session = harness.app.workspace(tab).unwrap().session;
+        harness
+            .app
+            .apply(Action::Backend(crate::backend::Event::Disconnected {
+                session,
+                error: native-sql-database-client-windows_db::Error::ConnectionLost(
+                    "server closed the connection unexpectedly".into(),
+                ),
+            }));
+    });
+    both("state-empty", |harness| {
+        let tab = workspace(harness);
+        let workspace = harness.app.workspace_mut(tab).unwrap();
+        workspace.tree.schemas.value = Some(vec!["public".into(), "reports".into()]);
+        // Collapsed, so the empty schema below it is on screen.
+        workspace.tree.nodes.get_mut("public").unwrap().expanded = false;
+        let node = workspace.tree.nodes.entry("reports".into()).or_default();
+        node.expanded = true;
+        node.objects.value = Some(Vec::new());
+        let object_tab = workspace.active_tab.unwrap();
+        let object = workspace.object_tab_mut(object_tab).unwrap();
+        object.filter.rows = vec![
+            crate::model::FilterRow {
+                column: "kind".into(),
+                op: native-sql-database-client-windows_db::FilterOp::Eq,
+                value: "cover".into(),
+            },
+            crate::model::FilterRow {
+                column: "book_id".into(),
+                op: native-sql-database-client-windows_db::FilterOp::Eq,
+                value: "4".into(),
+            },
+        ];
+        harness.app.apply(Action::ApplyFilters { tab, object_tab });
+        let mut empty = page();
+        empty.rows.clear();
+        harness.answer_rows(empty);
+    });
+    // A connect on its way, 2.4 s in.
+    both("state-connecting", |harness| {
+        harness.app.connections.upsert(saved());
+        harness.click("Connect to Bookshop");
+        let tab = harness.app.active_tab_id();
+        harness.app.workspace_mut(tab).unwrap().connect_started =
+            std::time::Instant::now().checked_sub(Duration::from_millis(2400));
+    });
+    // The three ways a connect fails that have a title of their own.
+    for (name, error) in [
+        (
+            "state-connect-auth",
+            native-sql-database-client-windows_db::Error::Auth("password authentication failed for user \"demo\"".into()),
+        ),
+        (
+            "state-connect-unreachable",
+            native-sql-database-client-windows_db::Error::Connect("Connection refused (os error 111)".into()),
+        ),
+        (
+            "state-connect-tls",
+            native-sql-database-client-windows_db::Error::Tls("invalid peer certificate: NotValidForName".into()),
+        ),
+    ] {
+        both(name, |harness| {
+            harness.app.connections.upsert(saved());
+            harness.click("Connect to Bookshop");
+            let (session, request) = match harness.app.backend.sent.last() {
+                Some(crate::backend::Command::Connect {
+                    session, request, ..
+                }) => (*session, *request),
+                other => panic!("{other:?}"),
+            };
+            harness
+                .app
+                .apply(Action::Backend(crate::backend::Event::ConnectFailed {
+                    session,
+                    request,
+                    error: error.clone(),
+                }));
+        });
+    }
+    // A table with no rows and no filter.
+    both("state-empty-table", |harness| {
+        let tab = workspace(harness);
+        harness.app.apply(Action::Refresh(tab));
+        let mut empty = page();
+        empty.rows.clear();
+        harness.answer_rows(empty);
+    });
+    // The page after the last one: no rows, and a way back.
+    both("state-past-last-row", |harness| {
+        let tab = workspace(harness);
+        // The next page needs a page that says more follows.
+        harness.app.apply(Action::Refresh(tab));
+        let mut first = page();
+        first.has_more = true;
+        harness.answer_rows(first);
+        let object_tab = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+        harness.app.apply(Action::NextPage { tab, object_tab });
+        let mut empty = page();
+        empty.rows.clear();
+        harness.answer_rows(empty);
+    });
+    // A table whose rows are on their way, 4.2 s in.
+    both("state-loading", |harness| {
+        let tab = workspace(harness);
+        harness.app.apply(Action::OpenObject {
+            tab,
+            object: ObjectRef::new("public", "book_reviews"),
+            kind: ObjectKind::Table,
+            pin: true,
+        });
+        let workspace = harness.app.workspace_mut(tab).unwrap();
+        let id = workspace.active_tab.unwrap();
+        workspace.object_tab_mut(id).unwrap().rows.started =
+            std::time::Instant::now().checked_sub(Duration::from_millis(4200));
+    });
+    // A write a database refused in a read-only run, as each of its
+    // cards: in a tab switched to Read-only, in a tab in Read-write whose
+    // run was taken for one of reads, and on a connection that opens
+    // read-only. The Messages lead with it.
+    both("sql-blocked", |harness| {
+        let tab = sql_script(harness, UPDATE);
+        sql_mode(harness, tab, RunMode::ReadOnly);
+        run_sql(harness, tab, true);
+        let refused = crate::testing::refused_write();
+        harness.answer_sql(Ok(crate::testing::script_outcome(vec![refused])), None);
+    });
+    both("sql-blocked-run", |harness| {
+        let tab = sql_script(harness, "SELECT setval('book_images_id_seq', 1);");
+        sql_mode(harness, tab, RunMode::ReadWrite);
+        run_sql(harness, tab, true);
+        let refused = native-sql-database-client-windows_db::StatementOutcome::Error {
+            error: native-sql-database-client-windows_db::Error::Query {
+                code: Some("25006".into()),
+                message: "cannot execute setval() in a read-only transaction".into(),
+                detail: None,
+                hint: None,
+                named: Box::default(),
+            },
+            position: None,
+        };
+        harness.answer_sql(Ok(crate::testing::script_outcome(vec![refused])), None);
+    });
+    both("sql-blocked-connection", |harness| {
+        let tab = sql_script(harness, UPDATE);
+        let workspace = harness.app.workspace_mut(tab).unwrap();
+        workspace.access = native-sql-database-client-windows_db::Access::ReadOnly;
+        run_sql(harness, tab, true);
+        let refused = crate::testing::refused_write();
+        harness.answer_sql(Ok(crate::testing::script_outcome(vec![refused])), None);
+    });
+    // The switch of a tab in Read-write and of one in Read-only, a run
+    // that writes on its way (Run and Run all wait for it), and how such
+    // a run ends.
+    both("sql-write-switch", |harness| {
+        sql_editor(harness);
+    });
+    both("sql-write-switch-read-only", |harness| {
+        let tab = sql_editor(harness);
+        sql_mode(harness, tab, RunMode::ReadOnly);
+    });
+    // On production the Read-write segment is shown and cannot be picked
+    // yet.
+    both("sql-write-switch-production", |harness| {
+        let tab = sql_editor(harness);
+        sql_mode(harness, tab, RunMode::ReadOnly);
+        harness.app.workspace_mut(tab).unwrap().environment = Environment::Production;
+    });
+    both("sql-write-running", |harness| {
+        writing(harness, WRITES);
+    });
+    both("sql-write-committed", |harness| {
+        let tab = writing(harness, WRITES);
+        let done = vec![
+            crate::testing::done_outcome(Some(12)),
+            crate::testing::done_outcome(Some(3)),
+        ];
+        let end = native-sql-database-client-windows_db::ScriptEnd::Committed;
+        harness.answer_sql(Ok(crate::testing::write_outcome(done, end)), None);
+        show_messages(harness, tab);
+    });
+    both("sql-write-rolled-back", |harness| {
+        writing(harness, WRITES);
+        let message = "update or delete on table \"book_images\" violates foreign key \
+                       constraint \"book_covers_image_id_fkey\" on table \"book_covers\"";
+        let outcomes = vec![
+            crate::testing::done_outcome(Some(12)),
+            crate::testing::error_outcome(message, None),
+        ];
+        let end = native-sql-database-client-windows_db::ScriptEnd::RolledBack;
+        harness.answer_sql(Ok(crate::testing::write_outcome(outcomes, end)), None);
+    });
+    both("sql-write-commit-failed", |harness| {
+        writing(harness, WRITES);
+        let done = vec![
+            crate::testing::done_outcome(Some(12)),
+            crate::testing::done_outcome(Some(3)),
+        ];
+        let end = native-sql-database-client-windows_db::ScriptEnd::CommitFailed {
+            error: native-sql-database-client-windows_db::Error::Query {
+                code: Some("23503".into()),
+                message: "update or delete on table \"book_images\" violates foreign key \
+                          constraint \"book_covers_image_id_fkey\" on table \"book_covers\""
+                    .into(),
+                detail: Some("Key (id)=(7) is still referenced from table \"book_covers\".".into()),
+                hint: None,
+                named: Box::default(),
+            },
+            committed: 0,
+        };
+        harness.answer_sql(Ok(crate::testing::write_outcome(done, end)), None);
+    });
+    // MySQL commits at a CREATE TABLE: what came before it is written
+    // though the script failed after it.
+    both("sql-write-partly", |harness| {
+        let script = "UPDATE book_images SET kind = 'ebook' WHERE kind = 'epub';\n\
+                      CREATE TABLE book_formats (kind varchar(16) PRIMARY KEY);\n\
+                      INSERT INTO book_formats SELECT DISTINCT kind FROM book_images;\n\
+                      INSERT INTO book_formats VALUES ('ebook');";
+        let tab = sql_script(harness, script);
+        harness.app.workspace_mut(tab).unwrap().driver = Driver::MySql;
+        sql_mode(harness, tab, RunMode::ReadWrite);
+        run_sql(harness, tab, true);
+        let outcomes = vec![
+            crate::testing::done_outcome(Some(12)),
+            crate::testing::done_outcome(None),
+            crate::testing::done_outcome(Some(2)),
+            crate::testing::error_outcome(
+                "Duplicate entry 'ebook' for key 'book_formats.PRIMARY'",
+                None,
+            ),
+        ];
+        let end = native-sql-database-client-windows_db::ScriptEnd::Partly { committed: 2 };
+        harness.answer_sql(Ok(crate::testing::write_outcome(outcomes, end)), None);
+    });
+    both("state-no-schemas", |harness| {
+        let tab = workspace(harness);
+        let workspace = harness.app.workspace_mut(tab).unwrap();
+        workspace.tree.schemas.value = Some(Vec::new());
+        workspace.databases.value = Some(vec![
+            "bookshop_development".into(),
+            "bookshop_test".into(),
+            "postgres".into(),
+        ]);
+    });
+    both("state-error", |harness| {
+        let tab = workspace(harness);
+        let object_tab = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+        harness.app.apply(Action::RetryRows { tab, object_tab });
+        let (session, request) = match harness.app.backend.sent.last() {
+            Some(crate::backend::Command::FetchRows {
+                session, request, ..
+            }) => (*session, *request),
+            other => panic!("{other:?}"),
+        };
+        harness
+            .app
+            .apply(Action::Backend(crate::backend::Event::Rows {
+                session,
+                request,
+                result: Err(native-sql-database-client-windows_db::Error::Query {
+                    code: Some("42703".into()),
+                    message: "column \"kindd\" does not exist".into(),
+                    detail: None,
+                    hint: Some("Perhaps you meant to reference the column \"kind\".".into()),
+                    named: Box::default(),
+                }),
+            }));
+    });
+    // Where the keyboard is, a few Tab stops in: the ring each control
+    // takes (a button, a chip, the search field, a row, a tab, a segment).
+    for stop in [1, 2, 4, 6, 9, 12, 16, 20] {
+        both(&format!("focus-{stop:02}"), |harness| {
+            workspace(harness);
+            for _ in 0..stop {
+                harness.press(egui::Key::Tab, egui::Modifiers::NONE);
+            }
+        });
+    }
+    // The arrows in the grid: the cell they are on, lit in its row.
+    both("focus-grid", |harness| {
+        workspace(harness);
+        for _ in 0..2 {
+            harness.press(egui::Key::ArrowRight, egui::Modifiers::NONE);
+        }
+    });
+    // The arrows in the tree: its cursor, apart from the open table's row.
+    both("focus-tree", |harness| {
+        let tab = workspace(harness);
+        harness.app.apply(Action::TreeKey {
+            tab,
+            key: crate::model::TreeKey::Home,
+        });
+        harness.app.workspace_mut(tab).unwrap().pane = crate::model::Pane::Tree;
+        for _ in 0..3 {
+            harness.press(egui::Key::ArrowDown, egui::Modifiers::NONE);
+        }
+    });
+    // A wide table scrolled to its last columns: the key stays in sight.
+    both("values-scrolled", |harness| {
+        let tab = harness.connect_fake();
+        let workspace = harness.app.workspace_mut(tab).unwrap();
+        workspace.name = "Bookshop".into();
+        // The fixture's session is read-only; Bookshop's would not be.
+        workspace.access = saved().access();
+        workspace.driver = Driver::Postgres;
+        harness.app.apply(Action::OpenObject {
+            tab,
+            object: ObjectRef::new("public", "book_images"),
+            kind: ObjectKind::Table,
+            pin: true,
+        });
+        harness.answer_structure(structure());
+        harness.answer_rows(page());
+        // The last column's cell: the grid scrolls to show it.
+        let object_tab = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+        harness.app.apply(Action::SelectCell {
+            tab,
+            id: object_tab,
+            cell: CellPos { row: 4, col: 5 },
+        });
+        harness.app.apply(Action::ToggleRowPanel(tab));
+        // The scroll glides: let it arrive.
+        harness.finish_animations();
+    });
+    both("structure", |harness| {
+        let tab = workspace(harness);
+        let object_tab = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+        harness.app.apply(Action::SetView {
+            tab,
+            object_tab,
+            view: crate::model::ObjectView::Structure,
+        });
+        harness.answer_structure(structure());
+    });
+    both("sql", |harness| {
+        sql_editor(harness);
+    });
+    both("sql-menu", |harness| {
+        sql_editor(harness);
+        harness.click("Timeout");
+    });
+    // The cursor in the first statement, which fails on its second line
+    // (the position counts from the comment the statement starts with).
+    both("sql-error", |harness| {
+        let tab = sql_editor(harness);
+        for _ in 0..3 {
+            harness.press(egui::Key::ArrowUp, egui::Modifiers::NONE);
+        }
+        let sql_tab = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+        harness.app.apply(Action::RunSql {
+            tab,
+            sql_tab,
+            all: false,
+        });
+        let message = "relation \"book_images\" does not exist";
+        let failed = crate::testing::error_outcome(message, Some(63));
+        harness.answer_sql(Ok(crate::testing::script_outcome(vec![failed])), None);
+    });
+    // The results' other states: nothing run yet, a run on its way, every
+    // statement in Messages, a refusal, a cancel and a cut result. Each
+    // answer is one its script could get.
+    both("sql-idle", |harness| {
+        let tab = workspace(harness);
+        harness.app.apply(Action::NewSqlTab(tab));
+    });
+    // The completion list, under a table's name being typed.
+    both("sql-complete", |harness| {
+        sql_editor(harness);
+        // The editor has the keyboard a frame after it opens.
+        harness.settle();
+        // The script ends without a `;`: close its last statement, so the
+        // one typed next is a new one.
+        harness.frame(vec![egui::Event::Paste(";\nSELECT * FROM ".into())]);
+        harness.frame(vec![egui::Event::Text("bo".into())]);
+    });
+    both("sql-running", |harness| {
+        let tab = sql_editor(harness);
+        run_sql(harness, tab, true);
+    });
+    // The first statement names a column that is not there, on its second
+    // line (the position counts from the comment it starts with).
+    both("sql-messages", |harness| {
+        let script = SCRIPT
+            .replace("SELECT kind", "SELECT kindd")
+            .replace("BY kind", "BY kindd");
+        let tab = sql_script(harness, &script);
+        run_sql(harness, tab, true);
+        let failed = native-sql-database-client-windows_db::StatementOutcome::Error {
+            error: native-sql-database-client-windows_db::Error::Query {
+                code: Some("42703".into()),
+                message: "column \"kindd\" does not exist".into(),
+                detail: None,
+                hint: Some("Perhaps you meant to reference the column \"kind\".".into()),
+                named: Box::default(),
+            },
+            position: Some(31),
+        };
+        harness.answer_sql(Ok(crate::testing::script_outcome(vec![failed])), None);
+    });
+    // The script's sixth line would end the transaction.
+    both("sql-refused", |harness| {
+        let script = SCRIPT.replace("SELECT * FROM book_images", "COMMIT");
+        let tab = sql_script(harness, &script);
+        run_sql(harness, tab, true);
+        let refused = native-sql-database-client-windows_db::Error::Refused {
+            line: 6,
+            what: "COMMIT".into(),
+            mode: native-sql-database-client-windows_db::ScriptMode::ReadOnly,
+        };
+        harness.answer_sql(Err(refused), None);
+        let sql_tab = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+        harness.app.apply(Action::SetResultPane {
+            tab,
+            sql_tab,
+            pane: crate::model::ResultPane::Results,
+        });
+    });
+    // The first statement counts the two kinds; the second runs out of time.
+    both("sql-cancelled", |harness| {
+        let tab = sql_script(harness, SCRIPT);
+        run_sql(harness, tab, true);
+        let column = |name: &str, type_name: &str, kind| ColumnMeta {
+            name: name.into(),
+            type_name: type_name.into(),
+            kind,
+        };
+        let kinds = native-sql-database-client-windows_db::StatementOutcome::Rows {
+            columns: vec![
+                column("kind", "varchar", ValueKind::Text),
+                column("images", "int8", ValueKind::Numeric),
+            ],
+            rows: vec![
+                vec![Value::Text("cover".into()), Value::Int(7)],
+                vec![Value::Text("preview".into()), Value::Int(6)],
+            ],
+            truncated: false,
+        };
+        let outcome =
+            crate::testing::script_outcome(vec![kinds, native-sql-database-client-windows_db::StatementOutcome::Cancelled]);
+        let timeout = crate::backend::CancelReason::Timeout(Duration::from_secs(30));
+        harness.answer_sql(Ok(outcome), Some(timeout));
+    });
+    // A limit of 100 rows, and a table with more.
+    both("sql-truncated", |harness| {
+        let tab = sql_script(harness, SCRIPT);
+        let sql_tab = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+        harness.app.apply(Action::SetSqlLimit {
+            tab,
+            sql_tab,
+            limit: 100,
+        });
+        run_sql(harness, tab, false);
+        let page = page_of(100);
+        let cut = native-sql-database-client-windows_db::StatementOutcome::Rows {
+            columns: page.columns,
+            rows: page.rows,
+            truncated: true,
+        };
+        harness.answer_sql(Ok(crate::testing::script_outcome(vec![cut])), None);
+    });
+    // A result row selected: its fields in the row panel, beside the editor
+    // and the results.
+    both("sql-row", |harness| {
+        let tab = sql_editor(harness);
+        let id = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+        harness.app.apply(Action::SelectCell {
+            tab,
+            id,
+            cell: CellPos { row: 1, col: 0 },
+        });
+    });
+    // Editing a table's values: what is pending and the statements a save
+    // of it would run, the two editors, a save that wrote, one that failed
+    // and one that found its row changed or gone, and the two questions
+    // before leaving and before a save to production.
+    for (name, scene) in EDITING {
+        both(name, scene);
+    }
+    // The row panel's fields: one being edited, a locked one saying why,
+    // what a field says of its cell, a row that cannot be edited, and the
+    // tall field of a long text and of a document.
+    for (name, scene) in ROW_FORM {
+        both(name, scene);
+    }
+}
+
+/// Runs the active SQL editor's statement, or `all` of its script.
+fn run_sql(harness: &mut Harness, tab: ConnTabId, all: bool) {
+    let sql_tab = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+    harness.app.apply(Action::RunSql { tab, sql_tab, all });
+}
+
+/// One statement that changes rows.
+const UPDATE: &str = "UPDATE book_images\n   SET kind = 'ebook'\n WHERE id = 2;";
+
+/// The script the scenes of a run that writes show.
+const WRITES: &str = "UPDATE book_images\n   SET kind = 'ebook'\n WHERE kind = 'epub';\n\n\
+                      DELETE FROM book_images\n WHERE book_id IS NULL;";
+
+/// Sets the SQL editor on screen to `mode`, as its switch does.
+fn sql_mode(harness: &mut Harness, tab: ConnTabId, mode: RunMode) {
+    let sql_tab = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+    harness.app.apply(Action::SetSqlMode { tab, sql_tab, mode });
+}
+
+/// A SQL editor in Read-write holding `script`, all of it sent as its run.
+fn writing(harness: &mut Harness, script: &str) -> ConnTabId {
+    let tab = sql_script(harness, script);
+    sql_mode(harness, tab, RunMode::ReadWrite);
+    run_sql(harness, tab, true);
+    tab
+}
+
+/// Shows the Messages of the SQL editor on screen.
+fn show_messages(harness: &mut Harness, tab: ConnTabId) {
+    let sql_tab = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+    harness.app.apply(Action::SetResultPane {
+        tab,
+        sql_tab,
+        pane: crate::model::ResultPane::Messages,
+    });
+}
+
+/// The script the SQL scenes show: two statements over `book_images`.
+const SCRIPT: &str = "-- Images of each kind\n\
+                      SELECT kind, count(*) AS images\n  \
+                      FROM book_images\n \
+                      GROUP BY kind;\n\n\
+                      SELECT * FROM book_images";
+
+/// A SQL editor beside the open tables, holding `script`.
+fn sql_script(harness: &mut Harness, script: &str) -> ConnTabId {
+    let tab = workspace(harness);
+    harness.app.apply(Action::NewSqlTab(tab));
+    let workspace = harness.app.workspace_mut(tab).unwrap();
+    workspace.server_version.value = Some("PostgreSQL 17.2".into());
+    let id = workspace.active_tab.unwrap();
+    let sql = workspace.sql_tab_mut(id).unwrap();
+    sql.text = script.into();
+    sql.cursor = sql.text.len();
+    tab
+}
+
+/// A SQL editor beside the open tables, its last statement run and
+/// answered with the table's rows.
+fn sql_editor(harness: &mut Harness) -> ConnTabId {
+    let tab = sql_script(harness, SCRIPT);
+    let id = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+    harness.app.apply(Action::RunSql {
+        tab,
+        sql_tab: id,
+        all: false,
+    });
+    let page = page();
+    harness.answer_sql(
+        Ok(native-sql-database-client-windows_db::ScriptOutcome {
+            results: vec![native-sql-database-client-windows_db::StatementResult {
+                elapsed: Duration::from_millis(14),
+                outcome: native-sql-database-client-windows_db::StatementOutcome::Rows {
+                    columns: page.columns,
+                    rows: page.rows,
+                    truncated: false,
+                },
+            }],
+            stopped: false,
+            ..Default::default()
+        }),
+        None,
+    );
+    tab
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with --features shots -- --ignored"]
+fn sidebar_width_over_time() {
+    let mut harness = Harness::for_shots(SIZE, 2.0, true, crate::theme::Look::standard());
+    workspace(&mut harness);
+    for frame in 0..300 {
+        let tree = harness.frame(Vec::new());
+        if frame % 50 == 0 {
+            let refresh =
+                crate::testing::node(&tree, "Reload objects", egui::accesskit::Role::Button)
+                    .and_then(|id| tree.nodes.iter().find(|(n, _)| *n == id))
+                    .and_then(|(_, node)| node.bounds());
+            eprintln!("frame {frame}: refresh button {refresh:?}");
+        }
+    }
+    harness.shot(&out("workspace-after-300-frames.png"));
+}
+
+/// The design screens at the mockups' scales, so each PNG lines up pixel
+/// for pixel with its mockup: `target/shots/mock-<screen>.png`. The
+/// promotional videos film Omarchy in its [`mock::tokyo_night`].
+pub(crate) mod mock {
+    use super::*;
+    use crate::theme::{Look, Palette};
+
+    /// The moment the scenes happen: 2026-09-29 12:00 UTC, so "last used"
+    /// reads as the mockups do (2 min ago, yesterday, Sep 12, Aug 30).
+    pub const NOW: u64 = 1_790_683_200;
+
+    /// A mockup's screen, in the Bookshop scene.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Screen {
+        MacWorkspace,
+        /// The same workspace in the dark palette.
+        MacWorkspaceDark,
+        /// `book_editions`: values that are awkward to show.
+        MacValues,
+        OmarchyValues,
+        OmarchyWorkspace,
+        MacPicker,
+        OmarchyPicker,
+        MacDialog,
+        OmarchyDialog,
+        /// The Settings screen, wide enough for the file beside the options.
+        OmarchySettings,
+        /// The Settings window, as a sheet over the workspace.
+        MacSettings,
+    }
+
+    impl Screen {
+        pub const ALL: [Screen; 11] = [
+            Self::MacWorkspace,
+            Self::MacWorkspaceDark,
+            Self::MacValues,
+            Self::OmarchyValues,
+            Self::OmarchyWorkspace,
+            Self::MacPicker,
+            Self::OmarchyPicker,
+            Self::MacDialog,
+            Self::OmarchyDialog,
+            Self::OmarchySettings,
+            Self::MacSettings,
+        ];
+
+        /// The screen's name (screenshot files).
+        pub fn name(self) -> &'static str {
+            match self {
+                Self::MacWorkspace => "macos-workspace",
+                Self::MacWorkspaceDark => "macos-workspace-dark",
+                Self::MacValues => "macos-values",
+                Self::OmarchyValues => "omarchy-values",
+                Self::OmarchyWorkspace => "omarchy-workspace",
+                Self::MacPicker => "macos-connections",
+                Self::OmarchyPicker => "omarchy-connections",
+                Self::MacDialog => "macos-connection-edit",
+                Self::OmarchyDialog => "omarchy-connection-edit",
+                Self::OmarchySettings => "omarchy-settings-general",
+                Self::MacSettings => "macos-settings-general",
+            }
+        }
+
+        pub fn look(self) -> Look {
+            match self {
+                Self::MacWorkspace
+                | Self::MacWorkspaceDark
+                | Self::MacValues
+                | Self::MacPicker
+                | Self::MacDialog
+                | Self::MacSettings => Look::macos(),
+                Self::OmarchyWorkspace
+                | Self::OmarchyValues
+                | Self::OmarchyPicker
+                | Self::OmarchyDialog
+                | Self::OmarchySettings => Look::omarchy(),
+            }
+        }
+
+        /// The window in points. The Omarchy artboards hold the window inside
+        /// a 10 pt wallpaper margin and Hyprland's 2 pt border.
+        pub fn size(self) -> egui::Vec2 {
+            match self {
+                Self::MacWorkspace
+                | Self::MacWorkspaceDark
+                | Self::MacValues
+                | Self::MacPicker
+                | Self::MacDialog
+                | Self::MacSettings => egui::vec2(1440.0, 900.0),
+                Self::OmarchyWorkspace | Self::OmarchyValues | Self::OmarchySettings => {
+                    egui::vec2(1896.0, 1056.0)
+                }
+                Self::OmarchyPicker | Self::OmarchyDialog => egui::vec2(936.0, 1016.0),
+            }
+        }
+
+        /// The mockups' export scale (pixels per point), for screenshots that
+        /// line up with them.
+        pub fn design_scale(self) -> f32 {
+            match self {
+                Self::MacWorkspace
+                | Self::MacWorkspaceDark
+                | Self::MacValues
+                | Self::MacPicker
+                | Self::MacDialog
+                | Self::MacSettings => 2000.0 / 1440.0,
+                Self::OmarchyWorkspace | Self::OmarchyValues | Self::OmarchySettings => {
+                    2000.0 / 1920.0
+                }
+                Self::OmarchyPicker | Self::OmarchyDialog => 1846.0 / 960.0,
+            }
+        }
+
+        /// The palette the screen is drawn in: macOS light, Omarchy in Tokyo
+        /// Night, as the mockups.
+        pub fn palette(self) -> Palette {
+            match self {
+                Self::MacWorkspace
+                | Self::MacValues
+                | Self::MacPicker
+                | Self::MacDialog
+                | Self::MacSettings => Palette::light(),
+                Self::MacWorkspaceDark => Palette::dark(),
+                Self::OmarchyWorkspace
+                | Self::OmarchyValues
+                | Self::OmarchyPicker
+                | Self::OmarchyDialog
+                | Self::OmarchySettings => tokyo_night(),
+            }
+        }
+
+        /// Puts the scene on `harness`.
+        pub fn stage(self, harness: &mut Harness) {
+            crate::util::pin_now(Some(NOW));
+            match self {
+                Self::MacWorkspace | Self::MacWorkspaceDark => {
+                    let tab = workspace(harness);
+                    production_beside(harness, tab);
+                }
+                Self::OmarchyWorkspace => {
+                    let tab = workspace(harness);
+                    production_beside(harness, tab);
+                    let object_tab = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+                    let object = harness
+                        .app
+                        .workspace_mut(tab)
+                        .unwrap()
+                        .object_tab_mut(object_tab)
+                        .unwrap();
+                    object.filter.raw = true;
+                    object.filter.raw_text = "kind = 'front'".into();
+                    harness.app.apply(Action::ApplyFilters { tab, object_tab });
+                    harness.answer_rows(covers());
+                    harness.app.apply(Action::SelectCell {
+                        tab,
+                        id: object_tab,
+                        cell: CellPos { row: 0, col: 0 },
+                    });
+                }
+                Self::MacValues | Self::OmarchyValues => {
+                    let tab = workspace(harness);
+                    harness.app.apply(Action::OpenObject {
+                        tab,
+                        object: ObjectRef::new("public", "book_editions"),
+                        kind: ObjectKind::Table,
+                        pin: true,
+                    });
+                    harness.answer_structure(editions_structure());
+                    harness.answer_rows(editions());
+                    let object_tab = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+                    harness.app.apply(Action::SelectCell {
+                        tab,
+                        id: object_tab,
+                        cell: CellPos { row: 0, col: 0 },
+                    });
+                }
+                Self::MacPicker | Self::OmarchyPicker => pickers(harness),
+                Self::MacDialog | Self::OmarchyDialog => {
+                    pickers(harness);
+                    edit_production(harness);
+                }
+                // Over the Bookshop's workspace, which it covers: the
+                // cursor on the second option, and the file watched, as it
+                // is in the app. The harness keeps its files in a temporary
+                // directory of another name on every run: the pane's
+                // heading names one that stays, and that nothing is
+                // written to (the backend here only records).
+                Self::OmarchySettings => {
+                    workspace(harness);
+                    harness.app.dirs.config = PathBuf::from("/home/demo/.config/native-sql-database-client-windows");
+                    harness.app.apply(Action::ShowSettings);
+                    harness.app.apply(Action::MoveSettingsRow(1));
+                    harness.app.settings_file.live = true;
+                }
+                // Over the Bookshop's workspace too, which shows dimmed at
+                // its sides. The path is one that stays, as above, and is
+                // written from a home directory that is no one's.
+                Self::MacSettings => {
+                    workspace(harness);
+                    harness.app.dirs.home = Some(PathBuf::from("/home/demo"));
+                    harness.app.dirs.config = PathBuf::from("/home/demo/.config/native-sql-database-client-windows");
+                    harness.app.apply(Action::ShowSettings);
+                }
+            }
+        }
+    }
+
+    /// Tokyo Night through the Omarchy template, as the mockups draw it.
+    pub fn tokyo_night() -> Palette {
+        let colors = "mode\tdark\nbackground\t#1a1b26\ndark_background\t#16161e\n\
+                      lighter_background\t#292e42\nforeground\t#c0caf5\nmuted\t#565f89\n\
+                      accent\t#7aa2f7\nselection\t#283457\nred\t#f7768e\ngreen\t#9ece6a\n\
+                      yellow\t#e0af68\ncyan\t#7dcfff\norange\t#ff9e64\nmagenta\t#bb9af7\n\
+                      blue\t#7aa2f7\nbright_red\t#f7768e\nbright_green\t#9ece6a\n";
+        let rendered = fastframe_theme::omarchy::render_seed::<crate::theme::Palette>(
+            include_str!("../contrib/omarchy/native-sql-database-client-windows.json.tpl"),
+            colors,
+        )
+        .unwrap();
+        fastframe_theme::parse_palette::<crate::theme::Palette>(&rendered)
+            .unwrap()
+            .with_readable_labels()
+    }
+
+    /// Twenty-one `book_` objects (three views), then the other groups.
+    fn objects() -> Vec<ObjectInfo> {
+        let table = |name: String| ObjectInfo {
+            name,
+            kind: ObjectKind::Table,
+            estimated_rows: Some(13),
+        };
+        let view = |name: &str| ObjectInfo {
+            name: name.into(),
+            kind: ObjectKind::View,
+            estimated_rows: None,
+        };
+        let mut objects = vec![
+            view("book_active_covers"),
+            view("book_cover_counts"),
+            view("book_unused_images"),
+        ];
+        for name in [
+            "authors",
+            "awards",
+            "blurbs",
+            "bundles",
+            "covers",
+            "editions",
+            "excerpts",
+            "formats",
+            "genres",
+            "imprints",
+            "isbns",
+            "prices",
+            "ratings",
+            "reviews",
+            "series",
+            "tags",
+            "translations",
+            "watermarks",
+        ] {
+            objects.push(table(format!("book_{name}")));
+        }
+        for name in [
+            "accounts",
+            "credits",
+            "discounts",
+            "invoices",
+            "ledgers",
+            "payments",
+            "payouts",
+            "plans",
+            "refunds",
+            "taxes",
+        ] {
+            objects.push(table(format!("billing_{name}")));
+        }
+        for name in [
+            "orders",
+            "orders_archive",
+            "orders_events",
+            "orders_items",
+            "orders_notes",
+            "orders_returns",
+        ] {
+            objects.push(table(name.into()));
+        }
+        for name in [
+            "users",
+            "users_addresses",
+            "users_devices",
+            "users_emails",
+            "users_prefs",
+            "users_roles",
+            "users_sessions",
+        ] {
+            objects.push(table(name.into()));
+        }
+        objects
+    }
+
+    const STAMPS: [(&str, &str, &str); 13] = [
+        (
+            "2026-01-12 09:14:03.482915",
+            "2026-01-12 09:14:03.571204",
+            "7b1e04c2a5f8d3160e9b4a27c81d05f3",
+        ),
+        (
+            "2026-01-12 17:02:41.118302",
+            "2026-01-12 17:02:41.204511",
+            "3fa9d6e10b27c4d58a1e6f3b92c07d44",
+        ),
+        (
+            "2026-02-03 10:26:55.730019",
+            "2026-02-03 10:26:56.001877",
+            "c05b8e7f4d21a9360be5c14f7a82d93e",
+        ),
+        (
+            "2026-02-05 07:48:19.265530",
+            "2026-02-05 07:48:19.340012",
+            "58d2a1b93e6f0c47d12b8a5e9f3c6071",
+        ),
+        (
+            "2026-02-05 14:31:08.902144",
+            "2026-02-05 14:31:08.977320",
+            "e4c7093fd2b18a65c3f0e9d47b21a58c",
+        ),
+        (
+            "2026-02-06 08:05:47.011938",
+            "2026-02-06 08:05:47.090215",
+            "9a61f2c05e3d8b47a0c19f6e28d73b54",
+        ),
+        (
+            "2026-02-06 08:06:12.548702",
+            "2026-02-06 08:06:12.611409",
+            "2d8b4e6a13f07c95b2e4d81a6c3f90e7",
+        ),
+        (
+            "2026-02-11 12:40:36.377115",
+            "2026-02-11 12:40:37.004263",
+            "f173c9d284a6b0e53d1f7c2e98a4b605",
+        ),
+        (
+            "2026-02-13 09:22:50.640881",
+            "2026-02-13 09:22:50.712093",
+            "6ce05a4b7d913f28e6a0c5b1f47d29e8",
+        ),
+        (
+            "2026-02-13 09:23:14.199236",
+            "2026-02-13 09:23:14.265870",
+            "b4892f1e6a0d7c53f9b2e18d4a6c07f3",
+        ),
+        (
+            "2026-03-04 11:57:02.834470",
+            "2026-03-04 11:57:02.901158",
+            "05ad7c3e9b1f46d28a0e7c5b3d91f24a",
+        ),
+        (
+            "2026-03-04 11:59:27.456093",
+            "2026-03-04 11:59:27.528714",
+            "d9e6b1084f3a2c7e5b90d16a8f4c32e1",
+        ),
+        (
+            "2026-03-10 15:18:44.120567",
+            "2026-03-10 15:18:44.193342",
+            "41f8a2c6d0e7b395f1a4c8e62d07b9a3",
+        ),
+    ];
+
+    /// `book_covers`, sorted by `created_at`: the mockups' badge table.
+    fn covers() -> RowPage {
+        let column = |name: &str, type_name: &str, kind| ColumnMeta {
+            name: name.into(),
+            type_name: type_name.into(),
+            kind,
+        };
+        let books = [1, 2, 1, 3, 4, 5, 5, 6, 7, 7, 8, 8, 9];
+        let rows = STAMPS
+            .iter()
+            .enumerate()
+            .map(|(i, (created, updated, hash))| {
+                let id = i as i64 + 2;
+                let kind = if [0, 4, 6, 7, 9, 10, 12].contains(&i) { "front" } else { "back" };
+                vec![
+                    Value::Int(id),
+                    Value::Int(4_700_000_000_000_000_000 + books[i]),
+                    Value::Text(kind.into()),
+                    Value::Text(format!(
+                        r#"{{"id": "book/cover/{id}/image/{hash}.jpg", "storage": "store", "metadata": {{"size": {}, "width": 103, "height": 102, "filename": "{kind}-cover.jpg", "mime_type": "image/jpeg"}}}}"#,
+                        6024 + i * 37
+                    ).into()),
+                    Value::Text((*created).into()),
+                    Value::Text((*updated).into()),
+                ]
+            })
+            .collect();
+        RowPage {
+            columns: vec![
+                column("id", "int8", ValueKind::Numeric),
+                column("book_id", "int8", ValueKind::Numeric),
+                column("kind", "varchar", ValueKind::Text),
+                column("image_data", "jsonb", ValueKind::Json),
+                column("created_at", "timestamp", ValueKind::Temporal),
+                column("updated_at", "timestamp", ValueKind::Temporal),
+            ],
+            rows,
+            has_more: false,
+            ordered_by_key: true,
+            elapsed: Duration::from_millis(2),
+        }
+    }
+
+    /// A document of `keys` keys: an ISBN, a page count, a list and an
+    /// object, then plain numbered ones.
+    fn metadata(keys: usize) -> Value {
+        let mut parts = vec![
+            r#""isbn": "978-1-4028-9462-6""#.to_owned(),
+            r#""pages": 612"#.to_owned(),
+            r#""awards": ["a", "b", "c", "d", "e", "f", "g"]"#.to_owned(),
+            r#""print_runs": {"first": 1200, "second": 800}"#.to_owned(),
+        ];
+        parts.truncate(keys);
+        for index in parts.len()..keys {
+            parts.push(format!(r#""note_{index}": "{index}""#));
+        }
+        Value::Text(format!("{{{}}}", parts.join(", ")).into())
+    }
+
+    /// `bytes` bytes that start as a JPEG does.
+    fn cover(bytes: usize) -> Value {
+        let head = [
+            0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x48, 0x00, 0x48, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43,
+        ];
+        let data: Vec<u8> = head
+            .into_iter()
+            .chain(std::iter::repeat(0))
+            .take(bytes)
+            .collect();
+        Value::Bytes(data.into())
+    }
+
+    /// `book_editions`: the values the mockups call awkward.
+    fn editions() -> RowPage {
+        let column = |name: &str, type_name: &str, kind| ColumnMeta {
+            name: name.into(),
+            type_name: type_name.into(),
+            kind,
+        };
+        let text = |value: &str| Value::Text(value.into());
+        let long = "The Lighthouse Keeper's Daughter: A Novel in Three Tides, with an Afterword \
+                    by the Translator. First published in a small run by Harbor Press, later \
+                    reissued with the restored third part and the letters. "
+            .repeat(10);
+        let rows = vec![
+            vec![
+                Value::Int(101),
+                text(&long),
+                text("A novel"),
+                text("hardcover"),
+                Value::Bool(true),
+                text("24.00"),
+                text("{en,fr}"),
+                cover(49_358),
+                metadata(46),
+                text("2025-11-04"),
+            ],
+            vec![
+                Value::Int(102),
+                text("Small Rooms"),
+                text(""),
+                text("paperback"),
+                Value::Bool(true),
+                text("12.50"),
+                text("{en}"),
+                cover(31_744),
+                metadata(12),
+                text("2024-03-19"),
+            ],
+            vec![
+                Value::Int(103),
+                text("Notes from the Night Train\nPart One"),
+                Value::Null,
+                text("ebook"),
+                Value::Bool(false),
+                text("0.00"),
+                text("{}"),
+                Value::Null,
+                Value::Null,
+                text("2023-09-01"),
+            ],
+            vec![
+                Value::Int(104),
+                text("A Field Guide to Paper"),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Int(105),
+                text("Maps of Imaginary Coasts"),
+                text("Atlas edition"),
+                text("hardcover"),
+                Value::Bool(true),
+                text("1240.00"),
+                text("{en,de,it,fr,es,pt,nl}"),
+                cover(2_202_010),
+                metadata(103),
+                text("2026-01-15"),
+            ],
+            vec![
+                Value::Int(106),
+                text("   Leading spaces kept"),
+                text("  "),
+                text("paperback"),
+                Value::Bool(false),
+                text("9.99"),
+                text("{es}"),
+                cover(0),
+                metadata(0),
+                text("2022-06-30"),
+            ],
+            vec![
+                Value::Int(107),
+                text("Unicode: Ærøskøbing"),
+                text("Translated"),
+                text("ebook"),
+                Value::Bool(true),
+                text("7.00"),
+                text("{da,ja,ar}"),
+                cover(13_005),
+                metadata(8),
+                text("2025-02-14"),
+            ],
+        ];
+        RowPage {
+            columns: vec![
+                column("id", "int8", ValueKind::Numeric),
+                column("title", "text", ValueKind::Text),
+                column("subtitle", "text", ValueKind::Text),
+                column("format", "edition_format", ValueKind::Other),
+                column("in_print", "bool", ValueKind::Bool),
+                column("price", "numeric", ValueKind::Numeric),
+                column("languages", "_text", ValueKind::Other),
+                column("cover", "bytea", ValueKind::Binary),
+                column("metadata", "jsonb", ValueKind::Json),
+                column("published_on", "date", ValueKind::Temporal),
+            ],
+            rows,
+            has_more: false,
+            ordered_by_key: true,
+            elapsed: Duration::from_millis(2),
+        }
+    }
+
+    fn editions_structure() -> Structure {
+        let column = |name: &str, type_name: &str, nullable| ColumnInfo {
+            name: name.into(),
+            type_name: type_name.into(),
+            nullable,
+            default: None,
+            comment: None,
+            allowed_values: None,
+            generated: false,
+            identity: false,
+        };
+        let mut format = column("format", "edition_format", true);
+        format.allowed_values = Some(
+            ["hardcover", "paperback", "audiobook", "ebook"]
+                .map(str::to_owned)
+                .to_vec(),
+        );
+        Structure {
+            columns: vec![
+                column("id", "bigint", false),
+                column("title", "text", false),
+                column("subtitle", "text", true),
+                format,
+                column("in_print", "boolean", true),
+                column("price", "numeric(10,2)", true),
+                column("languages", "text[]", true),
+                column("cover", "bytea", true),
+                column("metadata", "jsonb", true),
+                column("published_on", "date", true),
+            ],
+            primary_key: vec!["id".into()],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            referenced_by: Vec::new(),
+            comment: None,
+            file: None,
+        }
+    }
+
+    fn covers_structure() -> Structure {
+        let column = |name: &str, type_name: &str, nullable| ColumnInfo {
+            name: name.into(),
+            type_name: type_name.into(),
+            nullable,
+            default: None,
+            comment: None,
+            allowed_values: None,
+            generated: false,
+            identity: false,
+        };
+        Structure {
+            columns: vec![
+                column("id", "bigint", false),
+                column("book_id", "bigint", false),
+                column("kind", "character varying", false),
+                column("image_data", "jsonb", true),
+                column("created_at", "timestamp(6) without time zone", false),
+                column("updated_at", "timestamp(6) without time zone", false),
+            ],
+            primary_key: vec!["id".into()],
+            indexes: Vec::new(),
+            foreign_keys: vec![ForeignKeyInfo {
+                name: Some("fk_rails_book_covers_books".into()),
+                columns: vec!["book_id".into()],
+                ref_schema: "public".into(),
+                ref_table: "books".into(),
+                ref_columns: vec!["id".into()],
+                on_update: "NO ACTION".into(),
+                on_delete: "CASCADE".into(),
+            }],
+            referenced_by: Vec::new(),
+            comment: None,
+            file: None,
+        }
+    }
+
+    /// Bookshop, connected, with `book_covers` open and its first row
+    /// selected, `orders` in a second tab.
+    fn workspace(harness: &mut Harness) -> ConnTabId {
+        let tab = harness.connect_fake();
+        let saved = saved();
+        let workspace = harness.app.workspace_mut(tab).unwrap();
+        workspace.name = saved.name.clone();
+        workspace.environment = saved.environment;
+        // The fixture's session is read-only; Bookshop's would not be.
+        workspace.access = saved.access();
+        workspace.spec = saved.spec.clone();
+        workspace.driver = Driver::Postgres;
+        workspace.tree.schemas.value = Some(vec!["public".into()]);
+        let node = workspace.tree.nodes.entry("public".into()).or_default();
+        node.expanded = true;
+        node.objects.value = Some(objects());
+        workspace.databases.value =
+            Some(vec!["bookshop_development".into(), "bookshop_test".into()]);
+        for name in ["orders", "book_covers"] {
+            harness.app.apply(Action::OpenObject {
+                tab,
+                object: ObjectRef::new("public", name),
+                kind: ObjectKind::Table,
+                pin: true,
+            });
+            harness.answer_structure(covers_structure());
+            harness.answer_rows(covers());
+        }
+        let object_tab = harness.app.workspace(tab).unwrap().active_tab.unwrap();
+        harness.app.apply(Action::SortBy {
+            tab,
+            object_tab,
+            column: "created_at".into(),
+        });
+        harness.answer_rows(covers());
+        // The tabs in the order the mockups show them.
+        let workspace = harness.app.workspace_mut(tab).unwrap();
+        workspace.tabs.reverse();
+        harness.app.apply(Action::SelectCell {
+            tab,
+            id: object_tab,
+            cell: CellPos { row: 0, col: 0 },
+        });
+        tab
+    }
+
+    /// Five saved connections, as the picker mockups list them.
+    fn pickers(harness: &mut Harness) {
+        let entries = [
+            (
+                "Bookshop",
+                Environment::Dev,
+                "postgres://dev@localhost:5433/bookshop_development",
+            ),
+            (
+                "Bookshop",
+                Environment::Staging,
+                "postgres://app_readonly@db.staging.example.com:5432/bookshop_staging?sslmode=verify-full",
+            ),
+            (
+                "Bookshop",
+                Environment::Production,
+                "postgres://app_readonly@db.example.com:5432/bookshop_production?sslmode=verify-full",
+            ),
+            (
+                "Playground",
+                Environment::Local,
+                "postgres://postgres@localhost:5432/playground",
+            ),
+            (
+                "Rails test",
+                Environment::None,
+                "postgres://dev@localhost:5433/bookshop_test",
+            ),
+        ];
+        // 2 min ago, yesterday, Sep 12 and Aug 30 (10:00 UTC), never.
+        let used = [
+            Some(NOW - 120),
+            Some(NOW - 86_400),
+            Some(1_789_207_200),
+            Some(1_788_084_000),
+            None,
+        ];
+        for ((name, environment, url), used) in entries.into_iter().zip(used) {
+            let (mut spec, _) = ConnectSpec::from_url(url).unwrap();
+            if name == "Bookshop" && environment != Environment::Dev {
+                spec.ssh = Some(native-sql-database-client-windows_db::SshSpec {
+                    host: "bastion".into(),
+                    port: Some(22),
+                    user: "deploy".into(),
+                    auth: native-sql-database-client-windows_db::SshAuth::Agent,
+                });
+            }
+            let id = ConnectionId::new();
+            harness.app.connections.upsert(SavedConnection {
+                id: id.clone(),
+                name: name.into(),
+                environment,
+                read_only: None,
+                password: PasswordMode::None,
+                ssh_secret: PasswordMode::None,
+                spec,
+                agents: Default::default(),
+            });
+            if let Some(used) = used {
+                harness.app.connections.mark_used(&id, used);
+            }
+        }
+        let first = crate::ui::picker::visible(&harness.app.connections, "")
+            .first()
+            .cloned();
+        let tab = harness.app.active_tab_id();
+        harness
+            .app
+            .apply(Action::SelectConnection { tab, conn: first });
+    }
+
+    #[test]
+    #[ignore = "renders with wgpu; run with --features shots -- --ignored"]
+    fn mock() {
+        for screen in Screen::ALL {
+            let look = screen.look();
+            let palette = screen.palette();
+            let mut harness = Harness::for_shots(screen.size(), screen.design_scale(), true, look);
+            harness.app.palette = palette;
+            harness.app.apply_style(&harness.ctx);
+            screen.stage(&mut harness);
+            harness.shot(&out(&format!("mock-{}.png", screen.name())));
+        }
+    }
+}

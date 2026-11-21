@@ -1,0 +1,483 @@
+//! Settings › Updates as the terminal look draws it: the status block
+//! with its keys (a download's progress row among its lines, and the work
+//! a restart would interrupt), the row of how often a check runs, and
+//! what a package manager's copy does, with what the check sends.
+
+use egui::accesskit::Live;
+use egui::{CornerRadius, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+
+use crate::app::Work;
+use crate::i18n::{Msgid, gettext, msgid};
+use crate::keymap::Command;
+use crate::model::Action;
+use crate::settings::{OptionId, Settings};
+use crate::typography::{Text, TextRole};
+use crate::ui::widgets;
+use crate::update::release;
+
+use super::terminal::{ROW_SIDE, Skin, columns, heading, key, option_row, widths};
+use super::updates::{
+    Card, Status, announce_live, downloading_said, failure_said, installs, progress_node, released,
+    when, work_said,
+};
+
+/// What the note under the row says, word for word as the board has it.
+const NOTE: Msgid = msgid(
+    "installed with a package manager (pacman, an AUR helper, nix, cargo install)? then that tool updates native-sql-database-client-windows: this pane only checks and shows the command, for example",
+);
+const NOTE_COMMAND: &str = "cargo install native-sql-database-client-windows --locked";
+const PRIVACY: Msgid = msgid(
+    "the check asks github for the latest release and sends this version, os and cpu, nothing else.",
+);
+
+/// The pane: the block, then its one row under `automatic`, then the
+/// note. The cursor's row is the pane's only one. `interrupted` lists what
+/// a restart would interrupt, asked only while the block says so.
+pub(super) fn rows(
+    ui: &mut Ui,
+    status: Status,
+    interrupted: impl FnOnce() -> Vec<Work>,
+    settings: &Settings,
+    cursor: usize,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    block(ui, status, interrupted, skin);
+    heading(ui, msgid("Automatic"), 8.0, skin);
+    let room = ui.available_width() - 2.0 * ROW_SIDE;
+    let columns = columns(
+        ui,
+        room,
+        widths(ui, &OptionId::UPDATES, settings, skin),
+        skin,
+    );
+    option_row(
+        ui,
+        (0, OptionId::UpdatesCheck),
+        cursor == 0,
+        columns,
+        settings,
+        skin,
+        actions,
+    );
+    ui.add_space(14.0);
+    note(ui, skin);
+}
+
+/// One line of the block: its pieces, each its text and colour.
+type Line = Vec<(String, egui::Color32)>;
+
+/// The spinner of the components' progress row, a frame at a time.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// The cells of the progress row's bar.
+const CELLS: usize = 12;
+
+/// The components' progress row: the spinner, the bar of cells and the
+/// share, then what the card's line says, and the key that cancels.
+fn progress_row(ui: &Ui, downloading: &crate::update::Downloading, skin: &Skin) -> Line {
+    let Skin {
+        look,
+        palette,
+        locale,
+        ..
+    } = *skin;
+    let time = ui.input(|input| input.time);
+    // Ten frames a second, as long as it shows. The time is never
+    // negative, and the remainder keeps the frame in range.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let frame = SPINNER[(time * 10.0) as usize % SPINNER.len()];
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(100));
+    let share = match downloading.total {
+        0 => 0.0,
+        total => (release::megabytes_value(downloading.received) / release::megabytes_value(total))
+            .clamp(0.0, 1.0),
+    };
+    // The share is clamped to 0 to 1: the cells fit, and are never
+    // negative.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let filled = ((share * CELLS as f64).round() as usize).min(CELLS);
+    // 0 to 100, from the share clamped to 0 to 1.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let percent = (share * 100.0).floor() as u32;
+    let said = look.label(&downloading_said(downloading, locale));
+    vec![
+        // The components' progress row: the spinner in accent, the
+        // bracket in the text's colour, the filled cells in accent and
+        // the rest muted, and what it says and its key muted.
+        (format!("  {frame}"), palette.accent),
+        (" [".to_owned(), palette.text),
+        ("█".repeat(filled), palette.accent),
+        ("░".repeat(CELLS - filled), palette.dim),
+        (format!("] {percent}%"), palette.text),
+        (format!(" · {said} · "), palette.dim),
+        (
+            key(ui, look, Command::SettingsCancelDownload)
+                .as_str()
+                .to_owned(),
+            palette.dim,
+        ),
+        (format!(" {}", skin.say(msgid("cancel"))), palette.dim),
+    ]
+}
+
+/// The status block: what the card of the other looks says, a line at a
+/// time, with the pane's keys that act on it.
+fn block(ui: &mut Ui, status: Status, interrupted: impl FnOnce() -> Vec<Work>, skin: &Skin) {
+    let Skin {
+        look,
+        palette,
+        locale,
+        ..
+    } = *skin;
+    let shown = Card::of(status);
+    let now = status.now;
+    let current = crate::update::CURRENT;
+    // As the board writes it here: `0.4.0 available`.
+    let title = match shown {
+        Card::Available(offer) | Card::NoBuild(offer) => {
+            gettext(locale, "{version} available").replace("{version}", &offer.version)
+        }
+        _ => look.label(&shown.title(locale)),
+    };
+    let title_color = match shown {
+        Card::Failed { .. } | Card::NotInstalled { .. } => palette.danger,
+        Card::UpToDate { .. } => palette.success,
+        Card::Held { .. } => palette.warning,
+        _ => palette.accent,
+    };
+    let say = |text: Msgid| skin.say(text);
+    let mut sub: Vec<String> = Vec::new();
+    let mut lines: Vec<Line> = Vec::new();
+    // Which of `lines` are the progress row, and which the work a restart
+    // would interrupt: a list for a screen reader.
+    let mut progress = None;
+    let mut work = 0..0;
+    match shown {
+        Card::NotChecked => sub.push(say(msgid("not checked yet"))),
+        Card::Checking => sub.push(crate::update::check::ASKED.to_owned()),
+        Card::UpToDate { checked } => sub.push(look.label(
+            &gettext(locale, "Checked {when}").replace("{when}", &when(locale, checked, now)),
+        )),
+        Card::Available(offer) | Card::NoBuild(offer) => {
+            sub.push(
+                look.label(&gettext(locale, "You have {version}").replace("{version}", current)),
+            );
+            if let Some(at) = offer.published {
+                sub.push(look.label(&released(locale, at, now)));
+            }
+            if let Some((_, size)) = offer.download {
+                sub.push(look.label(&release::megabytes(size)));
+            }
+            sub.push(format!(
+                "{} {}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ));
+            for point in &offer.notes {
+                let plain: String = release::runs(point)
+                    .into_iter()
+                    .map(|(run, _)| run)
+                    .collect();
+                lines.push(vec![(format!("  - {}", look.label(&plain)), palette.text)]);
+            }
+            if matches!(shown, Card::NoBuild(_)) {
+                let said = gettext(locale, "{version} has no build for this computer yet")
+                    .replace("{version}", &offer.version);
+                lines.push(vec![(look.label(&said), palette.warning)]);
+            }
+        }
+        Card::Elsewhere(_, managed) => {
+            sub.push(say(managed.said));
+            if let Some(command) = managed.command {
+                lines.push(vec![(format!("  {command}"), palette.text)]);
+            }
+        }
+        Card::Failed { failed, last } => {
+            sub.push(match last {
+                Some(at) => look.label(
+                    &gettext(locale, "Last successful check: {when}")
+                        .replace("{when}", &when(locale, at, now)),
+                ),
+                None => say(msgid("no check has worked yet")),
+            });
+            let said = failed.with_numbers(&failed.said().say(locale));
+            lines.push(vec![(look.label(&said), palette.danger)]);
+        }
+        Card::Downloading(downloading) => {
+            progress = Some((lines.len(), downloading));
+            lines.push(progress_row(ui, downloading, skin));
+        }
+        Card::Ready(_) => sub.push(say(super::updates::ready_said(status.updates))),
+        Card::Held { when_done, .. } => {
+            sub.push(say(match when_done {
+                false => msgid("restart now would interrupt:"),
+                true => msgid("native-sql-database-client-windows restarts once this is done:"),
+            }));
+            let listed = interrupted();
+            let start = lines.len();
+            for item in &listed {
+                lines.push(vec![
+                    (format!("  - {}", item.window), palette.text),
+                    (format!(": {}", work_said(item, locale)), palette.text),
+                ]);
+            }
+            work = start..lines.len();
+        }
+        Card::Restarting(_) => sub.push(say(msgid("native-sql-database-client-windows restarts in a moment"))),
+        Card::NotInstalled { failure, .. } => {
+            sub.push(say(msgid("nothing was installed. your copy is unchanged.")));
+            lines.push(vec![(
+                look.label(&failure_said(failure, locale)),
+                palette.danger,
+            )]);
+        }
+    }
+    // The pane's keys that act on what the block shows.
+    let keys: Vec<(Command, String)> = match shown {
+        Card::NotChecked | Card::UpToDate { .. } => {
+            vec![(Command::SettingsCheckNow, say(msgid("check now")))]
+        }
+        Card::Failed { .. } => vec![(Command::SettingsCheckNow, say(msgid("try again")))],
+        Card::Checking => Vec::new(),
+        Card::Available(offer) | Card::NoBuild(offer) => {
+            let mut keys = Vec::new();
+            if matches!(shown, Card::Available(_)) && installs(status) {
+                keys.push((Command::SettingsInstallUpdate, say(msgid("update now"))));
+            }
+            keys.push((Command::SettingsReleaseNotes, say(msgid("release notes"))));
+            keys.push((
+                Command::SettingsSkipVersion,
+                format!("{} {}", say(msgid("skip")), offer.version),
+            ));
+            keys
+        }
+        // The progress row has its key.
+        Card::Downloading(_) | Card::Restarting(_) => Vec::new(),
+        Card::Ready(_) => vec![(Command::SettingsInstallUpdate, say(msgid("restart now")))],
+        Card::Held { when_done, .. } => vec![(
+            Command::SettingsInstallUpdate,
+            say(match when_done {
+                false => msgid("restart when done"),
+                true => msgid("don't restart"),
+            }),
+        )],
+        Card::NotInstalled { .. } => {
+            vec![(Command::SettingsInstallUpdate, say(msgid("download again")))]
+        }
+        Card::Elsewhere(_, managed) => match managed.command {
+            Some(_) => vec![
+                (Command::SettingsCopyCommand, say(msgid("copy"))),
+                (Command::SettingsReleaseNotes, say(msgid("release notes"))),
+            ],
+            None => vec![(Command::SettingsReleaseNotes, say(msgid("release notes")))],
+        },
+    };
+    let mut keyed: Line = Vec::new();
+    for (index, (command, what)) in keys.iter().enumerate() {
+        if index > 0 {
+            keyed.push(("  ".to_owned(), palette.dim));
+        }
+        keyed.push((key(ui, look, *command).as_str().to_owned(), palette.accent));
+        keyed.push((format!(" {what}"), palette.text));
+    }
+
+    let role = TextRole::OBody;
+    let line = (role.row_height(ui.ctx(), look.faces) * 1.35).round();
+    let count = 1 + lines.len() + usize::from(!keyed.is_empty());
+    let height = count as f32 * line + 20.0 + if keyed.is_empty() { 0.0 } else { 6.0 };
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), height + 14.0), Sense::hover());
+    let band = Rect::from_min_max(
+        pos2(rect.left() + ROW_SIDE, rect.top() + 8.0),
+        pos2(
+            (rect.right() - ROW_SIDE).max(rect.left() + ROW_SIDE),
+            rect.bottom() - 6.0,
+        ),
+    );
+    ui.painter()
+        .rect_filled(band, CornerRadius::ZERO, palette.panel);
+    ui.painter().rect_stroke(
+        band,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, palette.accent),
+        StrokeKind::Inside,
+    );
+    // The region, named; its lines are its own.
+    let region_id = ui.id().with("update-status");
+    let region = ui.interact(band, region_id, Sense::hover());
+    let named = skin.say(msgid("Update status"));
+    region.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, &named));
+    ui.ctx().accesskit_node_builder(region_id, |node| {
+        node.set_role(egui::accesskit::Role::Region);
+    });
+    let inside = egui::UiBuilder::new()
+        .accessibility_parent(region_id)
+        .max_rect(band);
+    let mut inside = ui.new_child(inside);
+    let ui = &mut inside;
+    let left = band.left() + 16.0;
+    let right = band.right() - 16.0;
+    let mut y = band.top() + 10.0 + line / 2.0;
+    // A line is cut at the block's edge, and read whole.
+    let ctx = ui.ctx().clone();
+    let cut = |text: &str, room: f32| {
+        crate::ui::grid::ellipsize(text, room.max(0.0), false, |text| {
+            role.width(&ctx, look.faces, text)
+        })
+        .into_owned()
+    };
+    // The title, strong, and what it says beside it.
+    let strong = Text::one(look, TextRole::OBody, &title, title_color).layout(ui.ctx());
+    strong.paint_left(ui.painter(), left, y);
+    // Told politely as it changes; an error is told by its own line.
+    announce_live(
+        ui,
+        Rect::from_center_size(pos2(left + strong.width() / 2.0, y), strong.size()),
+        (&title, "title"),
+        Live::Polite,
+    );
+    if !sub.is_empty() {
+        let said = format!("  {}", sub.join(" · "));
+        let shown_sub = cut(&said, right - left - strong.width());
+        let width = widgets::paint_text(
+            ui,
+            left + strong.width(),
+            y,
+            Text::one(look, role, &shown_sub, palette.dim),
+        );
+        widgets::announce(
+            ui,
+            Rect::from_min_size(
+                pos2(left + strong.width(), y - line / 2.0),
+                vec2(width.max(1.0), line),
+            ),
+            said.trim(),
+        );
+    }
+    // The work a restart would interrupt is a list: its items are the
+    // list's children, not the block's.
+    let items = (!work.is_empty()).then(|| {
+        let top = y + line / 2.0 + line * work.start as f32;
+        let rect = Rect::from_min_max(
+            pos2(left, top),
+            pos2(right.max(left), top + line * work.len() as f32),
+        );
+        let list_id = ui.id().with("update-work");
+        let list = ui.interact(rect, list_id, Sense::hover());
+        let named = skin.say(msgid("Work in progress"));
+        list.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, &named));
+        ui.ctx().accesskit_node_builder(list_id, |node| {
+            node.set_role(egui::accesskit::Role::List);
+        });
+        let items = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .accessibility_parent(list_id),
+        );
+        (list_id, items)
+    });
+    for (index, pieces) in lines
+        .iter()
+        .chain((!keyed.is_empty()).then_some(&keyed))
+        .enumerate()
+    {
+        y += line;
+        if std::ptr::eq(pieces, &keyed) {
+            y += 6.0;
+        }
+        let mut text = Text::new(look);
+        for (piece, color) in pieces {
+            // A line of one piece is a note or what is said: cut to fit.
+            let piece = match pieces.len() {
+                1 => cut(piece, right - left),
+                _ => piece.clone(),
+            };
+            text = text.add(role, &piece, *color);
+        }
+        let laid = text.layout(ui.ctx());
+        laid.paint_left(ui.painter(), left, y);
+        let said: String = pieces.iter().map(|(piece, _)| piece.as_str()).collect();
+        let place = Rect::from_center_size(
+            pos2(left + laid.width() / 2.0, y),
+            vec2(laid.width().max(1.0), line),
+        );
+        let error = matches!(shown, Card::Failed { .. } | Card::NotInstalled { .. })
+            && pieces
+                .first()
+                .is_some_and(|(_, color)| *color == palette.danger);
+        if let Some((at, downloading)) = progress
+            && at == index
+        {
+            // Read without the spinner and the bar's cells, which the
+            // progress indicator says.
+            let row: String = pieces[4..]
+                .iter()
+                .map(|(piece, _)| piece.as_str())
+                .collect();
+            widgets::announce(ui, place, row.trim_start_matches("] ").trim());
+            progress_node(ui, place, downloading, locale);
+        } else if let Some((list_id, items)) = &items
+            && work.contains(&index)
+        {
+            let item = items.interact(place, list_id.with(index), Sense::hover());
+            let said = said.trim().trim_start_matches("- ").to_owned();
+            item.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &said));
+            ui.ctx().accesskit_node_builder(item.id, |node| {
+                node.set_role(egui::accesskit::Role::ListItem);
+            });
+        } else if error {
+            announce_live(ui, place, (said.trim(), "error"), Live::Assertive);
+        } else {
+            widgets::announce(ui, place, said.trim());
+        }
+    }
+}
+
+/// What a package manager's copy does, and what the check sends, in a
+/// box under the row.
+fn note(ui: &mut Ui, skin: &Skin) {
+    let Skin { look, palette, .. } = *skin;
+    let role = TextRole::OBody;
+    let width = (ui.available_width() - 2.0 * ROW_SIDE - 24.0).max(0.0);
+    let first = Text::new(look)
+        .add(role, &skin.say(NOTE), palette.dim)
+        .space(role, " ")
+        .add(role, NOTE_COMMAND, palette.text)
+        .add(role, ".", palette.dim)
+        .wrap(width)
+        .layout(ui.ctx());
+    let second = Text::one(look, role, &skin.say(PRIVACY), palette.dim)
+        .wrap(width)
+        .layout(ui.ctx());
+    let height = first.height() + second.height() + 20.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let band = Rect::from_min_max(
+        pos2(rect.left() + ROW_SIDE, rect.top()),
+        pos2(
+            (rect.right() - ROW_SIDE).max(rect.left() + ROW_SIDE),
+            rect.bottom(),
+        ),
+    );
+    ui.painter().rect_stroke(
+        band,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, palette.outline),
+        StrokeKind::Inside,
+    );
+    let at = pos2(band.left() + 12.0, band.top() + 10.0);
+    first.paint(ui.painter(), at);
+    widgets::announce(
+        ui,
+        Rect::from_min_size(at, first.size()),
+        first.galley.text(),
+    );
+    let at = pos2(at.x, at.y + first.height());
+    second.paint(ui.painter(), at);
+    widgets::announce(
+        ui,
+        Rect::from_min_size(at, second.size()),
+        second.galley.text(),
+    );
+}

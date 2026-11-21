@@ -1,0 +1,2354 @@
+//! The Settings window as the terminal look draws it: a screen over the
+//! whole window. A header, the app's notice while it has one, a nav of its
+//! panes, the pane's rows under a cursor, the settings file beside them
+//! where the window has the room (`file_pane.rs` draws it in the place it
+//! is given here), and the screen's keys in the footer.
+
+use egui::emath::GuiRounding as _;
+use egui::{CornerRadius, Rect, Sense, Stroke, StrokeKind, Ui, WidgetInfo, WidgetType, pos2, vec2};
+
+use crate::app::{PinState, Work};
+use crate::i18n::{Locale, Msgid, gettext, msgid, ngettext, pmsgid};
+use crate::keymap::{Bind, Command, Keymap, Layout};
+use crate::model::{Action, SettingsDialog, SettingsPane, SettingsRow};
+use crate::settings::{Idle, OptionId, OptionValue, Settings, SettingsFile};
+use crate::theme::{Look, Palette};
+use crate::typography::{Text, TextRole};
+use crate::ui::focus::{self, Ring};
+use crate::ui::value_tags::terminal_slots;
+use crate::ui::widgets::{self, ButtonSpec};
+
+use super::{Said, choices, file_pane, sample_timestamp, terminal_label};
+
+/// The header's and the footer's heights, each without its rule.
+const HEADER: f32 = 40.0;
+const FOOTER: f32 = 30.0;
+/// A notice's band without its rule, and how far its line stands in from
+/// the band's sides.
+const NOTICE: f32 = 36.0;
+const NOTICE_SIDE: f32 = 14.0;
+/// The nav's width.
+const NAV: f32 = 220.0;
+/// An option's row, and how far its words stand in from its sides.
+const ROW: f32 = 30.0;
+pub(super) const ROW_SIDE: f32 = 16.0;
+/// The label's column and the value's at their widest; the hint has what
+/// is left.
+const LABEL: f32 = 280.0;
+const VALUE: f32 = 320.0;
+/// The space at each side of a segment's word.
+const SEGMENT_PAD: f32 = 6.0;
+/// One of the palette's swatches.
+const SWATCH: egui::Vec2 = vec2(18.0, 14.0);
+/// The file's pane: this wide, or this share of the window where that is
+/// less, and not there in a window narrower than `FILE_FROM`.
+const FILE: f32 = 620.0;
+const FILE_SHARE: f32 = 0.4;
+const FILE_FROM: f32 = 1100.0;
+
+/// How the screen draws: the look, the palette and the language.
+#[derive(Clone, Copy)]
+pub(super) struct Skin<'a> {
+    pub(super) look: &'a Look,
+    pub(super) palette: &'a Palette,
+    pub(super) locale: Locale,
+    /// Whether a connection window is open: what Enter on the Agents
+    /// pane's status and log rows shows the tab of.
+    pub(super) window: bool,
+    /// The computer's zone's name, which the System zone writes beside it.
+    pub(super) system: Option<&'a str>,
+    /// The last named zone the session had, which the zone's steps reach.
+    pub(super) named: Option<&'a str>,
+    /// The system's first language, which the System language follows.
+    pub(super) language: Option<&'a crate::i18n::LanguageTag>,
+    /// The saved connections, and what On launch steps through.
+    pub(super) connections: &'a [crate::connections::SavedConnection],
+    pub(super) launches: &'a [crate::settings::Launch],
+    /// What the theme's rows say of the desktop.
+    pub(super) desktop: Desktop<'a>,
+    /// What the font's row says of the font drawn.
+    pub(super) font: FontShown<'a>,
+    /// When the last check for updates that worked ran, as the Updates
+    /// pane's row says it: `last checked 09:12`.
+    pub(super) checked: Option<&'a str>,
+    /// How far in from the left the macOS window buttons reach, in
+    /// points: the header's title starts after them.
+    pub(super) inset: f32,
+}
+
+/// What fontconfig gave for the font the settings name, which the font's
+/// row says beside its value.
+#[derive(Clone, Copy)]
+pub(super) struct FontShown<'a> {
+    /// The family drawn, as fontconfig names it: `None` where nothing was
+    /// read from it (the bundled face is drawn then).
+    pub(super) family: Option<&'a str>,
+    /// The font the settings name, where fontconfig does not have it: the
+    /// system's monospace is drawn in its place.
+    pub(super) missing: Option<&'a str>,
+}
+
+/// What the Appearance pane's theme rows say beside their values: Omarchy's
+/// theme of the moment, and how a pin stands.
+#[derive(Clone, Copy)]
+pub(super) struct Desktop<'a> {
+    /// The name of Omarchy's theme of the moment, where it is known.
+    pub(super) current: Option<&'a str>,
+    /// The pin as the settings write it, and how it stands.
+    pub(super) pin: Option<(&'a str, PinState)>,
+    /// Whether Omarchy's palette is followed: else the system's light or
+    /// dark is.
+    pub(super) follows_omarchy: bool,
+}
+
+/// What the screen reads of the app beside its skin and the dialog, built
+/// by `settings::terminal_asked`.
+pub(super) struct Asked<'a> {
+    /// The app's notice, which stands under the header while it has one.
+    pub(super) notice: Option<&'a str>,
+    /// The Keyboard pane's shortcuts, where the file's pane and the
+    /// footer find the cursor's row.
+    pub(super) keymap: &'a Keymap,
+    /// The settings file the file's pane shows, its path as the window
+    /// writes it, and the keys it binds.
+    pub(super) file: &'a SettingsFile,
+    pub(super) path: String,
+    pub(super) binds: &'a [Bind],
+    /// The settings as the window shows them (`settings::shown`).
+    pub(super) shown: Settings,
+    /// The server, as the Agents pane's status says it.
+    pub(super) server: super::agents::Server,
+    /// Where updates stand, which the nav's dot and the Updates pane read.
+    pub(super) status: super::updates::Status<'a>,
+    /// What Enter does on the cursor's row, where it does something
+    /// (`settings::opened`).
+    pub(super) opened: Option<Vec<Action>>,
+    /// What a restart would interrupt: asked only while the Updates card
+    /// is held.
+    pub(super) interrupted: &'a dyn Fn() -> Vec<Work>,
+}
+
+impl Skin<'_> {
+    /// `text` translated, in the look's case.
+    pub(super) fn say(&self, text: Msgid) -> String {
+        self.look.label(&text.say(self.locale))
+    }
+
+    /// A row's label as the screen writes it: as [`Self::say`] has it,
+    /// with the run key in it where it names one.
+    fn label(&self, ctx: &egui::Context, text: Msgid) -> String {
+        self.look
+            .label(&super::said(ctx, self.look, self.locale, text))
+    }
+
+    /// A choice as the screen writes it: a word as [`Self::say`] has it, a
+    /// sample as it is, a key as the keymap writes it.
+    fn written(&self, ctx: &egui::Context, choice: Said) -> String {
+        match choice {
+            Said::Word(word) => self.say(word),
+            Said::Sample(sample) => sample.to_owned(),
+            Said::Grouped(number) => {
+                crate::i18n::numbers::group_number(self.locale, number).into_owned()
+            }
+            Said::Key(command) => crate::ui::keys::written(ctx, self.look, command)
+                .as_str()
+                .to_owned(),
+        }
+    }
+}
+
+/// A row's value: the row, where its column starts, whether the cursor is
+/// on it, and the hint the row paints, which describes its controls.
+#[derive(Clone, Copy)]
+struct Cell<'a> {
+    index: usize,
+    row: Rect,
+    left: f32,
+    on_cursor: bool,
+    described: Option<&'a str>,
+}
+
+/// The screen over the whole window, drawn as `skin` has it: the header,
+/// the notice, the nav, the rows of the pane `dialog` shows with what the
+/// app answered in `asked`, the file beside them where it fits, and the
+/// footer. What its buttons do is pushed into `actions`.
+pub(super) fn show(
+    ctx: &egui::Context,
+    skin: &Skin,
+    dialog: &SettingsDialog,
+    asked: Asked,
+    actions: &mut Vec<Action>,
+) {
+    let (pane, row) = (dialog.pane, dialog.row);
+    let settings = &asked.shown;
+    let screen = ctx.content_rect();
+    let id = egui::Id::new("settings");
+    // A modal: nothing behind it can be clicked while it is open. It is
+    // whole on the first frame it paints: through a fade the workspace
+    // would show in every row.
+    let area = egui::Modal::default_area(id)
+        .anchor(egui::Align2::LEFT_TOP, egui::Vec2::ZERO)
+        .fade_in(false);
+    // No dialog's border, corners or margin: the screen is the window.
+    let frame = egui::Frame::new().fill(skin.palette.window);
+    widgets::modal(id, skin.look, skin.palette)
+        .frame(frame)
+        .area(area)
+        .backdrop_color(skin.palette.window)
+        .show(ctx, |ui| {
+            ui.set_width(screen.width());
+            ui.set_height(screen.height());
+            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+            header(ui, pane, skin);
+            let notice = notice(ui, skin, asked.notice, actions);
+            // What the header, a notice, the footer and their rules leave.
+            let height = (screen.height() - HEADER - notice - FOOTER - 2.0).max(0.0);
+            let (body, _) =
+                ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+            let (side, place) = body.split_left_right_at_x((body.left() + NAV).min(body.right()));
+            let offered = super::updates::offered(asked.status);
+            nav(ui, (side, offered), pane, skin, actions);
+            // The rows scroll when the window is short, so the header and
+            // the footer stay on screen. They start past the nav's rule.
+            let place = place.with_min_x((place.left() + 1.0).min(place.right()));
+            let cursor = pane.rows().get(row).copied();
+            let option = cursor.and_then(SettingsRow::option);
+            // The file has the right of the rows, in a window wide enough
+            // for both.
+            let (place, beside) = if screen.width() >= FILE_FROM {
+                let width = FILE.min(screen.width() * FILE_SHARE);
+                let edge = (place.right() - width).round_to_pixels(ui.pixels_per_point());
+                let (place, beside) = place.split_left_right_at_x(edge);
+                (place, Some(beside))
+            } else {
+                (place, None)
+            };
+            let mut list = ui.new_child(egui::UiBuilder::new().id_salt("rows").max_rect(place));
+            // Each pane scrolls on its own.
+            egui::ScrollArea::vertical()
+                .id_salt(pane.name())
+                .auto_shrink([false, false])
+                .show(&mut list, |ui| match pane {
+                    SettingsPane::General => rows(ui, settings, row, skin, actions),
+                    SettingsPane::Appearance => appearance_rows(ui, settings, row, skin, actions),
+                    SettingsPane::Editor => editor_rows(ui, settings, row, skin, actions),
+                    SettingsPane::Keyboard => {
+                        super::keyboard_terminal::rows(
+                            ui,
+                            asked.keymap,
+                            &dialog.keyboard,
+                            skin,
+                            actions,
+                        );
+                    }
+                    SettingsPane::Agents => {
+                        agent_rows(ui, asked.server, settings, row, skin, actions);
+                    }
+                    SettingsPane::Updates => {
+                        super::updates_terminal::rows(
+                            ui,
+                            asked.status,
+                            asked.interrupted,
+                            settings,
+                            row,
+                            skin,
+                            actions,
+                        );
+                    }
+                });
+            if let Some(beside) = beside {
+                let shown = match pane {
+                    SettingsPane::Keyboard => {
+                        let (keymap, layout) = (asked.keymap, Layout::of(skin.look));
+                        let page = &dialog.keyboard;
+                        let row =
+                            super::keyboard_terminal::cursor(keymap, layout, skin.locale, page);
+                        file_pane::Shown::Keys(row)
+                    }
+                    _ => file_pane::Shown::Option(option),
+                };
+                let (file, path) = (asked.file, asked.path.as_str());
+                file_pane::show(ui, beside, file, path, asked.binds, shown, skin);
+            }
+            let opens = cursor.zip(asked.opened);
+            let question = dialog.history_question;
+            let update = dialog.update_question.as_deref();
+            let update = update.filter(|_| pane == SettingsPane::Updates);
+            match (question, update) {
+                (Some(question), _) => history_question(ui, question, skin, actions),
+                (None, Some(version)) => update_question(ui, version, skin, actions),
+                (None, None) if pane == SettingsPane::Keyboard => {
+                    keyboard_footer(ui, asked.keymap, &dialog.keyboard, skin, actions);
+                }
+                (None, None) => footer(ui, pane, option, opens, settings, skin, actions),
+            }
+        });
+}
+
+/// The footer while the history asks whether to delete what it kept: the
+/// question, and its two keys, each a button too.
+fn history_question(
+    ui: &mut Ui,
+    question: crate::model::HistoryQuestion,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    let Skin { look, palette, .. } = *skin;
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), FOOTER + 1.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::ZERO, palette.panel);
+    widgets::hline(ui, rect.x_range(), rect.top() + 0.5, palette.outline);
+    let y = rect.top() + 1.0 + FOOTER / 2.0;
+    let asks = skin.say(match question {
+        crate::model::HistoryQuestion::ClearAll => {
+            msgid("clear the history of every connection? this can't be undone")
+        }
+        crate::model::HistoryQuestion::Forget => {
+            msgid("history is off · delete the statements it kept on this computer?")
+        }
+    });
+    let mut left = rect.left() + 12.0;
+    left += widgets::paint_label(
+        ui,
+        left,
+        y,
+        Text::one(look, TextRole::OSecondary, &asks, palette.warning),
+    ) + 16.0;
+    for (command, what, answer) in [
+        (
+            Command::SettingsDeleteHistory,
+            skin.say(msgid("delete")),
+            true,
+        ),
+        (Command::SettingsKeepHistory, skin.say(msgid("keep")), false),
+    ] {
+        let key = key(ui, look, command);
+        let hint = [(&key, what.as_str(), true)];
+        let width = widgets::key_hints(ui, (left, y), &hint, 0.0, look, palette);
+        let place = Rect::from_min_max(
+            pos2(left, rect.top() + 5.0),
+            pos2(left + width, rect.bottom() - 4.0),
+        );
+        left += width + 16.0;
+        if ButtonSpec::new(&what).hidden_at(ui, place).clicked() {
+            actions.push(Action::AnswerHistoryQuestion(answer));
+        }
+    }
+}
+
+/// The footer while `:update` asks whether to install `version` and
+/// restart, as the components' confirm row has it: the question on the
+/// sunken ground under a red rule, then `[y] yes  [N] no`. Each hint is
+/// its button too.
+fn update_question(ui: &mut Ui, version: &str, skin: &Skin, actions: &mut Vec<Action>) {
+    let Skin {
+        look,
+        palette,
+        locale,
+        ..
+    } = *skin;
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), FOOTER + 1.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::ZERO, palette.panel);
+    widgets::hline(ui, rect.x_range(), rect.top() + 0.5, palette.danger);
+    let y = rect.top() + 1.0 + FOOTER / 2.0;
+    let role = TextRole::OSecondary;
+    let asks = skin
+        .say(msgid("install {version} and restart?"))
+        .replace("{version}", version);
+    let mut left = rect.left() + 12.0;
+    left += widgets::paint_label(ui, left, y, Text::one(look, role, &asks, palette.text)) + 18.0;
+    for (command, word, name, yes) in [
+        (
+            Command::SettingsInstallYes,
+            msgid("yes"),
+            msgid("Install and restart"),
+            true,
+        ),
+        (
+            Command::SettingsInstallNo,
+            msgid("no"),
+            msgid("Cancel"),
+            false,
+        ),
+    ] {
+        let written = key(ui, look, command).bracketed();
+        let word = skin.say(word);
+        let hint = Text::new(look)
+            .add(role, &written, palette.accent)
+            .space(role, " ")
+            .add(role, &word, palette.secondary);
+        let width = widgets::paint_text(ui, left, y, hint);
+        let place = Rect::from_min_max(
+            pos2(left, rect.top() + 5.0),
+            pos2(left + width, rect.bottom() - 4.0),
+        );
+        widgets::announce(ui, place, &format!("{} {word}", written.as_str()));
+        left += width + 16.0;
+        if ButtonSpec::new(&name.say(locale))
+            .hidden_at(ui, place)
+            .clicked()
+        {
+            actions.push(Action::AnswerUpdateQuestion(yes));
+        }
+    }
+}
+
+/// One tinted line: the title and the pane it shows, and at the right
+/// what a change does and the key that opens the screen.
+fn header(ui: &mut Ui, pane: SettingsPane, skin: &Skin) {
+    let Skin {
+        look,
+        palette,
+        inset,
+        ..
+    } = *skin;
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), HEADER + 1.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::ZERO, palette.panel);
+    widgets::hline(ui, rect.x_range(), rect.bottom() - 0.5, palette.outline);
+    let y = rect.top() + HEADER / 2.0;
+    // Clear of the macOS window buttons, as the connections' header is.
+    let mut x = rect.left() + 14.0_f32.max(inset + 12.0);
+    x += widgets::paint_label(
+        ui,
+        x,
+        y,
+        Text::one(
+            look,
+            TextRole::OScreenTitle,
+            &skin.say(msgid("Settings")),
+            palette.text,
+        ),
+    ) + 12.0;
+    x += widgets::paint_text(
+        ui,
+        x,
+        y,
+        Text::one(look, TextRole::OBody, &skin.say(pane.name()), palette.dim),
+    );
+    let role = widgets::secondary(look);
+    let note = format!("{} · ", skin.say(msgid("Changes apply right away")));
+    let note = Text::new(look)
+        .add(role, &note, palette.dim)
+        .add(role, &key(ui, look, Command::Settings), palette.accent)
+        .space(role, " ")
+        .add(role, &skin.say(msgid("opens this")), palette.dim)
+        .layout(ui.ctx());
+    // The note gives way to the title in a window too narrow for both.
+    let right = rect.right() - 14.0;
+    if right - note.width() >= x + 12.0 {
+        note.paint_right(ui.painter(), right, y);
+    }
+}
+
+/// The app's notice, in a band under the header: the bar that shows it is
+/// under the screen, and a save that fails here would go unseen until the
+/// screen closes. Returns the band's height with its rule, nothing when
+/// there is no notice.
+fn notice(ui: &mut Ui, skin: &Skin, notice: Option<&str>, actions: &mut Vec<Action>) -> f32 {
+    let Some(message) = notice else {
+        return 0.0;
+    };
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), NOTICE + 1.0), Sense::hover());
+    let fill = crate::ui::notice_fill(skin.palette);
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, fill);
+    widgets::hline(
+        ui,
+        rect.x_range(),
+        rect.bottom() - 0.5,
+        skin.palette.outline,
+    );
+    let left = rect.left() + NOTICE_SIDE;
+    let right = (rect.right() - NOTICE_SIDE).max(left);
+    let line = Rect::from_min_max(pos2(left, rect.top()), pos2(right, rect.bottom() - 1.0));
+    // The bar's own line, centred on the band.
+    let centred = egui::Layout::left_to_right(egui::Align::Center);
+    let builder = egui::UiBuilder::new().id_salt("notice").max_rect(line);
+    let mut line = ui.new_child(builder.layout(centred));
+    let paint = crate::ui::Paint {
+        locale: skin.locale,
+        palette: *skin.palette,
+        look: *skin.look,
+    };
+    crate::ui::notice_line(&mut line, paint, message, actions);
+    rect.height()
+}
+
+/// The mark of the nav's item and of the cursor's row: the selection's
+/// fill, with a 2 pt bar in the accent at its left. Neither is put on whole
+/// pixels here, nor is any other fill or outline of the screen: epaint does
+/// that as it draws them, the bar too where it is thin enough to be drawn
+/// as a line.
+fn mark(ui: &Ui, rect: Rect, palette: &Palette) {
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::ZERO, palette.selection);
+    let bar = Rect::from_min_size(rect.min, vec2(2.0, rect.height()));
+    painter.rect_filled(bar, CornerRadius::ZERO, palette.accent);
+}
+
+/// The panes, down the left, the one shown marked: a click shows another.
+/// Under them, where there are two, the key that switches. Updates has a
+/// `●` while a newer version is `offered`.
+fn nav(
+    ui: &mut Ui,
+    (rect, offered): (Rect, bool),
+    shown: SettingsPane,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    let Skin {
+        look,
+        palette,
+        locale,
+        ..
+    } = *skin;
+    widgets::vline(ui, rect.right() + 0.5, rect.y_range(), palette.outline);
+    // An item is its line of text, with 3 above and below.
+    let line = TextRole::OBody.row_height(ui.ctx(), look.faces);
+    let listed = SettingsPane::listed();
+    for (index, pane) in listed.iter().copied().enumerate() {
+        let item = Rect::from_min_size(
+            pos2(rect.left(), rect.top() + 10.0 + index as f32 * (line + 6.0)),
+            vec2(rect.width(), line + 6.0),
+        );
+        let on = pane == shown;
+        let name = pane.name().say(locale);
+        let button = ButtonSpec::new(&name).hidden_at(ui, item);
+        button.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, on, &name));
+        focus::hint(ui, &button, item, Ring::Inset { radius: 0 });
+        if button.clicked() && !on {
+            actions.push(Action::ShowSettingsPane(pane));
+        }
+        let color = if on {
+            mark(ui, item, palette);
+            palette.text
+        } else {
+            palette.dim
+        };
+        let width = widgets::paint_label(
+            ui,
+            item.left() + 14.0,
+            item.center().y,
+            Text::one(look, TextRole::OBody, &skin.say(pane.name()), color),
+        );
+        if pane == SettingsPane::Updates && offered {
+            let at = item.left() + 14.0 + width;
+            let dot = Text::one(look, TextRole::OBody, " ●", palette.accent).layout(ui.ctx());
+            dot.paint_left(ui.painter(), at, item.center().y);
+            let place =
+                Rect::from_center_size(pos2(at + dot.width() / 2.0, item.center().y), dot.size());
+            widgets::announce(ui, place, &gettext(locale, "Update available"));
+        }
+    }
+    if listed.len() > 1 {
+        let switch = key(ui, look, Command::SettingsPane);
+        let what = skin.say(msgid("pane"));
+        let y = rect.bottom() - 10.0 - line / 2.0;
+        let hint = [(&switch, what.as_str(), true)];
+        widgets::key_hints(ui, (rect.left() + 14.0, y), &hint, 0.0, look, palette);
+    }
+}
+
+/// A group's heading over its rows: 12 over it and 4 under, after `top`
+/// at the pane's top or between two groups. A whole number of points, so
+/// the rows' fills start on a pixel.
+pub(super) fn heading(ui: &mut Ui, text: Msgid, top: f32, skin: &Skin) {
+    let Skin { look, palette, .. } = *skin;
+    let role = TextRole::OCaption;
+    let line = role.row_height(ui.ctx(), look.faces);
+    let height = (top + 12.0 + line + 4.0).ceil();
+    let (place, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    // Dim, which `widgets::section_label` is not in this look.
+    widgets::paint_label(
+        ui,
+        place.left() + ROW_SIDE,
+        place.top() + top + 12.0 + line / 2.0,
+        Text::one(look, role, &skin.label(ui.ctx(), text), palette.dim),
+    );
+}
+
+/// The General pane's options, one to a row, under the headings of their
+/// groups. Their columns line up across the groups.
+fn rows(ui: &mut Ui, settings: &Settings, cursor: usize, skin: &Skin, actions: &mut Vec<Action>) {
+    let room = ui.available_width() - 2.0 * ROW_SIDE;
+    let columns = columns(
+        ui,
+        room,
+        widths(ui, &OptionId::GENERAL, settings, skin),
+        skin,
+    );
+    let mut index = 0;
+    for (heading_text, top, options) in [
+        (msgid("Language"), 8.0, &OptionId::LANGUAGE[..]),
+        (msgid("Startup"), 12.0, &OptionId::STARTUP[..]),
+        (msgid("Data"), 12.0, &OptionId::DATA[..]),
+        (msgid("Safety"), 12.0, &OptionId::SAFETY[..]),
+    ] {
+        heading(ui, heading_text, top, skin);
+        for option in options.iter().copied() {
+            option_row(
+                ui,
+                (index, option),
+                index == cursor,
+                columns,
+                settings,
+                skin,
+                actions,
+            );
+            index += 1;
+        }
+    }
+}
+
+/// The Appearance pane's options, a row each, under the headings of their
+/// groups, and the preview under them. Their columns line up across the
+/// groups.
+fn appearance_rows(
+    ui: &mut Ui,
+    settings: &Settings,
+    cursor: usize,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    let room = ui.available_width() - 2.0 * ROW_SIDE;
+    let columns = columns(
+        ui,
+        room,
+        widths(ui, &OptionId::APPEARANCE, settings, skin),
+        skin,
+    );
+    let mut index = 0;
+    for (heading_text, top, options) in [
+        (msgid("Interface"), 8.0, &OptionId::INTERFACE[..]),
+        (msgid("Theme"), 12.0, &OptionId::THEME[..]),
+        (msgid("Text"), 12.0, &OptionId::TERMINAL_TEXT[..]),
+        (msgid("Grid"), 12.0, &OptionId::GRID[..]),
+        (msgid("Environment"), 12.0, &OptionId::ENVIRONMENT[..]),
+    ] {
+        heading(ui, heading_text, top, skin);
+        for option in options.iter().copied() {
+            option_row(
+                ui,
+                (index, option),
+                index == cursor,
+                columns,
+                settings,
+                skin,
+                actions,
+            );
+            index += 1;
+        }
+        // Under the theme, the colours it gave: no row of the cursor's.
+        if options == OptionId::THEME {
+            palette_row(ui, columns, skin, actions);
+        }
+    }
+    // Under the options, the preview, no row of the cursor's either: 4
+    // over and under it, as far in as the rows' words.
+    heading(ui, msgid("Preview"), 12.0, skin);
+    ui.add_space(4.0);
+    let name = skin.say(msgid("Preview"));
+    super::preview::show(ui, (&name, ROW_SIDE), settings, skin.look, skin.palette);
+    ui.add_space(4.0);
+}
+
+/// The Editor pane's options, a row each, under the headings of their
+/// groups, then its preview. Their columns line up across the groups.
+fn editor_rows(
+    ui: &mut Ui,
+    settings: &Settings,
+    cursor: usize,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    let room = ui.available_width() - 2.0 * ROW_SIDE;
+    let shown: Vec<OptionId> = [
+        &OptionId::RUNNING[..],
+        &OptionId::TERMINAL_TYPING[..],
+        &OptionId::FORMAT[..],
+        &OptionId::HISTORY[..],
+    ]
+    .concat();
+    let columns = columns(ui, room, widths(ui, &shown, settings, skin), skin);
+    let mut index = 0;
+    for (heading_text, top, options) in [
+        (msgid("Running queries"), 8.0, &OptionId::RUNNING[..]),
+        (msgid("Typing"), 12.0, &OptionId::TERMINAL_TYPING[..]),
+        // The board's: "format · = in normal mode".
+        (
+            msgid("Format · {format} in normal mode"),
+            12.0,
+            &OptionId::FORMAT[..],
+        ),
+        (msgid("History"), 12.0, &OptionId::HISTORY[..]),
+    ] {
+        heading(ui, heading_text, top, skin);
+        for option in options.iter().copied() {
+            option_row(
+                ui,
+                (index, option),
+                index == cursor,
+                columns,
+                settings,
+                skin,
+                actions,
+            );
+            index += 1;
+        }
+    }
+    // Under the options, the editor's preview, no row of the cursor's: 4
+    // over and under it, as far in as the rows' words.
+    heading(ui, msgid("Preview"), 12.0, skin);
+    ui.add_space(4.0);
+    super::editor_preview::show(
+        ui,
+        ROW_SIDE,
+        settings,
+        (skin.look, skin.palette, skin.locale),
+    );
+    ui.add_space(4.0);
+}
+
+/// The colours the theme gave, eight of them as the board has them, and
+/// where they were read from. Nothing to change: the cursor passes it.
+fn palette_row(
+    ui: &mut Ui,
+    (label_width, value_width): (f32, f32),
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    let palette = skin.palette;
+    let (row, left, right, _) = row_frame(ui, (usize::MAX, msgid("Palette")), false, skin, actions);
+    let label_width = label_width.min(right - left);
+    let value_width = value_width.min(right - left - label_width);
+    let swatches = [
+        palette.window,
+        palette.accent,
+        palette.success,
+        palette.warning,
+        palette.danger,
+        palette.magenta,
+        palette.info,
+        palette.orange,
+    ];
+    let mut x = left + label_width;
+    for color in swatches {
+        let swatch = Rect::from_center_size(pos2(x + SWATCH.x / 2.0, row.center().y), SWATCH);
+        ui.painter().rect(
+            swatch,
+            CornerRadius::same(2),
+            color,
+            Stroke::new(1.0, palette.outline),
+            StrokeKind::Inside,
+        );
+        x += SWATCH.x + 4.0;
+    }
+    let hint = palette_source(skin).layout(ui.ctx());
+    let hint_left = left + label_width + value_width;
+    if hint_left + hint.width() <= right {
+        hint.paint_left(ui.painter(), hint_left, row.center().y);
+        widgets::announce(
+            ui,
+            Rect::from_min_size(pos2(hint_left, row.top()), vec2(hint.width(), ROW)),
+            hint.galley.text(),
+        );
+    }
+}
+
+/// Where the drawn colours came from: an Omarchy theme, a palette file the
+/// pin names, or the app's own light or dark.
+fn palette_source(skin: &Skin) -> Text {
+    let Skin {
+        look,
+        palette,
+        desktop,
+        ..
+    } = *skin;
+    let said = match desktop.pin {
+        Some((_, PinState::Drawn(pinned))) if pinned.omarchy => {
+            skin.say(msgid("read from the omarchy theme"))
+        }
+        Some((name, PinState::Drawn(_))) => {
+            skin.say(msgid("read from {name}")).replace("{name}", name)
+        }
+        _ if desktop.follows_omarchy => skin.say(msgid("read from the omarchy theme")),
+        _ => skin.say(msgid("native-sql-database-client-windows's own light or dark")),
+    };
+    Text::one(look, TextRole::OBody, &said, palette.dim)
+}
+
+/// What the theme's row says beside its value: the theme drawn now, and
+/// what changes it, or why a pin is not drawn.
+fn theme_hint(skin: &Skin) -> Text {
+    let Skin {
+        look,
+        palette,
+        desktop,
+        ..
+    } = *skin;
+    let role = TextRole::OBody;
+    match desktop.pin {
+        Some((name, PinState::Drawn(_))) => {
+            let said = skin
+                .say(msgid("now: {name} · pinned"))
+                .replace("{name}", name);
+            Text::one(look, role, &said, palette.dim)
+        }
+        Some((name, PinState::Missing)) => {
+            let said = skin.say(if desktop.follows_omarchy {
+                msgid("“{name}” not found · following omarchy")
+            } else {
+                msgid("“{name}” not found · following the system")
+            });
+            Text::one(look, role, &said.replace("{name}", name), palette.warning)
+        }
+        // A pin still being read is drawn as the desktop until it is.
+        Some((_, PinState::Reading)) | None if desktop.follows_omarchy => {
+            let name = look.label(desktop.current.unwrap_or("Omarchy"));
+            let said = skin.say(msgid("now: {name} · switches with omarchy-theme"));
+            Text::one(look, role, &said.replace("{name}", &name), palette.dim)
+        }
+        Some((_, PinState::Reading)) | None => {
+            let said = skin.say(if palette.dark {
+                msgid("now: dark, from the system")
+            } else {
+                msgid("now: light, from the system")
+            });
+            Text::one(look, role, &said, palette.dim)
+        }
+    }
+}
+
+/// What the font's row says beside its value: the family fontconfig drew,
+/// or that the font named is not there.
+fn font_hint(skin: &Skin) -> Text {
+    let Skin {
+        look,
+        palette,
+        font,
+        ..
+    } = *skin;
+    let role = TextRole::OBody;
+    let family = font.family.map(|family| look.label(family));
+    match (font.missing, family) {
+        (None, Some(family)) => {
+            let said = skin.say(msgid("now: {family}, from fontconfig"));
+            Text::one(look, role, &said.replace("{family}", &family), palette.dim)
+        }
+        (None, None) => Text::one(
+            look,
+            role,
+            &skin.say(msgid("now: jetbrains mono, bundled")),
+            palette.dim,
+        ),
+        // Shorter: the row has the room for what was not found first.
+        (Some(name), family) => {
+            let drawn = family.unwrap_or_else(|| skin.say(msgid("jetbrains mono, bundled")));
+            let said = skin.say(msgid("“{name}” not found · now: {family}"));
+            let said = crate::i18n::fill(&said, &[("{name}", name), ("{family}", &drawn)]);
+            Text::one(look, role, &said, palette.warning)
+        }
+    }
+}
+
+/// The font's value: its name as the settings write it, or the system's
+/// monospace.
+fn font_value(settings: &Settings, skin: &Skin) -> String {
+    match settings.font.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() && !name.eq_ignore_ascii_case("monospace") => {
+            name.to_owned()
+        }
+        _ => skin.say(msgid("system monospace")),
+    }
+}
+
+/// The Agents pane: the server's switch and its status, how to connect an
+/// agent, where access is set, and the log. Its rows are
+/// [`SettingsPane::rows`]'s, in order; the command, the line for other
+/// agents and the note under them are no rows of the cursor's. `server`
+/// is what the status row says.
+fn agent_rows(
+    ui: &mut Ui,
+    server: super::agents::Server,
+    settings: &Settings,
+    cursor: usize,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    let Skin {
+        look,
+        palette,
+        locale,
+        ..
+    } = *skin;
+    let role = TextRole::OBody;
+    let room = ui.available_width() - 2.0 * ROW_SIDE;
+    let other = crate::endpoint::agent_setup_ready(crate::endpoint::Agent::Other).unwrap_or("…");
+    // The rows that are no options', each its label, value and hint: made
+    // again for each use, as a text is laid out once. The command for other
+    // agents gives way in its middle to what `fits`, and is copied whole.
+    let text_of = |ui: &Ui, which: usize, fits: f32| -> (Msgid, Text, Text) {
+        match which {
+            0 => {
+                let (value, hint) = status_text(server.on, server.connected, skin);
+                (msgid("Status"), value, hint)
+            }
+            1 => {
+                let (value, hint) = access_text(ui, skin);
+                (msgid("Set for each connection"), value, hint)
+            }
+            _ => {
+                let ctx = ui.ctx().clone();
+                let shown = crate::ui::grid::ellipsize(other, fits, true, |text| {
+                    role.width(&ctx, look.faces, text)
+                });
+                (
+                    msgid("Cursor, others"),
+                    Text::one(look, role, &shown, palette.text),
+                    dim(skin, msgid("same server, stdio")),
+                )
+            }
+        }
+    };
+    // Their labels and values with the options': all of the pane's columns
+    // line up. The command is as long as the path it holds, and lines up
+    // with nothing.
+    let mut widest = widths(ui, &OptionId::AGENTS, settings, skin);
+    for which in 0..2 {
+        let (name, value, hint) = text_of(ui, which, f32::INFINITY);
+        let label = role.width(ui.ctx(), look.faces, &format!("▌{}", skin.say(name)));
+        widest.0 = widest.0.max(label);
+        widest.1 = widest.1.max(value.layout(ui.ctx()).width());
+        widest.2 = widest.2.max(hint.layout(ui.ctx()).width());
+    }
+    // The status as it may come to read, not only as it does: the columns
+    // stay where they are when the server is turned on or off, or agents
+    // come and go.
+    for (on, count) in [(false, 0), (true, 0), (true, 999)] {
+        let (value, hint) = status_text(on, count, skin);
+        widest.1 = widest.1.max(value.layout(ui.ctx()).width());
+        widest.2 = widest.2.max(hint.layout(ui.ctx()).width());
+    }
+    let columns = columns(ui, room, widest, skin);
+    let on = |index: usize| index == cursor;
+    let fits = (room - columns.0).max(0.0);
+    let text = |ui: &mut Ui, index: usize, which: usize, actions: &mut Vec<Action>| {
+        let (name, value, hint) = text_of(ui, which, fits);
+        let on_cursor = index != usize::MAX && on(index);
+        text_row(
+            ui,
+            (index, name),
+            on_cursor,
+            columns,
+            (value, hint),
+            skin,
+            actions,
+        );
+    };
+    heading(ui, msgid("MCP server"), 8.0, skin);
+    option_row(
+        ui,
+        (0, OptionId::AgentsOn),
+        on(0),
+        columns,
+        settings,
+        skin,
+        actions,
+    );
+    text(ui, 1, 0, actions);
+
+    heading(ui, msgid("Connect an agent"), 12.0, skin);
+    command_box(ui, skin, locale);
+    text(ui, usize::MAX, 2, actions);
+
+    heading(ui, msgid("Access"), 12.0, skin);
+    text(ui, 2, 1, actions);
+
+    heading(ui, msgid("Log"), 12.0, skin);
+    option_row(
+        ui,
+        (3, OptionId::LogDays),
+        on(3),
+        columns,
+        settings,
+        skin,
+        actions,
+    );
+    option_row(
+        ui,
+        (4, OptionId::AgentsNotify),
+        on(4),
+        columns,
+        settings,
+        skin,
+        actions,
+    );
+
+    ui.add_space(14.0);
+    note(ui, skin);
+}
+
+/// A dim hint.
+fn dim(skin: &Skin, text: Msgid) -> Text {
+    Text::one(
+        skin.look,
+        TextRole::OBody,
+        &skin.say(text),
+        skin.palette.dim,
+    )
+}
+
+/// The status row's value and hint: whether the server runs, with how many
+/// agents are connected, and how they reach it.
+fn status_text(on: bool, count: usize, skin: &Skin) -> (Text, Text) {
+    let Skin {
+        look,
+        palette,
+        locale,
+        ..
+    } = *skin;
+    let role = TextRole::OBody;
+    if !on {
+        let value = Text::one(
+            look,
+            role,
+            &format!("● {}", skin.say(msgid("off"))),
+            palette.dim,
+        );
+        return (value, dim(skin, msgid("agents can't connect")));
+    }
+    let agents = match count {
+        0 => skin.say(msgid("no agents")),
+        count => look.label(
+            &ngettext(locale, "{n} agent", "{n} agents", count)
+                .replace("{n}", &crate::i18n::number(locale, count)),
+        ),
+    };
+    let value = Text::new(look)
+        .add(
+            role,
+            &format!("● {}", skin.say(msgid("running"))),
+            palette.success,
+        )
+        .add(role, &format!(" · {agents}"), palette.text);
+    (value, dim(skin, msgid("stdio · this computer")))
+}
+
+/// The access row's value and hint: where access is set, and the key
+/// that sets it on a row of Connections.
+fn access_text(ui: &Ui, skin: &Skin) -> (Text, Text) {
+    let Skin { look, palette, .. } = *skin;
+    let role = TextRole::OBody;
+    let change = key(ui, look, Command::ChangeAgentAccess);
+    let value = Text::one(look, role, &skin.say(msgid("in connections")), palette.text);
+    let hint = Text::new(look).add(role, &change, palette.accent).add(
+        role,
+        &format!(" {}", skin.say(msgid("on a row"))),
+        palette.dim,
+    );
+    (value, hint)
+}
+
+/// The command that connects Claude Code, boxed, with the key that copies
+/// it at the box's right.
+fn command_box(ui: &mut Ui, skin: &Skin, locale: Locale) {
+    let Skin { look, palette, .. } = *skin;
+    let role = TextRole::OBody;
+    let line = role.row_height(ui.ctx(), look.faces);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), line + 22.0), Sense::hover());
+    let boxed = Rect::from_min_max(
+        pos2(rect.left() + ROW_SIDE, rect.top() + 4.0),
+        pos2(
+            (rect.right() - ROW_SIDE).max(rect.left() + ROW_SIDE),
+            rect.bottom() - 2.0,
+        ),
+    );
+    ui.painter()
+        .rect_filled(boxed, CornerRadius::ZERO, palette.panel);
+    ui.painter().rect_stroke(
+        boxed,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, palette.outline),
+        StrokeKind::Inside,
+    );
+    let copy = key(ui, look, Command::SettingsCopyCommand);
+    let hint = Text::new(look)
+        .add(role, &copy, palette.accent)
+        .space(role, " ")
+        .add(role, &skin.say(msgid("copy")), palette.dim)
+        .layout(ui.ctx());
+    let right = boxed.right() - 12.0;
+    hint.paint_right(ui.painter(), right, boxed.center().y);
+    // The command gives way in its middle to a pane too narrow for it, and
+    // is copied whole.
+    let command = crate::endpoint::agent_command_ready().unwrap_or_else(|| {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(100));
+        "…"
+    });
+    let fits = (right - hint.width() - 16.0 - boxed.left() - 12.0).max(0.0);
+    let ctx = ui.ctx().clone();
+    let shown = crate::ui::grid::ellipsize(command, fits, true, |text| {
+        role.width(&ctx, look.faces, text)
+    });
+    widgets::paint_text(
+        ui,
+        boxed.left() + 12.0,
+        boxed.center().y,
+        Text::one(look, role, &shown, palette.text),
+    );
+    widgets::announce(ui, boxed, command);
+    let name = gettext(locale, "Copy");
+    if ButtonSpec::new(&name)
+        .hidden_at(ui, boxed.with_min_x(right - hint.width()))
+        .clicked()
+    {
+        crate::ui::agents::copy_command(ui.ctx(), locale);
+    }
+}
+
+/// What keeps agents within bounds, in a band with the accent at its left.
+fn note(ui: &mut Ui, skin: &Skin) {
+    let Skin { look, palette, .. } = *skin;
+    let role = TextRole::OBody;
+    let lines = [
+        msgid("reads run in a read-only transaction with each connection's limits"),
+        msgid("no ddl, no multiple statements, no copy, no secrets sent"),
+    ];
+    let line = role.row_height(ui.ctx(), look.faces);
+    // Each paragraph laid out at the band's width first: a long one (the
+    // Russian) wraps, and the band grows by its lines.
+    let side = (ui.available_width() - 2.0 * ROW_SIDE).max(0.0);
+    let width = (side - 24.0).max(0.0);
+    let texts = lines.map(|said| {
+        Text::one(look, role, &skin.say(said), palette.dim)
+            .wrap(width)
+            .layout(ui.ctx())
+    });
+    let step = |text: &crate::typography::Laid| text.height().max(line) + line * 0.2;
+    let height = (texts.iter().map(step).sum::<f32>() + 20.0).ceil();
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let band = Rect::from_min_max(
+        pos2(rect.left() + ROW_SIDE, rect.top()),
+        pos2(
+            (rect.right() - ROW_SIDE).max(rect.left() + ROW_SIDE),
+            rect.bottom(),
+        ),
+    );
+    ui.painter()
+        .rect_filled(band, CornerRadius::ZERO, palette.panel);
+    let bar = Rect::from_min_size(band.min, vec2(2.0, band.height()));
+    ui.painter()
+        .rect_filled(bar, CornerRadius::ZERO, palette.accent);
+    let mut y = band.top() + 10.0;
+    for text in &texts {
+        text.paint(ui.painter(), pos2(band.left() + 12.0, y));
+        widgets::announce(
+            ui,
+            Rect::from_min_size(pos2(band.left() + 12.0, y), text.size()),
+            text.galley.text(),
+        );
+        y += step(text);
+    }
+}
+
+/// The widest label, value and hint `options` have: the hints of every
+/// value, not only the ones shown, so that the columns stay where they are
+/// when a value changes.
+pub(super) fn widths(
+    ui: &Ui,
+    options: &[OptionId],
+    settings: &Settings,
+    skin: &Skin,
+) -> (f32, f32, f32) {
+    let role = TextRole::OBody;
+    let width = |text: &str| role.width(ui.ctx(), skin.look.faces, text);
+    let labels = options
+        .iter()
+        .map(|option| {
+            width(&format!(
+                "▌{}",
+                skin.label(ui.ctx(), terminal_label(*option))
+            ))
+        })
+        .fold(0.0, f32::max);
+    let values = options
+        .iter()
+        .map(|option| value_width(ui, *option, settings, skin))
+        .fold(0.0, f32::max);
+    let hints = options
+        .iter()
+        .flat_map(|option| {
+            choices(
+                *option,
+                settings,
+                (skin.named, skin.language),
+                skin.launches,
+            )
+        })
+        .map(|(_, value)| {
+            let mut changed = settings.clone();
+            value.set(&mut changed);
+            hint(ui, value.option(), &changed, skin)
+                .layout(ui.ctx())
+                .width()
+        })
+        .fold(0.0, f32::max);
+    (labels, values, hints)
+}
+
+/// The widths of the label's column and the value's in rows with `room`
+/// between their sides, from the widest label, value and hint they have:
+/// `LABEL` and `VALUE` where the widest hint has room after them. Rows with
+/// less (the file is beside them) take from the space each column has past
+/// its widest words, from both alike, before a hint is left out.
+pub(super) fn columns(
+    ui: &Ui,
+    room: f32,
+    (labels, values, hints): (f32, f32, f32),
+    skin: &Skin,
+) -> (f32, f32) {
+    // Two cells stand between a column's widest words and the next column.
+    let gap = TextRole::OBody.width(ui.ctx(), skin.look.faces, "  ");
+    let spare = [LABEL - labels - gap, VALUE - values - gap].map(|spare| spare.max(0.0));
+    // The shortfall in whole points: a hint that fits by the last fraction
+    // of one is not left out for a rounding.
+    let short = (LABEL + VALUE + hints - room)
+        .ceil()
+        .clamp(0.0, spare[0] + spare[1]);
+    let share = if short > 0.0 {
+        short / (spare[0] + spare[1])
+    } else {
+        0.0
+    };
+    (LABEL - share * spare[0], VALUE - share * spare[1])
+}
+
+/// What the stepper of `option` says after its chevrons: the font size's
+/// range, `9 to 32`.
+fn range(option: OptionId, skin: &Skin) -> Option<String> {
+    (option == OptionId::FontSize).then(|| {
+        let sizes = crate::settings::FontSizes::of(true);
+        format!(
+            "{} {} {}",
+            sizes.min.text(),
+            skin.say(msgid("to")),
+            sizes.max.text()
+        )
+    })
+}
+
+/// How wide `option`'s value is drawn, at its widest.
+fn value_width(ui: &Ui, option: OptionId, settings: &Settings, skin: &Skin) -> f32 {
+    let role = TextRole::OBody;
+    let width = |text: &str| role.width(ui.ctx(), skin.look.faces, text);
+    match option {
+        // Between its chevrons, as the cursor's row has it.
+        OptionId::PageSize
+        | OptionId::LogDays
+        | OptionId::Tz
+        | OptionId::IdleDisconnect
+        | OptionId::OnLaunch
+        | OptionId::Language
+        | OptionId::FontSize
+        | OptionId::RowLimit
+        | OptionId::Timeout
+        | OptionId::Indent
+        | OptionId::HistoryKeep
+        | OptionId::UpdatesCheck => {
+            let value = stepped_text(option, settings, skin);
+            match range(option, skin) {
+                Some(range) => width(&format!("‹ {value} › {range}")),
+                None => width(&format!("‹ {value} ›")),
+            }
+        }
+        OptionId::Font => width(&font_value(settings, skin)),
+        OptionId::Timestamps
+        | OptionId::GroupDigits
+        | OptionId::Look
+        | OptionId::Theme
+        | OptionId::InterfaceScale
+        | OptionId::RowHeight
+        | OptionId::TableList
+        | OptionId::EnvBar
+        | OptionId::NewTab
+        | OptionId::RunScope
+        | OptionId::EditorKeys
+        | OptionId::Autocomplete
+        | OptionId::LineNumbers
+        | OptionId::Keywords
+        | OptionId::Commas => {
+            let words = choices(option, settings, (skin.named, skin.language), skin.launches);
+            let between = width(" ") * words.len().saturating_sub(1) as f32;
+            let segments = words.into_iter().map(|(word, _)| segment(ui, word, skin));
+            segments.sum::<f32>() + between
+        }
+        OptionId::RestoreTabs
+        | OptionId::ValueTags
+        | OptionId::DatePicker
+        | OptionId::ProductionReadOnly
+        | OptionId::ConfirmCloseEdits
+        | OptionId::AgentsOn
+        | OptionId::AgentsNotify
+        | OptionId::Zebra
+        | OptionId::ColumnTypes
+        | OptionId::ConfirmUnsafeWrites
+        | OptionId::ClosePairs
+        | OptionId::HighlightLine
+        | OptionId::Wrap => width("[x]"),
+    }
+}
+
+/// A stepped option's value as its row writes it: the page size, the log's
+/// days, the zone, the idle time.
+fn stepped_text(option: OptionId, settings: &Settings, skin: &Skin) -> String {
+    match option {
+        OptionId::LogDays => skin
+            .look
+            .label(&super::days(skin.locale, settings.mcp_log_days)),
+        // As the file writes it: `30m`; never in words.
+        OptionId::IdleDisconnect => match settings.idle_disconnect {
+            Idle::Never => skin.say(msgid("Never")),
+            choice => choice.name().to_owned(),
+        },
+        // As the artboard writes it: `system (русский)`, `english`.
+        OptionId::Language => skin.look.label(&super::language_text(
+            skin.locale,
+            settings.language,
+            skin.language,
+        )),
+        // As the artboard writes it: `system (america/new_york)`.
+        OptionId::Tz => skin.look.label(&match (&settings.tz, skin.system) {
+            (crate::settings::Zone::System, Some(name)) => {
+                gettext(skin.locale, "System ({zone})").replace("{zone}", name)
+            }
+            (zone, system) => super::zone_text(skin.locale, zone, system),
+        }),
+        OptionId::FontSize => settings.font_size_in(true).text(),
+        OptionId::RowLimit => {
+            crate::ui::sql_editor::limit_words(settings.sql_limit, skin.look, skin.locale)
+        }
+        // As the editor writes a time (`30s`, `1m`, `1m 30s`), or `off`.
+        OptionId::Timeout => match settings.sql_timeout_secs {
+            Some(secs) => crate::ui::sql_editor::time_words(secs, true, skin.locale),
+            None => skin.say(msgid("Off")),
+        },
+        OptionId::Indent => skin.say(match settings.indent {
+            crate::settings::Indent::Two => msgid("2 spaces"),
+            crate::settings::Indent::Four => msgid("4 spaces"),
+            crate::settings::Indent::Tab => msgid("Tab"),
+        }),
+        OptionId::HistoryKeep => match settings.history_keep {
+            0 => skin.say(msgid("Don't keep")),
+            keep => skin
+                .say(msgid("{n} per connection"))
+                .replace("{n}", &crate::i18n::number(skin.locale, keep)),
+        },
+        // As the file writes it: `daily`.
+        OptionId::UpdatesCheck => settings.update_check.name().to_owned(),
+        // A connection by its name as it is saved, and where it points:
+        // three of one name are told apart.
+        OptionId::OnLaunch => {
+            let text = super::launch_text(skin.locale, &settings.on_launch, skin.connections);
+            match &settings.on_launch {
+                crate::settings::Launch::Connection { id, .. } => {
+                    let saved = skin.connections.iter().find(|saved| saved.id == *id);
+                    match saved {
+                        // The name as it is saved, not set in the screen's case.
+                        Some(saved) => {
+                            let place = super::place(saved);
+                            if place.is_empty() {
+                                text
+                            } else {
+                                format!("{text} ({place})")
+                            }
+                        }
+                        None => skin.look.label(&text),
+                    }
+                }
+                crate::settings::Launch::Restore | crate::settings::Launch::Connections => {
+                    skin.look.label(&text)
+                }
+            }
+        }
+        _ => settings.page_size.to_string(),
+    }
+}
+
+/// How wide the segment of the choice `word` is.
+fn segment(ui: &Ui, word: Said, skin: &Skin) -> f32 {
+    let text = skin.written(ui.ctx(), word);
+    TextRole::OBody.width(ui.ctx(), skin.look.faces, &text) + 2.0 * SEGMENT_PAD
+}
+
+/// A row's frame: its button, which puts the cursor on it (none for a row
+/// at `usize::MAX`, which the cursor is never on), the cursor's mark, and
+/// its label. Returns the row, and where its words stand between.
+fn row_frame(
+    ui: &mut Ui,
+    (index, name): (usize, Msgid),
+    on_cursor: bool,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) -> (Rect, f32, f32, Option<egui::Response>) {
+    let Skin {
+        look,
+        palette,
+        locale,
+        ..
+    } = *skin;
+    let role = TextRole::OBody;
+    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::hover());
+    let button = (index != usize::MAX).then(|| {
+        let said = super::said(ui.ctx(), look, locale, name);
+        let button = ButtonSpec::new(&said).hidden_at(ui, row);
+        // A row of a list: a ring outside it would be cut where the list
+        // ends.
+        focus::hint(ui, &button, row, Ring::Inset { radius: 0 });
+        if button.clicked() {
+            actions.push(Action::SelectSettingsRow(index));
+        }
+        button
+    });
+    if on_cursor {
+        mark(ui, row, palette);
+    }
+    let left = row.left() + ROW_SIDE;
+    let right = (row.right() - ROW_SIDE).max(left);
+    // The cursor's mark stands where a label starts, so the label under
+    // the cursor is a cell further in than the others.
+    let text = skin.label(ui.ctx(), name);
+    let text = if on_cursor {
+        Text::one(look, role, &format!("▌{text}"), palette.accent)
+    } else {
+        Text::one(look, role, &text, palette.text)
+    };
+    widgets::paint_text(ui, left, row.center().y, text);
+    (row, left, right, button)
+}
+
+/// A row that is no option: its label, what it says, and a hint, whole or
+/// left out.
+fn text_row(
+    ui: &mut Ui,
+    (index, name): (usize, Msgid),
+    on_cursor: bool,
+    (label_width, value_width): (f32, f32),
+    (value, hint): (Text, Text),
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    let hint = hint.layout(ui.ctx());
+    let (row, left, right, button) = row_frame(ui, (index, name), on_cursor, skin, actions);
+    if let Some(button) = &button {
+        describe(ui, button, painted(&hint));
+    }
+    let y = row.center().y;
+    let label_width = label_width.min(right - left);
+    let value_width = value_width.min(right - left - label_width);
+    let value = value.layout(ui.ctx());
+    let at = left + label_width;
+    value.paint_left(ui.painter(), at, y);
+    widgets::announce(
+        ui,
+        Rect::from_min_size(pos2(at, row.top()), vec2(value.width(), ROW)),
+        value.galley.text(),
+    );
+    let hint_left = at + value_width.max(value.width());
+    if hint_left + hint.width() <= right {
+        hint.paint_left(ui.painter(), hint_left, y);
+    }
+    // A row the cursor never stops on has no button to describe: its hint
+    // is said as its value is, painted or not.
+    if button.is_none()
+        && let Some(said) = painted(&hint)
+    {
+        let left = hint_left.min(right);
+        let width = hint.width().min(right - left).max(1.0);
+        widgets::announce(
+            ui,
+            Rect::from_min_size(pos2(left, row.top()), vec2(width, ROW)),
+            said,
+        );
+    }
+}
+
+/// One option's row: its label, its value where a click sets it, and the
+/// hint that shows what the value does.
+pub(super) fn option_row(
+    ui: &mut Ui,
+    (index, option): (usize, OptionId),
+    on_cursor: bool,
+    (label_width, value_width): (f32, f32),
+    settings: &Settings,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    let locale = skin.locale;
+    // The hint is whole or left out: it tells nothing cut short. What it
+    // says describes the row's controls, painted or not.
+    let hint = hint(ui, option, settings, skin).layout(ui.ctx());
+    let described = painted(&hint);
+    // The row's button comes before its values', so that a click on a
+    // value is the value's.
+    let (row, left, right, button) = row_frame(
+        ui,
+        (index, terminal_label(option)),
+        on_cursor,
+        skin,
+        actions,
+    );
+    let y = row.center().y;
+    if let Some(button) = &button {
+        describe(ui, button, described);
+    }
+    // A stepped option has no button that is its value: its row says it.
+    if let Some(button) = button
+        && matches!(
+            option,
+            OptionId::PageSize
+                | OptionId::LogDays
+                | OptionId::Tz
+                | OptionId::IdleDisconnect
+                | OptionId::OnLaunch
+                | OptionId::Language
+                | OptionId::FontSize
+                | OptionId::RowLimit
+                | OptionId::Timeout
+                | OptionId::Indent
+                | OptionId::HistoryKeep
+                | OptionId::UpdatesCheck
+        )
+    {
+        let name = super::said(ui.ctx(), skin.look, locale, terminal_label(option));
+        let value = stepped_text(option, settings, skin);
+        button.widget_info(|| {
+            let mut info = WidgetInfo::labeled(WidgetType::Button, true, &name);
+            info.current_text_value = Some(value.clone());
+            info
+        });
+    }
+    // A window too narrow for the columns takes from the hint first, then
+    // from the value's column.
+    let label_width = label_width.min(right - left);
+    let value_width = value_width.min(right - left - label_width);
+    let cell = Cell {
+        index,
+        row,
+        left: left + label_width,
+        on_cursor,
+        described,
+    };
+    match option {
+        OptionId::PageSize
+        | OptionId::LogDays
+        | OptionId::Tz
+        | OptionId::IdleDisconnect
+        | OptionId::OnLaunch
+        | OptionId::Language
+        | OptionId::FontSize
+        | OptionId::RowLimit
+        | OptionId::Timeout
+        | OptionId::Indent
+        | OptionId::HistoryKeep
+        | OptionId::UpdatesCheck => stepper(ui, cell, option, settings, skin, actions),
+        // Nothing to step to: a name is set in the file.
+        OptionId::Font => {
+            let value = Text::one(
+                skin.look,
+                TextRole::OBody,
+                &font_value(settings, skin),
+                skin.palette.text,
+            );
+            widgets::paint_text(ui, cell.left, y, value);
+        }
+        OptionId::Timestamps
+        | OptionId::GroupDigits
+        | OptionId::Look
+        | OptionId::Theme
+        | OptionId::InterfaceScale
+        | OptionId::RowHeight
+        | OptionId::TableList
+        | OptionId::EnvBar
+        | OptionId::NewTab
+        | OptionId::RunScope
+        | OptionId::EditorKeys
+        | OptionId::Autocomplete
+        | OptionId::LineNumbers
+        | OptionId::Keywords
+        | OptionId::Commas => {
+            segments(ui, cell, option, settings, skin, actions);
+        }
+        OptionId::RestoreTabs
+        | OptionId::ValueTags
+        | OptionId::DatePicker
+        | OptionId::ProductionReadOnly
+        | OptionId::ConfirmCloseEdits
+        | OptionId::AgentsOn
+        | OptionId::AgentsNotify
+        | OptionId::Zebra
+        | OptionId::ColumnTypes
+        | OptionId::ConfirmUnsafeWrites
+        | OptionId::ClosePairs
+        | OptionId::HighlightLine
+        | OptionId::Wrap => {
+            check(ui, cell, option, settings, skin, actions);
+        }
+    }
+    let hint_left = cell.left + value_width;
+    if hint_left + hint.width() <= right {
+        hint.paint_left(ui.painter(), hint_left, y);
+    }
+    // A warning is read out as it appears, over a point of the row, which
+    // has nothing to press, as the data view says its counts.
+    if warns(option, skin)
+        && let Some(said) = described
+    {
+        let at = pos2(hint_left.min(right), row.top());
+        widgets::announce_polite(ui, Rect::from_min_size(at, vec2(1.0, 1.0)), said);
+    }
+}
+
+/// What a hint laid out says, where it says anything.
+fn painted(hint: &crate::typography::Laid) -> Option<&str> {
+    Some(hint.galley.text()).filter(|said| !said.is_empty())
+}
+
+/// Whether `option`'s hint is a warning: a font or a pinned theme that is
+/// not found, drawn as something else.
+fn warns(option: OptionId, skin: &Skin) -> bool {
+    match option {
+        OptionId::Font => skin.font.missing.is_some(),
+        OptionId::Theme => matches!(skin.desktop.pin, Some((_, PinState::Missing))),
+        _ => false,
+    }
+}
+
+/// A stepped option, the page size, the log's days, the zone or the idle
+/// time: its value as it is, and on the cursor's row between the chevrons
+/// that step it, each dim where there is no value on its side.
+fn stepper(
+    ui: &mut Ui,
+    cell: Cell,
+    option: OptionId,
+    settings: &Settings,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    let Skin { look, palette, .. } = *skin;
+    let role = TextRole::OBody;
+    let y = cell.row.center().y;
+    let value = stepped_text(option, settings, skin);
+    let current = settings.value(option);
+    let Ok([fewer, more]) = <[_; 2]>::try_from(choices(
+        option,
+        settings,
+        (skin.named, skin.language),
+        skin.launches,
+    )) else {
+        return;
+    };
+    let text = if cell.on_cursor {
+        let chevron = |(_, step): &(Said, OptionValue)| {
+            if *step == current {
+                palette.dim
+            } else {
+                palette.accent
+            }
+        };
+        Text::new(look)
+            .add(role, "‹", chevron(&fewer))
+            .space(role, " ")
+            .add(role, &value, palette.text)
+            .space(role, " ")
+            .add(role, "›", chevron(&more))
+    } else {
+        Text::one(look, role, &value, palette.text)
+    };
+    // The size's range after it, as the board writes it: `‹ 13 › 9 to 32`.
+    let text = match range(option, skin) {
+        Some(range) => text.add(role, &format!(" {range}"), palette.dim),
+        None => text,
+    };
+    widgets::paint_text(ui, cell.left, y, text);
+    // The chevrons' buttons are on every row. On the cursor's row each is
+    // over its chevron, with half the space beside it. On the others, where
+    // no chevron is drawn, each keeps a point at the column's corner: a
+    // click on the value there only moves the cursor, and Tab does not
+    // stop on a point.
+    let places = if cell.on_cursor {
+        let width = |text: &str| role.width(ui.ctx(), look.faces, text);
+        let lead = width("‹ ");
+        let chevron = width("‹");
+        let reach = (lead - chevron) / 2.0;
+        let after = cell.left + lead + width(&value) + (lead - chevron);
+        [cell.left, after].map(|left| {
+            Rect::from_min_max(
+                pos2(left - reach, cell.row.top()),
+                pos2(left + chevron + reach, cell.row.bottom()),
+            )
+        })
+    } else {
+        [0.0, 1.0].map(|along| {
+            Rect::from_min_size(pos2(cell.left + along, cell.row.top()), vec2(1.0, 1.0))
+        })
+    };
+    let press = Press::Step {
+        drawn: cell.on_cursor,
+    };
+    for (place, step) in places.into_iter().zip([fewer, more]) {
+        choice(ui, place, cell, step, press, skin, actions);
+    }
+}
+
+/// An option that is on or off, as the look's check.
+fn check(
+    ui: &mut Ui,
+    cell: Cell,
+    option: OptionId,
+    settings: &Settings,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    let Skin { look, palette, .. } = *skin;
+    let current = settings.value(option);
+    let (glyph, color) = if super::is_on(&current) {
+        ("[x]", palette.success)
+    } else {
+        ("[ ]", palette.dim)
+    };
+    let text = Text::one(look, TextRole::OBody, glyph, color);
+    let width = widgets::paint_text(ui, cell.left, cell.row.center().y, text);
+    let place = Rect::from_min_max(
+        pos2(cell.left, cell.row.top()),
+        pos2(cell.left + width, cell.row.bottom()),
+    );
+    // One mark stands for both values, and a click on it flips it: the
+    // value it is not set to is the button on top.
+    let mut values = choices(option, settings, (skin.named, skin.language), skin.launches);
+    values.sort_by_key(|(_, value)| *value != current);
+    let mut group = radio_group(ui, cell, option, skin);
+    for (word, value) in values {
+        let press = Press::Value {
+            set: value == current,
+        };
+        choice(&mut group, place, cell, (word, value), press, skin, actions);
+    }
+}
+
+/// What the row says beside `option`'s value: where it applies, or a
+/// sample of what it does.
+fn hint(ui: &Ui, option: OptionId, settings: &Settings, skin: &Skin) -> Text {
+    let Skin { look, palette, .. } = *skin;
+    let role = TextRole::OBody;
+    let dim = |text: &str| Text::one(look, role, text, palette.dim);
+    match option {
+        OptionId::Language => {
+            // Where the system's first language is not translated, said
+            // first: `français is not translated yet · help translate: …`.
+            let missing = skin
+                .language
+                .filter(|tag| {
+                    settings.language == crate::settings::Language::System
+                        && Locale::from_tag(tag).is_none()
+                })
+                .map(|_| super::language_print(skin.locale, settings.language, skin.language));
+            // Only System comes from the system: from `$LANG` where that
+            // decides it, a name that keeps its case, and from the system's
+            // own settings on macOS and Windows. A language chosen here
+            // comes from nowhere else.
+            let from = missing.or_else(|| {
+                (settings.language == crate::settings::Language::System).then(|| {
+                    if cfg!(any(target_os = "macos", target_os = "windows")) {
+                        gettext(skin.locale, "from the system").into_owned()
+                    } else {
+                        gettext(skin.locale, "from {variable}").into_owned()
+                    }
+                })
+            });
+            let help = gettext(skin.locale, "help translate: {folder}");
+            let said = match from {
+                Some(from) => look.label(&format!("{from} · {help}")),
+                None => look.label(&help),
+            };
+            let said = said
+                .replace("{variable}", "$LANG")
+                .replace("{folder}", "assets/i18n");
+            dim(&said)
+        }
+        OptionId::PageSize => dim(&skin.say(msgid("table view"))),
+        OptionId::Tz => dim(&skin.say(msgid("sent with offset"))),
+        OptionId::Timestamps => dim(sample_timestamp(settings.timestamps)),
+        OptionId::GroupDigits => dim(&skin.say(if settings.group_digits.unwrap_or_default() {
+            msgid("grouping on")
+        } else {
+            msgid("grouping off")
+        })),
+        // Two tags as a grid shows them: in the first two slots' colours,
+        // or as plain values. They are values of a column, not words:
+        // no language has others.
+        OptionId::ValueTags => {
+            let slots = terminal_slots(palette);
+            let [first, second] = if settings.value_tags {
+                [slots[0], slots[1]]
+            } else {
+                [palette.dim; 2]
+            };
+            Text::new(look)
+                .add(role, "print", first)
+                .space(role, "  ")
+                .add(role, "ebook", second)
+        }
+        // The prompt's lines that set it, from the keymap.
+        OptionId::DatePicker => Text::new(look)
+            .add(role, &key(ui, look, Command::ShowCalendar), palette.accent)
+            .add(role, " · ", palette.dim)
+            .add(role, &key(ui, look, Command::HideCalendar), palette.accent),
+        OptionId::RestoreTabs => dim(&skin.say(msgid("per connection"))),
+        OptionId::OnLaunch => dim(&skin.say(msgid("or connections · a chosen connection"))),
+        OptionId::ProductionReadOnly => dim(&skin.say(msgid("default for new connections"))),
+        // As drawn: nothing to add.
+        OptionId::ConfirmCloseEdits => Text::new(look),
+        OptionId::IdleDisconnect => dim(&skin.say(msgid("tabs reconnect on use"))),
+        OptionId::AgentsOn => dim(&skin.say(msgid("while native-sql-database-client-windows is open"))),
+        // The key that shows the log, from this row, where there is a
+        // window to show it in.
+        OptionId::LogDays if !skin.window => dim(&skin.say(msgid("on this computer"))),
+        OptionId::LogDays => Text::new(look)
+            .add(
+                role,
+                &key(ui, look, Command::SettingsOpenRow),
+                palette.accent,
+            )
+            .add(
+                role,
+                &format!(" {}", skin.say(msgid("shows it"))),
+                palette.dim,
+            ),
+        OptionId::AgentsNotify => dim(&skin.say(msgid("a desktop notification"))),
+        OptionId::Look => dim(&skin.say(msgid("classic is the system's own look"))),
+        OptionId::Theme => theme_hint(skin),
+        // macOS's and Windows's: no row of this look's.
+        OptionId::InterfaceScale => Text::new(look),
+        OptionId::Font => font_hint(skin),
+        // The keys that change it, from the keymap, wherever the keyboard
+        // is.
+        OptionId::FontSize => Text::new(look)
+            .add(role, &key(ui, look, Command::LargerText), palette.accent)
+            .add(role, " / ", palette.dim)
+            .add(role, &key(ui, look, Command::SmallerText), palette.accent)
+            .add(role, " / ", palette.dim)
+            .add(
+                role,
+                &key(ui, look, Command::DefaultTextSize),
+                palette.accent,
+            )
+            .add(
+                role,
+                &format!(
+                    " {} · {}",
+                    skin.say(msgid("anywhere")),
+                    skin.say(msgid("rows and panes grow with it"))
+                ),
+                palette.dim,
+            ),
+        OptionId::RowHeight => dim(&skin.say(msgid("1 · 1.5 · 2 lines"))),
+        OptionId::Zebra => Text::new(look),
+        OptionId::ColumnTypes => dim(&skin.say(msgid("second header line"))),
+        // The key that flips the sidebar's list, from the keymap.
+        OptionId::TableList => Text::new(look)
+            .add(
+                role,
+                &format!("{} ", skin.say(msgid("default;"))),
+                palette.dim,
+            )
+            .add(role, &key(ui, look, Command::ToggleTree), palette.accent)
+            .add(
+                role,
+                &format!(" {}", skin.say(msgid("toggles"))),
+                palette.dim,
+            ),
+        // Not the board's "ctrl+w toggles per tab": ctrl+w closes the tab.
+        // The commands that switch it, from the keymap.
+        OptionId::NewTab => Text::new(look)
+            .add(role, &key(ui, look, Command::ReadOnlyTab), palette.accent)
+            .add(role, " / ", palette.dim)
+            .add(role, &key(ui, look, Command::ReadWriteTab), palette.accent)
+            .add(
+                role,
+                &format!(" {}", skin.say(msgid("per tab"))),
+                palette.dim,
+            ),
+        OptionId::RowLimit => dim(&skin.say(msgid(
+            "caps results you browse · show all and exports get every row",
+        ))),
+        // A selection is visual mode's where the keys are vim's.
+        OptionId::RunScope => {
+            if settings.editor_keys_in(true) == crate::settings::EditorKeys::Vim {
+                dim(&skin.say(msgid("a visual selection always wins")))
+            } else {
+                dim(&skin.say(msgid("a selection always wins")))
+            }
+        }
+        OptionId::ConfirmUnsafeWrites => dim(&skin.say(msgid("connections that allow writes"))),
+        // Vim's own words for the mode, in its case; the standard keys
+        // have no mode to show.
+        OptionId::EditorKeys => {
+            if settings.editor_keys_in(true) == crate::settings::EditorKeys::Vim {
+                Text::new(look).add(role, "-- INSERT --", palette.dim).add(
+                    role,
+                    &format!(" {}", skin.say(msgid("shown in the status line"))),
+                    palette.dim,
+                )
+            } else {
+                Text::new(look)
+            }
+        }
+        OptionId::Autocomplete => dim(&skin.say(msgid("schema objects"))),
+        OptionId::HistoryKeep => dim(&skin.say(msgid(
+            "per connection · sql, saves, filters, agents · never results",
+        ))),
+        // When the last check ran, and the key that checks. Not the
+        // board's "or weekly · never" before them: beside the file the
+        // hint has no room for all of it, and the chevrons say there are
+        // other values.
+        OptionId::UpdatesCheck => {
+            let mut text = Text::new(look);
+            if let Some(checked) = skin.checked {
+                text = text.add(role, &format!("{checked} · "), palette.dim);
+            }
+            text.add(
+                role,
+                &key(ui, look, Command::SettingsCheckNow),
+                palette.accent,
+            )
+            .add(
+                role,
+                &format!(" {}", skin.say(msgid("check now"))),
+                palette.dim,
+            )
+        }
+        OptionId::Timeout
+        | OptionId::Indent
+        | OptionId::ClosePairs
+        | OptionId::LineNumbers
+        | OptionId::HighlightLine
+        | OptionId::Wrap
+        | OptionId::Keywords
+        | OptionId::Commas => Text::new(look),
+        // Production as the bar's label writes it, in its own case.
+        OptionId::EnvBar => Text::new(look)
+            .add(
+                role,
+                crate::env::Environment::Production.label(crate::env::Platform::Omarchy),
+                palette.dim,
+            )
+            .add(
+                role,
+                &format!(" {}", skin.say(msgid("always tinted"))),
+                palette.dim,
+            ),
+    }
+}
+
+/// The button a hint of the footer stands for: its name, and what a
+/// press does, where it does something.
+type Button = (Msgid, Option<Vec<Action>>);
+
+/// The screen's keys at the left. A hint whose key does one thing is that
+/// thing's button too. On the Agents pane: Enter, on a row that opens
+/// something (`opens`), and the key that copies the command.
+fn footer(
+    ui: &mut Ui,
+    pane: SettingsPane,
+    option: Option<OptionId>,
+    opens: Option<(SettingsRow, Vec<Action>)>,
+    settings: &Settings,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    let Skin {
+        look,
+        palette,
+        locale,
+        ..
+    } = *skin;
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), FOOTER + 1.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::ZERO, palette.panel);
+    widgets::hline(ui, rect.x_range(), rect.top() + 0.5, palette.outline);
+    let y = rect.top() + 1.0 + FOOTER / 2.0;
+    // What the keys would do on the cursor's row. Space has nothing to
+    // flip on an option of more than two values.
+    let flip = option
+        .and_then(|option| settings.flipped(option))
+        .map(Action::SetOption);
+    // The server's switch is not reset: off, it would end every agent's
+    // session.
+    let reset = option
+        .filter(|option| *option != OptionId::AgentsOn)
+        .map(|option| Action::SetOption(option.default_value()));
+    let edit = Some(Action::EditSettingsFile);
+    // `$EDITOR` is a name: the look does not lower-case it.
+    let in_editor = skin
+        .say(msgid("open file in {editor}"))
+        .replace("{editor}", "$EDITOR");
+    // The key, what it does, the button it stands for, and what that does.
+    let mut keys: Vec<(Command, String, Option<Button>)> = vec![
+        (Command::SettingsMove, skin.say(msgid("move")), None),
+        (
+            Command::SettingsChange,
+            skin.say(pmsgid("key hint", "change")),
+            None,
+        ),
+        (
+            Command::SettingsToggle,
+            skin.say(msgid("toggle")),
+            Some((msgid("Toggle"), flip.map(|flip| vec![flip]))),
+        ),
+    ];
+    // The history's row shows the History tab.
+    let mut opens = opens;
+    if pane == SettingsPane::Editor
+        && let Some((_, shows)) = opens.take()
+    {
+        keys.push((
+            Command::SettingsOpenRow,
+            skin.say(msgid("show history")),
+            Some((msgid("Show History"), Some(shows))),
+        ));
+    }
+    if pane == SettingsPane::Agents {
+        if let Some((row, opens)) = opens {
+            let (what, name) = match row {
+                SettingsRow::AgentsAccess => (msgid("open connections"), msgid("Open Connections")),
+                SettingsRow::Option(OptionId::LogDays) => (msgid("show log"), msgid("Show log")),
+                _ => (msgid("show agents tab"), msgid("Show Agents tab")),
+            };
+            keys.push((
+                Command::SettingsOpenRow,
+                skin.say(what),
+                Some((name, Some(opens))),
+            ));
+        }
+        keys.push((
+            Command::SettingsCopyCommand,
+            skin.say(msgid("copy command")),
+            Some((msgid("Copy the command"), None)),
+        ));
+    }
+    keys.extend([
+        (
+            Command::SettingsOpenFile,
+            in_editor,
+            Some((msgid("Open file in editor"), edit.map(|edit| vec![edit]))),
+        ),
+        (
+            Command::SettingsReset,
+            skin.say(msgid("reset option")),
+            Some((msgid("Reset option"), reset.map(|reset| vec![reset]))),
+        ),
+        (
+            Command::SettingsClose,
+            skin.say(msgid("close")),
+            Some((msgid("Close"), Some(vec![Action::CloseDialog]))),
+        ),
+    ]);
+    // The hints give way from the end where the window has no room for
+    // them, all but the last, which closes: their keys still work.
+    let width_of = |ui: &Ui, (command, what): (Command, &str)| {
+        let key = key(ui, look, command);
+        widgets::key_hints_width(ui, &[(&key, what, true)], 0.0, look, palette)
+    };
+    let room = rect.width() - 24.0;
+    let mut widths: Vec<f32> = keys
+        .iter()
+        .map(|(command, what, _)| width_of(ui, (*command, what)))
+        .collect();
+    while keys.len() > 1 && widths.iter().sum::<f32>() + 16.0 * (keys.len() - 1) as f32 > room {
+        let before_last = keys.len() - 2;
+        keys.remove(before_last);
+        widths.remove(before_last);
+    }
+    let mut left = rect.left() + 12.0;
+    for (command, what, button) in keys {
+        let key = key(ui, look, command);
+        let hint = [(&key, what.as_str(), true)];
+        let width = widgets::key_hints(ui, (left, y), &hint, 0.0, look, palette);
+        // In from the window's edge by a focus ring's reach, or the ring
+        // would be cut there.
+        let place = Rect::from_min_max(
+            pos2(left, rect.top() + 5.0),
+            pos2(left + width, rect.bottom() - 4.0),
+        );
+        left += width + 16.0;
+        if let Some((name, action)) = button {
+            let name = name.say(locale);
+            if ButtonSpec::new(&name).hidden_at(ui, place).clicked() {
+                if command == Command::SettingsCopyCommand {
+                    crate::ui::agents::copy_command(ui.ctx(), locale);
+                }
+                actions.extend(action.into_iter().flatten());
+            }
+        }
+    }
+}
+
+/// The Keyboard pane's footer: its keys, each a button too, which act on
+/// the row of `keymap` the cursor is on. While a row records, the keys
+/// that end and give up the recording.
+fn keyboard_footer(
+    ui: &mut Ui,
+    keymap: &Keymap,
+    page: &crate::model::KeyboardPage,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    let Skin {
+        look,
+        palette,
+        locale,
+        ..
+    } = *skin;
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), FOOTER + 1.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::ZERO, palette.panel);
+    widgets::hline(ui, rect.x_range(), rect.top() + 0.5, palette.outline);
+    let y = rect.top() + 1.0 + FOOTER / 2.0;
+    let cursor = super::keyboard_terminal::cursor(keymap, Layout::of(look), locale, page);
+    // `$EDITOR` is a name: the look does not lower-case it.
+    let in_editor = skin
+        .say(msgid("open file in {editor}"))
+        .replace("{editor}", "$EDITOR");
+    let keys: Vec<(Command, String, Option<Button>)> = if page.recording.is_some() {
+        vec![
+            (Command::SettingsOpenRow, skin.say(msgid("end")), None),
+            (
+                Command::SettingsClose,
+                skin.say(msgid("cancel")),
+                Some((msgid("Cancel"), Some(vec![Action::StopRecording]))),
+            ),
+        ]
+    } else {
+        let row = |action: fn(crate::keymap::Row) -> Action| cursor.map(|row| vec![action(row)]);
+        vec![
+            (Command::SettingsMove, skin.say(msgid("move")), None),
+            (Command::SettingsChange, skin.say(msgid("group")), None),
+            (
+                Command::SettingsOpenRow,
+                skin.say(msgid("record")),
+                Some((
+                    msgid("Record"),
+                    cursor.map(|row| vec![Action::RecordKeys(crate::model::Recorded::Row(row))]),
+                )),
+            ),
+            (
+                Command::SettingsUnbind,
+                skin.say(msgid("unbind")),
+                Some((msgid("Unbind"), row(Action::UnbindRow))),
+            ),
+            (
+                Command::SettingsReset,
+                skin.say(msgid("reset")),
+                Some((msgid("Reset"), row(Action::ResetRow))),
+            ),
+            (
+                Command::SettingsFilter,
+                skin.say(pmsgid("key hint", "filter")),
+                None,
+            ),
+            (
+                Command::SettingsFindKey,
+                skin.say(msgid("find by key")),
+                None,
+            ),
+            (
+                Command::SettingsOpenFile,
+                in_editor,
+                Some((
+                    msgid("Open file in editor"),
+                    Some(vec![Action::EditSettingsFile]),
+                )),
+            ),
+            (
+                Command::SettingsClose,
+                skin.say(msgid("close")),
+                Some((msgid("Close"), Some(vec![Action::CloseDialog]))),
+            ),
+        ]
+    };
+    let width_of = |ui: &Ui, (command, what): (Command, &str)| {
+        let key = key(ui, look, command);
+        widgets::key_hints_width(ui, &[(&key, what, true)], 0.0, look, palette)
+    };
+    let room = rect.width() - 24.0;
+    let mut keys = keys;
+    let mut widths: Vec<f32> = keys
+        .iter()
+        .map(|(command, what, _)| width_of(ui, (*command, what)))
+        .collect();
+    while keys.len() > 1 && widths.iter().sum::<f32>() + 16.0 * (keys.len() - 1) as f32 > room {
+        let before_last = keys.len() - 2;
+        keys.remove(before_last);
+        widths.remove(before_last);
+    }
+    let mut left = rect.left() + 12.0;
+    for (command, what, button) in keys {
+        let key = key(ui, look, command);
+        let hint = [(&key, what.as_str(), true)];
+        let width = widgets::key_hints(ui, (left, y), &hint, 0.0, look, palette);
+        let place = Rect::from_min_max(
+            pos2(left, rect.top() + 5.0),
+            pos2(left + width, rect.bottom() - 4.0),
+        );
+        left += width + 16.0;
+        if let Some((name, action)) = button {
+            let name = name.say(locale);
+            if ButtonSpec::new(&name).hidden_at(ui, place).clicked() {
+                actions.extend(action.into_iter().flatten());
+            }
+        }
+    }
+}
+
+/// What a choice's button is to the keyboard and to a screen reader.
+#[derive(Clone, Copy)]
+enum Press {
+    /// One of the option's values, the one it is set to or not: a radio
+    /// button.
+    Value { set: bool },
+    /// A step from the value it has: a plain button. Tab passes one that
+    /// is not drawn.
+    Step { drawn: bool },
+}
+
+/// The button over a choice as it is drawn, named by its option and its
+/// own word: a click there moves the cursor to its row and sets it.
+fn choice(
+    ui: &mut Ui,
+    place: Rect,
+    cell: Cell,
+    (word, value): (Said, OptionValue),
+    press: Press,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    let name = format!(
+        "{}: {}",
+        super::said(
+            ui.ctx(),
+            skin.look,
+            skin.locale,
+            terminal_label(value.option())
+        ),
+        word.name(ui.ctx(), skin.look, skin.locale)
+    );
+    let button = ButtonSpec::new(&name);
+    let button = match press {
+        Press::Step { drawn: false } => button.hidden_off_tab(ui, place),
+        Press::Step { drawn: true } | Press::Value { .. } => button.hidden_at(ui, place),
+    };
+    if let Press::Value { set } = press {
+        button.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, true, set, &name));
+    }
+    describe(ui, &button, cell.described);
+    if button.clicked() {
+        actions.push(Action::SelectSettingsRow(cell.index));
+        // The theme it shows already: a value of the other looks', shown
+        // as the desktop followed, stays in the file.
+        let shown = matches!(press, Press::Value { set: true });
+        if !(shown && value.option() == OptionId::Theme) {
+            actions.push(Action::SetOption(value));
+        }
+    }
+}
+
+/// Gives a row's hint, where it has one, to `control` as its description:
+/// what a screen reader reads after its name, as the macOS look's controls
+/// have their small print. The words as the row paints them.
+fn describe(ui: &Ui, control: &egui::Response, hint: Option<&str>) {
+    if let Some(said) = hint {
+        ui.ctx().accesskit_node_builder(control.id, |node| {
+            node.set_description(said);
+        });
+    }
+}
+
+/// A Ui over `cell`'s row whose node is a radio group named by `option`:
+/// the parent of the option's values in the accessibility tree. A child
+/// Ui, not a scope: the row's places are painted, nothing is allocated,
+/// and the rows under it stay where they are.
+fn radio_group(ui: &mut Ui, cell: Cell, option: OptionId, skin: &Skin) -> Ui {
+    let label = terminal_label(option);
+    let builder = egui::UiBuilder::new()
+        .id_salt(("values", label))
+        .max_rect(cell.row);
+    let group = ui.new_child(builder);
+    let name = super::said(ui.ctx(), skin.look, skin.locale, label);
+    group
+        .ctx()
+        .accesskit_node_builder(group.unique_id(), |node| {
+            node.set_role(egui::accesskit::Role::RadioGroup);
+            node.set_label(name.as_ref());
+        });
+    group
+}
+
+/// One of two values as segments, each as tall as its line of text and a
+/// cell from the next: the chosen one filled with the accent on the
+/// cursor's row and outlined on the others, the other one dim.
+fn segments(
+    ui: &mut Ui,
+    cell: Cell,
+    option: OptionId,
+    settings: &Settings,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    let Skin { look, palette, .. } = *skin;
+    let role = TextRole::OBody;
+    let current = settings.value(option);
+    let line = role.row_height(ui.ctx(), look.faces);
+    let gap = role.width(ui.ctx(), look.faces, " ");
+    let mut group = radio_group(ui, cell, option, skin);
+    let mut left = cell.left;
+    for (word, value) in choices(option, settings, (skin.named, skin.language), skin.launches) {
+        let text = skin.written(ui.ctx(), word);
+        let width = segment(ui, word, skin);
+        let place = Rect::from_min_size(
+            pos2(left, cell.row.center().y - line / 2.0),
+            vec2(width, line),
+        );
+        left += width + gap;
+        let color = if value != current {
+            palette.dim
+        } else if cell.on_cursor {
+            ui.painter()
+                .rect_filled(place, CornerRadius::ZERO, palette.accent);
+            palette.on_accent
+        } else {
+            let stroke = Stroke::new(1.0, palette.outline);
+            ui.painter()
+                .rect_stroke(place, CornerRadius::ZERO, stroke, StrokeKind::Inside);
+            palette.text
+        };
+        let text = Text::one(look, role, &text, color);
+        widgets::paint_text(ui, place.left() + SEGMENT_PAD, place.center().y, text);
+        let press = Press::Value {
+            set: value == current,
+        };
+        choice(&mut group, place, cell, (word, value), press, skin, actions);
+    }
+}
+
+/// A key of the screen, as the keymap writes it for the look.
+pub(super) fn key(ui: &Ui, look: &Look, command: Command) -> crate::keymap::Written {
+    crate::ui::keys::written(ui.ctx(), look, command)
+}

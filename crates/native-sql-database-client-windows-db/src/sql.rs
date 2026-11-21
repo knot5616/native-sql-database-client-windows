@@ -1,0 +1,3383 @@
+//! SQL text as tokens, for highlighting, for splitting a script into
+//! statements, for the guard that keeps a script inside its transaction,
+//! and for telling a statement that writes from one that reads. Tokenizing
+//! never fails; it only has to agree with the database on where strings,
+//! comments and statements end.
+
+use std::ops::Range;
+
+use crate::Dialect;
+
+pub mod format;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenKind {
+    Keyword,
+    Identifier,
+    /// `"name"`, `` `name` `` or `[name]`, quotes included.
+    QuotedIdentifier,
+    /// Quotes included; PostgreSQL `$tag$` bodies too.
+    String,
+    Number,
+    Comment,
+    /// MySQL's `/*! ... */`, whose contents MySQL runs.
+    ExecutableComment,
+    Operator,
+    Punctuation,
+    Semicolon,
+    Whitespace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Token {
+    pub kind: TokenKind,
+    /// Byte range in the text, always on char boundaries.
+    pub range: Range<usize>,
+}
+
+/// Reserved words and common clauses, shared by every dialect.
+const KEYWORDS: &[&str] = &[
+    "ALL",
+    "ALTER",
+    "AND",
+    "ANY",
+    "AS",
+    "ASC",
+    "BEGIN",
+    "BETWEEN",
+    "BY",
+    "CASE",
+    "CAST",
+    "COMMIT",
+    "CREATE",
+    "CROSS",
+    "CURRENT",
+    "DEFAULT",
+    "DELETE",
+    "DESC",
+    "DISTINCT",
+    "DROP",
+    "ELSE",
+    "END",
+    "EXCEPT",
+    "EXISTS",
+    "EXPLAIN",
+    "FALSE",
+    "FETCH",
+    "FILTER",
+    "FIRST",
+    "FOLLOWING",
+    "FOR",
+    "FROM",
+    "FULL",
+    "GROUP",
+    "HAVING",
+    "IN",
+    "INNER",
+    "INSERT",
+    "INTERSECT",
+    "INTERVAL",
+    "INTO",
+    "IS",
+    "JOIN",
+    "LAST",
+    "LEFT",
+    "LIKE",
+    "LIMIT",
+    "LOCKED",
+    "NATURAL",
+    "NO",
+    "NOT",
+    "NOTHING",
+    "NOWAIT",
+    "NULL",
+    "NULLS",
+    "OFFSET",
+    "ON",
+    "ONLY",
+    "OR",
+    "ORDER",
+    "OUTER",
+    "OVER",
+    "PARTITION",
+    "PRECEDING",
+    "RECURSIVE",
+    "RIGHT",
+    "ROLLBACK",
+    "ROW",
+    "ROWS",
+    "SELECT",
+    "SET",
+    "SHOW",
+    "SKIP",
+    "TABLE",
+    "THEN",
+    "TO",
+    "TRUE",
+    "UNBOUNDED",
+    "UNION",
+    "UPDATE",
+    "USING",
+    "VALUES",
+    "VIEW",
+    "WHEN",
+    "WHERE",
+    "WINDOW",
+    "WITH",
+];
+
+const POSTGRES_KEYWORDS: &[&str] = &["ILIKE", "LATERAL", "RETURNING", "SIMILAR"];
+const MYSQL_KEYWORDS: &[&str] = &["DESCRIBE", "REGEXP", "STRAIGHT_JOIN"];
+const SQLITE_KEYWORDS: &[&str] = &["GLOB", "PRAGMA", "RETURNING"];
+const BIGQUERY_KEYWORDS: &[&str] = &["PIVOT", "QUALIFY", "STRUCT", "UNNEST"];
+const DUCKDB_KEYWORDS: &[&str] = &[
+    "DESCRIBE",
+    "EXCLUDE",
+    "ILIKE",
+    "LATERAL",
+    "PIVOT",
+    "QUALIFY",
+    "RETURNING",
+    "SIMILAR",
+    "SUMMARIZE",
+    "UNPIVOT",
+];
+
+/// The keywords `dialect` highlights, in upper case: the words the editor
+/// completes too. A keyword worth completing is worth colouring, so there
+/// is one list.
+pub fn keywords(dialect: Dialect) -> impl Iterator<Item = &'static str> {
+    let own = match dialect {
+        Dialect::Postgres => POSTGRES_KEYWORDS,
+        Dialect::MySql => MYSQL_KEYWORDS,
+        Dialect::Sqlite => SQLITE_KEYWORDS,
+        Dialect::BigQuery => BIGQUERY_KEYWORDS,
+        Dialect::DuckDb => DUCKDB_KEYWORDS,
+    };
+    KEYWORDS.iter().chain(own).copied()
+}
+
+/// Whether `word` (any case) is highlighted as a keyword in `dialect`.
+pub fn is_keyword(dialect: Dialect, word: &str) -> bool {
+    keywords(dialect).any(|keyword| keyword.eq_ignore_ascii_case(word))
+}
+
+/// How a dialect reads text. A guard in the tokenizer asks one of these
+/// rather than naming a dialect, so every rule answers for every dialect.
+/// DuckDB's scanner is PostgreSQL's, and answers as it does.
+impl Dialect {
+    /// A byte-order mark where a token starts reads as a space.
+    fn bom_is_space(self) -> bool {
+        match self {
+            Self::Sqlite => true,
+            Self::Postgres | Self::MySql | Self::BigQuery | Self::DuckDb => false,
+        }
+    }
+
+    /// `#` starts a line comment (GoogleSQL's too).
+    fn hash_comments(self) -> bool {
+        match self {
+            Self::MySql | Self::BigQuery => true,
+            Self::Postgres | Self::Sqlite | Self::DuckDb => false,
+        }
+    }
+
+    /// `/*! ... */` and MariaDB's `/*M! ... */` are run, not skipped.
+    fn runs_comments(self) -> bool {
+        match self {
+            Self::MySql => true,
+            Self::Postgres | Self::Sqlite | Self::BigQuery | Self::DuckDb => false,
+        }
+    }
+
+    /// A block comment inside a block comment has an end of its own.
+    fn nests_comments(self) -> bool {
+        match self {
+            Self::Postgres | Self::DuckDb => true,
+            Self::MySql | Self::Sqlite | Self::BigQuery => false,
+        }
+    }
+
+    /// A backslash in a `'...'` string escapes the next character.
+    fn backslash_escapes(self) -> bool {
+        match self {
+            Self::MySql | Self::BigQuery => true,
+            Self::Postgres | Self::Sqlite | Self::DuckDb => false,
+        }
+    }
+
+    /// `E'...'` is a string with backslash escapes.
+    fn escape_strings(self) -> bool {
+        match self {
+            Self::Postgres | Self::DuckDb => true,
+            Self::MySql | Self::Sqlite | Self::BigQuery => false,
+        }
+    }
+
+    /// `` `name` `` is a quoted name.
+    pub fn backtick_names(self) -> bool {
+        match self {
+            Self::MySql | Self::Sqlite | Self::BigQuery => true,
+            Self::Postgres | Self::DuckDb => false,
+        }
+    }
+
+    /// `[name]` is a quoted name.
+    fn bracket_names(self) -> bool {
+        match self {
+            Self::Sqlite => true,
+            Self::Postgres | Self::MySql | Self::BigQuery | Self::DuckDb => false,
+        }
+    }
+
+    /// `$tag$ ... $tag$` is a string and `$1` a parameter.
+    fn dollar_quotes(self) -> bool {
+        match self {
+            Self::Postgres | Self::DuckDb => true,
+            Self::MySql | Self::Sqlite | Self::BigQuery => false,
+        }
+    }
+
+    /// `$` can stand inside a word.
+    fn dollar_in_words(self) -> bool {
+        match self {
+            Self::Postgres | Self::MySql | Self::DuckDb => true,
+            Self::Sqlite | Self::BigQuery => false,
+        }
+    }
+}
+
+/// Splits `text` into tokens that cover it end to end.
+pub fn tokenize(dialect: Dialect, text: &str) -> Vec<Token> {
+    let bytes = text.as_bytes();
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let start = at;
+        let (kind, end) = next(dialect, text, start);
+        // A hard assert: an arm that stopped short would loop forever.
+        assert!(end > start && text.is_char_boundary(end));
+        tokens.push(Token {
+            kind,
+            range: start..end,
+        });
+        at = end;
+    }
+    tokens
+}
+
+fn next(dialect: Dialect, text: &str, start: usize) -> (TokenKind, usize) {
+    let bytes = text.as_bytes();
+    let byte = bytes[start];
+    let peek = |offset: usize| bytes.get(start + offset).copied();
+    match byte {
+        b if is_space(b) => (TokenKind::Whitespace, scan(bytes, start, is_space)),
+        // SQLite reads a byte-order mark where a token starts as a space,
+        // so the word after it is a word of its own.
+        0xEF if dialect.bom_is_space() && peek(1) == Some(0xBB) && peek(2) == Some(0xBF) => {
+            (TokenKind::Whitespace, start + 3)
+        }
+        b'-' if peek(1) == Some(b'-') && dash_comment(dialect, peek(2)) => {
+            (TokenKind::Comment, line_end(dialect, bytes, start))
+        }
+        b'#' if dialect.hash_comments() => (TokenKind::Comment, line_end(dialect, bytes, start)),
+        b'/' if peek(1) == Some(b'*') => {
+            // `/*!` and MariaDB's `/*M!`: MySQL runs what is inside.
+            let executable =
+                peek(2) == Some(b'!') || (peek(2) == Some(b'M') && peek(3) == Some(b'!'));
+            let kind = if dialect.runs_comments() && executable {
+                TokenKind::ExecutableComment
+            } else {
+                TokenKind::Comment
+            };
+            (
+                kind,
+                block_comment_end(bytes, start, dialect.nests_comments()),
+            )
+        }
+        b'\'' => (
+            TokenKind::String,
+            quoted_end(bytes, start, b'\'', dialect.backslash_escapes()),
+        ),
+        b'E' | b'e' if dialect.escape_strings() && peek(1) == Some(b'\'') => {
+            (TokenKind::String, escape_string_end(bytes, start))
+        }
+        b'"' => match dialect {
+            Dialect::MySql => (TokenKind::String, quoted_end(bytes, start, b'"', true)),
+            // GoogleSQL reads "..." as a string with backslash escapes,
+            // never as a name.
+            Dialect::BigQuery => (TokenKind::String, quoted_end(bytes, start, b'"', true)),
+            Dialect::Postgres | Dialect::Sqlite | Dialect::DuckDb => (
+                TokenKind::QuotedIdentifier,
+                quoted_end(bytes, start, b'"', false),
+            ),
+        },
+        b'`' if dialect.backtick_names() => (
+            TokenKind::QuotedIdentifier,
+            quoted_end(bytes, start, b'`', false),
+        ),
+        b'[' if dialect.bracket_names() => {
+            let end = bytes[start..]
+                .iter()
+                .position(|&b| b == b']')
+                .map_or(bytes.len(), |offset| start + offset + 1);
+            (TokenKind::QuotedIdentifier, end)
+        }
+        b'$' if dialect.dollar_quotes() => match dollar_tag(bytes, start) {
+            Some(tag_end) => {
+                let tag = &bytes[start..tag_end];
+                let body = find(bytes, tag_end, tag).map_or(bytes.len(), |at| at + tag.len());
+                (TokenKind::String, body)
+            }
+            // `$1`: a parameter, one piece of punctuation.
+            None => (
+                TokenKind::Punctuation,
+                scan(bytes, start + 1, |b| b.is_ascii_digit()),
+            ),
+        },
+        b'0'..=b'9' => (TokenKind::Number, number_end(bytes, start)),
+        b'.' if peek(1).is_some_and(|b| b.is_ascii_digit()) => {
+            (TokenKind::Number, number_end(bytes, start))
+        }
+        b';' => (TokenKind::Semicolon, start + 1),
+        b if is_word_start(b) => {
+            let end = scan(bytes, start, |b| is_word_part(dialect, b));
+            let kind = if is_keyword(dialect, &text[start..end]) {
+                TokenKind::Keyword
+            } else {
+                TokenKind::Identifier
+            };
+            (kind, end)
+        }
+        b'+' | b'-' | b'*' | b'/' | b'<' | b'>' | b'=' | b'~' | b'!' | b'@' | b'#' | b'%'
+        | b'^' | b'&' | b'|' | b'?' | b':' => (TokenKind::Operator, start + 1),
+        _ => {
+            // One whole character, however many bytes.
+            let width = text[start..].chars().next().map_or(1, char::len_utf8);
+            (TokenKind::Punctuation, start + width)
+        }
+    }
+}
+
+/// `--` starts a comment everywhere but MySQL, where whitespace or a
+/// control character (or the end) must follow: `1--1` is arithmetic.
+fn dash_comment(dialect: Dialect, after: Option<u8>) -> bool {
+    match dialect {
+        Dialect::MySql => after.is_none_or(|b| is_space(b) || b.is_ascii_control()),
+        Dialect::Postgres | Dialect::Sqlite | Dialect::BigQuery | Dialect::DuckDb => true,
+    }
+}
+
+fn is_word_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_' || byte >= 0x80
+}
+
+fn is_word_part(dialect: Dialect, byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || byte == b'_'
+        || byte >= 0x80
+        || (byte == b'$' && dialect.dollar_in_words())
+}
+
+fn scan(bytes: &[u8], from: usize, keep: impl Fn(u8) -> bool) -> usize {
+    bytes[from..]
+        .iter()
+        .position(|&b| !keep(b))
+        .map_or(bytes.len(), |offset| from + offset)
+}
+
+/// Whitespace as MySQL, SQLite and PostgreSQL 17+ read it (vertical tab
+/// included, which Rust's `is_ascii_whitespace` leaves out). Earlier
+/// PostgreSQL rejects a bare vertical tab, so treating it as space is safe.
+fn is_space(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || byte == 0x0B
+}
+
+/// The end of a line comment: the newline stays outside it. PostgreSQL ends
+/// it at a carriage return too; MySQL and SQLite only at a line feed.
+fn line_end(dialect: Dialect, bytes: &[u8], from: usize) -> usize {
+    let cr_ends = match dialect {
+        Dialect::Postgres | Dialect::DuckDb => true,
+        Dialect::MySql | Dialect::Sqlite | Dialect::BigQuery => false,
+    };
+    scan(bytes, from, |b| b != b'\n' && !(cr_ends && b == b'\r'))
+}
+
+fn find(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    bytes[from..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|offset| from + offset)
+}
+
+fn block_comment_end(bytes: &[u8], start: usize, nests: bool) -> usize {
+    let mut depth = 0usize;
+    let mut at = start;
+    while at + 1 < bytes.len() {
+        match (bytes[at], bytes[at + 1]) {
+            (b'/', b'*') if depth == 0 || nests => {
+                depth += 1;
+                at += 2;
+            }
+            (b'*', b'/') => {
+                depth -= 1;
+                at += 2;
+                if depth == 0 {
+                    return at;
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// A quoted run from `start` (the opening quote): a doubled quote stays
+/// inside, and with `backslash` a backslash escapes the next byte.
+fn quoted_end(bytes: &[u8], start: usize, quote: u8, backslash: bool) -> usize {
+    let mut at = start + 1;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' if backslash => at += 2,
+            b if b == quote => {
+                if bytes.get(at + 1) == Some(&quote) {
+                    at += 2;
+                } else {
+                    return at + 1;
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// An `E'...'` string from `start` (the `E`). PostgreSQL continues it over a
+/// newline into the next quote, still with backslash escapes, so the whole
+/// run is one token. Plain strings are left alone: with no escapes their
+/// pieces end where the continued string would, and each piece is a string.
+fn escape_string_end(bytes: &[u8], start: usize) -> usize {
+    let mut end = quoted_end(bytes, start + 1, b'\'', true);
+    while let Some(quote) = string_continuation(bytes, end) {
+        end = quoted_end(bytes, quote, b'\'', true);
+    }
+    end
+}
+
+/// After a string closes at `from`: blanks and comments, a newline, then
+/// more blanks and comment lines, then a quote. That quote's offset, if so.
+fn string_continuation(bytes: &[u8], from: usize) -> Option<usize> {
+    let non_newline = |b: u8| b != b'\n' && b != b'\r';
+    let is_newline = |at: usize| matches!(bytes.get(at), Some(b'\n' | b'\r'));
+    let is_comment = |at: usize| bytes.get(at) == Some(&b'-') && bytes.get(at + 1) == Some(&b'-');
+    let mut at = from;
+    loop {
+        match bytes.get(at) {
+            Some(b' ' | b'\t' | 0x0B | 0x0C) => at += 1,
+            _ if is_comment(at) => at = scan(bytes, at, non_newline),
+            _ => break,
+        }
+    }
+    if !is_newline(at) {
+        return None;
+    }
+    loop {
+        match bytes.get(at) {
+            Some(b'\'') => return Some(at),
+            Some(&b) if is_space(b) => at += 1,
+            _ if is_comment(at) => {
+                at = scan(bytes, at, non_newline);
+                // A comment here must end in a newline.
+                if !is_newline(at) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// `$tag$` or `$$` at `start`: the end of the opening tag.
+fn dollar_tag(bytes: &[u8], start: usize) -> Option<usize> {
+    let tag_end = scan(bytes, start + 1, |b| {
+        b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+    });
+    let tag = &bytes[start + 1..tag_end];
+    let starts_well = tag.first().is_none_or(|b| !b.is_ascii_digit());
+    (starts_well && bytes.get(tag_end) == Some(&b'$')).then_some(tag_end + 1)
+}
+
+fn number_end(bytes: &[u8], start: usize) -> usize {
+    let mut at = scan(bytes, start, |b| b.is_ascii_digit());
+    if bytes.get(at) == Some(&b'.') {
+        at = scan(bytes, at + 1, |b| b.is_ascii_digit());
+    }
+    if matches!(bytes.get(at), Some(b'e' | b'E')) {
+        let sign = usize::from(matches!(bytes.get(at + 1), Some(b'+' | b'-')));
+        if bytes.get(at + 1 + sign).is_some_and(u8::is_ascii_digit) {
+            at = scan(bytes, at + 1 + sign, |b| b.is_ascii_digit());
+        }
+    }
+    at
+}
+
+/// One statement of a script, as the editor shows it. Its `Debug` output
+/// leaves the text out: what a user types into the editor is never logged.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Statement {
+    /// Byte range in the script, without surrounding whitespace or the `;`.
+    pub range: Range<usize>,
+    /// Byte offset just past its `;`, or `range.end` when it has none.
+    pub end: usize,
+    /// 1-based line of `range.start`.
+    pub start_line: usize,
+    /// Characters before `range.start` on its line.
+    pub start_column: usize,
+    /// 1-based line of its first token that is not a comment: the SQL,
+    /// not a comment above it.
+    pub first_line: usize,
+    /// The script's text in `range`.
+    pub text: String,
+}
+
+impl std::fmt::Debug for Statement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Statement")
+            .field("range", &self.range)
+            .field("end", &self.end)
+            .field("start_line", &self.start_line)
+            .field("start_column", &self.start_column)
+            .field("first_line", &self.first_line)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Statement {
+    /// The 1-based line and column in the script of a 1-based character
+    /// `position` in `text` (as PostgreSQL reports error positions).
+    pub fn line_col(&self, position: usize) -> (usize, usize) {
+        let before: String = self.text.chars().take(position.saturating_sub(1)).collect();
+        let lines = before.matches('\n').count();
+        let column = before
+            .rsplit('\n')
+            .next()
+            .map_or(0, |line| line.chars().count())
+            + 1;
+        let first_column = if lines == 0 { self.start_column } else { 0 };
+        (self.start_line + lines, column + first_column)
+    }
+}
+
+/// Whether a token is SQL the server runs. An executable comment counts:
+/// MySQL and MariaDB run its contents.
+pub(crate) fn is_code(kind: TokenKind) -> bool {
+    !matches!(kind, TokenKind::Whitespace | TokenKind::Comment)
+}
+
+/// A line and column that only moves forward through a text, so asking
+/// for many increasing positions costs one pass in all.
+struct Walker<'a> {
+    text: &'a str,
+    byte: usize,
+    line: usize,
+    column: usize,
+}
+
+impl<'a> Walker<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            byte: 0,
+            line: 1,
+            column: 0,
+        }
+    }
+
+    /// The 1-based line and the characters before `byte` on it. `byte` must
+    /// not be before the last one asked for.
+    fn at(&mut self, byte: usize) -> (usize, usize) {
+        for ch in self.text[self.byte..byte].chars() {
+            if ch == '\n' {
+                self.line += 1;
+                self.column = 0;
+            } else {
+                self.column += 1;
+            }
+        }
+        self.byte = byte;
+        (self.line, self.column)
+    }
+}
+
+/// The statements of `script`, split on `;` tokens. Pieces holding only
+/// whitespace and comments are dropped.
+pub fn statements(dialect: Dialect, script: &str) -> Vec<Statement> {
+    statements_from(script, &tokenize(dialect, script))
+}
+
+/// [`statements`] of a `script` already tokenized into `tokens`, for a
+/// caller that needs the tokens as well (the editor colours them).
+pub fn statements_from(script: &str, tokens: &[Token]) -> Vec<Statement> {
+    let mut found = Vec::new();
+    let mut walker = Walker::new(script);
+    for piece in tokens.split_inclusive(|token| token.kind == TokenKind::Semicolon) {
+        let body: &[Token] = match piece.last() {
+            Some(last) if last.kind == TokenKind::Semicolon => &piece[..piece.len() - 1],
+            _ => piece,
+        };
+        let Some(first_code) = body.iter().find(|token| is_code(token.kind)) else {
+            continue;
+        };
+        let mut visible = body
+            .iter()
+            .filter(|token| token.kind != TokenKind::Whitespace);
+        let (Some(first), Some(last)) = (visible.clone().next(), visible.next_back()) else {
+            continue;
+        };
+        let range = first.range.start..last.range.end;
+        let end = match piece.last() {
+            Some(last) if last.kind == TokenKind::Semicolon => last.range.end,
+            _ => range.end,
+        };
+        let (start_line, start_column) = walker.at(range.start);
+        let (first_line, _) = walker.at(first_code.range.start);
+        found.push(Statement {
+            start_line,
+            start_column,
+            first_line,
+            text: script[range.clone()].to_owned(),
+            range,
+            end,
+        });
+    }
+    found
+}
+
+/// The statement Run executes for a cursor at byte `cursor`: the one whose
+/// range, extended to its `;`, holds it; else the nearest one ending
+/// before it; else the first after it.
+pub fn statement_at(statements: &[Statement], cursor: usize) -> Option<&Statement> {
+    statements
+        .iter()
+        .find(|statement| statement.range.start <= cursor && cursor <= statement.end)
+        .or_else(|| {
+            statements
+                .iter()
+                .rev()
+                .find(|statement| statement.end <= cursor)
+        })
+        .or_else(|| statements.first())
+}
+
+/// The statement's words (keywords and names, quotes removed), upper-cased,
+/// in order. Only keywords and names count: strings, numbers, operators,
+/// punctuation and comments (executable ones included) are skipped. The
+/// read-only guard checks executable comments separately.
+pub fn words(dialect: Dialect, text: &str) -> Vec<String> {
+    tokenize(dialect, text)
+        .iter()
+        .filter_map(|token| word_of(text, token))
+        .collect()
+}
+
+/// The word a token spells, if it is a keyword or a name.
+fn word_of(text: &str, token: &Token) -> Option<String> {
+    let word = &text[token.range.clone()];
+    match token.kind {
+        TokenKind::Keyword | TokenKind::Identifier => Some(word.to_ascii_uppercase()),
+        // Strip the quotes, not a byte count: an unterminated name can
+        // end inside a multi-byte character.
+        TokenKind::QuotedIdentifier => Some(
+            word.trim_start_matches(['"', '`', '['])
+                .trim_end_matches(['"', '`', ']'])
+                .to_ascii_uppercase(),
+        ),
+        _ => None,
+    }
+}
+
+/// Why `statement` must not run in a script's transaction, which
+/// native-sql-database-client-windows begins and ends itself, read-only or not: the statement kind
+/// it is, for the message. `None` when it may run. Matched on tokens, so
+/// `SELECT 'COMMIT'` and a column named `end_date` pass.
+pub fn refusal(dialect: Dialect, statement: &str) -> Option<String> {
+    let tokens = tokenize(dialect, statement);
+    // What the dialect's own tokens can hide from the words below.
+    let hidden = match dialect {
+        Dialect::MySql => tokens
+            .iter()
+            .any(|token| token.kind == TokenKind::ExecutableComment)
+            .then(|| "a /*! */ comment".to_owned()),
+        // A U&"..." name can spell any name in escapes, set_config included.
+        Dialect::Postgres | Dialect::DuckDb => {
+            unicode_name(statement, &tokens).then(|| "a U& name".to_owned())
+        }
+        Dialect::Sqlite => refused_pragma(statement, &tokens).map(|name| format!("PRAGMA {name}")),
+        // GoogleSQL has neither executable comments, escape names nor pragmas.
+        Dialect::BigQuery => None,
+    };
+    if hidden.is_some() {
+        return hidden;
+    }
+    let mut words: Vec<String> = tokens
+        .iter()
+        .filter_map(|token| word_of(statement, token))
+        .collect();
+    match dialect {
+        // MariaDB's CREATE OR REPLACE USER / ROLE: match them as CREATE USER.
+        Dialect::MySql => {
+            if words.len() > 2 && words[0] == "CREATE" && words[1] == "OR" && words[2] == "REPLACE"
+            {
+                words.drain(1..3);
+            }
+        }
+        Dialect::Postgres | Dialect::Sqlite | Dialect::BigQuery | Dialect::DuckDb => {}
+    }
+    let word = |index: usize| words.get(index).map(String::as_str).unwrap_or_default();
+    match dialect {
+        // What outlives the rollback in DuckDB, or reaches past the
+        // connection's files: a setting or a pragma (the fence locks the
+        // database's, not the session's), the default catalog, a
+        // database attached or detached, an extension, a file written.
+        // An `EXPLAIN ANALYZE` runs the statement it explains: one that
+        // names any of them anywhere is refused as that one, whatever the
+        // options between.
+        Dialect::DuckDb => {
+            let refused = |word: &str| DUCKDB_REFUSED.iter().find(|refused| **refused == word);
+            if let Some(first) = refused(word(0)) {
+                return Some((*first).to_owned());
+            }
+            if word(0) == "EXPLAIN"
+                && let Some(named) = words.iter().skip(1).find_map(|word| refused(word))
+            {
+                return Some(format!("EXPLAIN {named}"));
+            }
+        }
+        Dialect::Postgres | Dialect::MySql | Dialect::Sqlite | Dialect::BigQuery => {}
+    }
+    let guarded_name = || words.iter().skip(1).find(|name| is_guarded_setting(name));
+    match word(0) {
+        first @ ("BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT"
+        | "RELEASE") => return Some(first.to_owned()),
+        // The SQL they run is a string the guard cannot read, and prepared
+        // statements outlive the rollback.
+        first @ ("PREPARE" | "EXECUTE" | "DEALLOCATE") => match dialect {
+            Dialect::Postgres if first == "PREPARE" && word(1) == "TRANSACTION" => {
+                return Some("PREPARE TRANSACTION".into());
+            }
+            // BigQuery's EXECUTE IMMEDIATE runs SQL the guard cannot read.
+            Dialect::Postgres | Dialect::MySql | Dialect::DuckDb => {
+                return Some(first.to_owned());
+            }
+            Dialect::BigQuery if first == "EXECUTE" => return Some(first.to_owned()),
+            Dialect::BigQuery | Dialect::Sqlite => {}
+        },
+        "SET" => {
+            if let Some(refused) = set_refusal(dialect, statement, &tokens, &words) {
+                return Some(refused);
+            }
+        }
+        "RESET" => match dialect {
+            Dialect::MySql => {
+                return Some(match word(1) {
+                    "" => "RESET".to_owned(),
+                    second => format!("RESET {second}"),
+                });
+            }
+            // Refused above, whatever it resets.
+            Dialect::DuckDb => return Some("RESET".into()),
+            Dialect::Postgres | Dialect::Sqlite | Dialect::BigQuery => {
+                if word(1) == "ALL" {
+                    return Some("RESET ALL".into());
+                }
+                if let Some(name) = guarded_name() {
+                    return Some(format!("RESET {name}"));
+                }
+            }
+        },
+        "DISCARD" if word(1) == "ALL" => return Some("DISCARD ALL".into()),
+        "COPY" => match dialect {
+            Dialect::Postgres | Dialect::DuckDb => return Some("COPY".into()),
+            Dialect::MySql | Dialect::Sqlite | Dialect::BigQuery => {}
+        },
+        _ => {}
+    }
+    match dialect {
+        // set_config() changes the same settings as SET, from any statement.
+        Dialect::Postgres => {
+            return words
+                .iter()
+                .any(|word| word == "SET_CONFIG")
+                .then(|| "set_config".to_owned());
+        }
+        Dialect::Sqlite | Dialect::DuckDb => return None,
+        // BigQuery has no session settings to guard, no USE: what remains
+        // is MySQL's.
+        Dialect::BigQuery => return None,
+        // The rest is MySQL's.
+        Dialect::MySql => {}
+    }
+    // The session's default database is not reset by the cleanup; a server
+    // that prepares USE would carry it into browsing and the next run.
+    if word(0) == "USE" {
+        return Some("USE".into());
+    }
+    if matches!(
+        word(0),
+        "XA" | "LOCK"
+            | "UNLOCK"
+            | "CALL"
+            | "GRANT"
+            | "REVOKE"
+            | "FLUSH"
+            | "INSTALL"
+            | "UNINSTALL"
+            | "PURGE"
+            | "CHANGE"
+            | "STOP"
+            | "SHUTDOWN"
+            | "RESTART"
+            | "CLONE"
+            | "BACKUP"
+    ) {
+        return Some(word(0).to_owned());
+    }
+    if let Some((first, second)) = [
+        ("CREATE", "USER"),
+        ("ALTER", "USER"),
+        ("DROP", "USER"),
+        ("RENAME", "USER"),
+        ("CREATE", "ROLE"),
+        ("DROP", "ROLE"),
+        ("DROP", "PREPARE"),
+        ("ALTER", "INSTANCE"),
+        ("SET", "PASSWORD"),
+        ("SET", "DEFAULT"),
+    ]
+    .into_iter()
+    .find(|(first, second)| word(0) == *first && word(1) == *second)
+    {
+        return Some(format!("{first} {second}"));
+    }
+    into_file(statement, &tokens).map(|file| format!("INTO {file}"))
+}
+
+/// Settings that leave read-only, or that change how later statements are
+/// lexed (the tokenizer assumes the connect-time values). MySQL's
+/// `completion_type` changes what the cleanup's `ROLLBACK` does: with
+/// `RELEASE` it closes the session, with `CHAIN` it starts a transaction.
+fn is_guarded_setting(name: &str) -> bool {
+    name.ends_with("READ_ONLY")
+        || name == "AUTOCOMMIT"
+        || name == "COMPLETION_TYPE"
+        || name == "SQL_MODE"
+        || name == "STANDARD_CONFORMING_STRINGS"
+        || name == "CLIENT_ENCODING"
+        || name.starts_with("CHARACTER_SET")
+}
+
+/// The SQLite pragmas a script may not set. `query_only` is what keeps a
+/// writable handle from writing. `writable_schema` would open the schema
+/// table to writes; SQLite ignores it in defensive mode, which every
+/// session is opened in, so refusing it is belt and braces.
+const GUARDED_PRAGMAS: [&str; 2] = ["QUERY_ONLY", "WRITABLE_SCHEMA"];
+
+/// The statements a DuckDB script may not run, by their first word (see
+/// `refusal`). `FORCE` is `FORCE INSTALL`.
+const DUCKDB_REFUSED: [&str; 15] = [
+    "SET",
+    "RESET",
+    "PRAGMA",
+    "USE",
+    "ATTACH",
+    "DETACH",
+    "INSTALL",
+    "FORCE",
+    "LOAD",
+    "UPDATE_EXTENSIONS",
+    "COPY",
+    "EXPORT",
+    "IMPORT",
+    "CHECKPOINT",
+    "VACUUM",
+];
+
+/// The SQLite pragmas a script may not name in any form, since the bare
+/// form acts too. `wal_checkpoint` rewrites a file in WAL mode, and neither
+/// `query_only` nor a transaction that has read nothing stops it.
+const REFUSED_PRAGMAS: [&str; 1] = ["WAL_CHECKPOINT"];
+
+/// The name a token spells in a `PRAGMA`, upper-cased. SQLite reads a
+/// pragma's name as a bare word, a quoted name or a string, which is why
+/// this does not go through `word_of`: that skips strings.
+fn pragma_name(statement: &str, token: &Token) -> Option<String> {
+    matches!(
+        token.kind,
+        TokenKind::Keyword
+            | TokenKind::Identifier
+            | TokenKind::QuotedIdentifier
+            | TokenKind::String
+    )
+    .then(|| {
+        statement[token.range.clone()]
+            .trim_matches(['"', '`', '[', ']', '\''])
+            .to_ascii_uppercase()
+    })
+}
+
+/// The pragma a SQLite `PRAGMA` statement may not name: one of
+/// `REFUSED_PRAGMAS`, or one of `GUARDED_PRAGMAS` unless the statement only
+/// reads it (`PRAGMA name`, `PRAGMA schema.name`, nothing after). It errs
+/// toward refusing: such a name anywhere in a longer statement counts.
+fn refused_pragma(statement: &str, tokens: &[Token]) -> Option<&'static str> {
+    let code: Vec<&Token> = tokens
+        .iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment))
+        .collect();
+    // EXPLAIN [QUERY PLAN] in front changes nothing: SQLite applies a flag
+    // pragma when it prepares the statement, explained or not.
+    let explained = code
+        .iter()
+        .take_while(|token| {
+            word_of(statement, token)
+                .is_some_and(|word| matches!(word.as_str(), "EXPLAIN" | "QUERY" | "PLAN"))
+        })
+        .count();
+    let [pragma, code @ ..] = &code[explained..] else {
+        return None;
+    };
+    if word_of(statement, pragma).as_deref() != Some("PRAGMA") {
+        return None;
+    }
+    let named = |list: &[&'static str]| {
+        code.iter()
+            .filter_map(|token| pragma_name(statement, token))
+            .find_map(|name| list.iter().copied().find(|listed| *listed == name))
+    };
+    if let Some(refused) = named(&REFUSED_PRAGMAS) {
+        return Some(refused);
+    }
+    let guarded = named(&GUARDED_PRAGMAS)?;
+    let is_name = |token: &Token| pragma_name(statement, token).is_some();
+    let reads = match code {
+        [name] => is_name(name),
+        [schema, dot, name] => {
+            is_name(schema) && &statement[dot.range.clone()] == "." && is_name(name)
+        }
+        _ => false,
+    };
+    (!reads).then_some(guarded)
+}
+
+/// The refusal for a `SET` statement, if any. Everything here errs toward
+/// refusing: a guarded word anywhere in the statement counts.
+fn set_refusal(
+    dialect: Dialect,
+    statement: &str,
+    tokens: &[Token],
+    words: &[String],
+) -> Option<String> {
+    // MariaDB's SET STATEMENT var=value FOR <statement> wraps any statement
+    // behind a leading SET; refuse it outright rather than read inside.
+    // Only the token right after SET counts: `SET @statement = 1` has an
+    // `@` there.
+    let mut code = tokens
+        .iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment));
+    match dialect {
+        Dialect::MySql => {
+            if let Some(second) = code.nth(1)
+                && matches!(second.kind, TokenKind::Keyword | TokenKind::Identifier)
+                && statement[second.range.clone()].eq_ignore_ascii_case("STATEMENT")
+            {
+                return Some("SET STATEMENT".into());
+            }
+        }
+        Dialect::Postgres | Dialect::Sqlite | Dialect::BigQuery | Dialect::DuckDb => {}
+    }
+    let has = |wanted: &str| words.iter().skip(1).any(|word| word == wanted);
+    if has("CHARACTERISTICS") {
+        return Some("SET SESSION CHARACTERISTICS".into());
+    }
+    if has("TRANSACTION") {
+        return Some("SET TRANSACTION".into());
+    }
+    // Each assignment on its own: `SET @a = 1, NAMES gbk` sets a charset.
+    for assignment in assignments(statement, tokens) {
+        let mut rest = assignment.iter().map(String::as_str).peekable();
+        while rest
+            .next_if(|word| {
+                matches!(
+                    *word,
+                    "GLOBAL" | "SESSION" | "LOCAL" | "PERSIST" | "PERSIST_ONLY"
+                )
+            })
+            .is_some()
+        {}
+        match (rest.next(), rest.next()) {
+            (Some("NAMES"), _) => return Some("SET NAMES".into()),
+            (Some("CHARSET"), _) => return Some("SET CHARSET".into()),
+            (Some("CHARACTER"), Some("SET")) => return Some("SET CHARACTER SET".into()),
+            _ => {}
+        }
+    }
+    if let Some(name) = words.iter().skip(1).find(|name| is_guarded_setting(name)) {
+        return Some(format!("SET {name}"));
+    }
+    match dialect {
+        // Server state that is neither rolled back nor reset by the cleanup.
+        Dialect::MySql => words
+            .iter()
+            .skip(1)
+            .find(|word| matches!(word.as_str(), "GLOBAL" | "PERSIST" | "PERSIST_ONLY"))
+            .map(|scope| format!("SET {scope}")),
+        // Every DuckDB SET is refused before this is asked.
+        Dialect::DuckDb => Some("SET".into()),
+        Dialect::Postgres | Dialect::Sqlite | Dialect::BigQuery => None,
+    }
+}
+
+/// The words of each top-level assignment of a `SET` (split on commas
+/// outside parentheses), without the leading `SET`. Unbalanced parentheses
+/// leave the rest of the statement in one assignment, which fails open, but
+/// the server rejects such text as a syntax error, so nothing runs.
+fn assignments(statement: &str, tokens: &[Token]) -> Vec<Vec<String>> {
+    let mut found = vec![Vec::new()];
+    let mut depth = 0_usize;
+    for token in tokens {
+        match (token.kind, &statement[token.range.clone()]) {
+            (TokenKind::Punctuation, "(") => depth += 1,
+            (TokenKind::Punctuation, ")") => depth = depth.saturating_sub(1),
+            (TokenKind::Punctuation, ",") if depth == 0 => found.push(Vec::new()),
+            _ => {
+                if let (Some(word), Some(current)) = (word_of(statement, token), found.last_mut()) {
+                    current.push(word);
+                }
+            }
+        }
+    }
+    if let Some(first) = found.first_mut()
+        && first.first().is_some_and(|word| word == "SET")
+    {
+        first.remove(0);
+    }
+    found
+}
+
+/// `OUTFILE` or `DUMPFILE` when the statement has `INTO` straight before it,
+/// as the next unquoted word with only whitespace and comments between.
+fn into_file(statement: &str, tokens: &[Token]) -> Option<&'static str> {
+    let mut previous_into = false;
+    for token in tokens {
+        let text = &statement[token.range.clone()];
+        match token.kind {
+            TokenKind::Whitespace | TokenKind::Comment => {}
+            TokenKind::Keyword | TokenKind::Identifier => {
+                if previous_into && text.eq_ignore_ascii_case("OUTFILE") {
+                    return Some("OUTFILE");
+                }
+                if previous_into && text.eq_ignore_ascii_case("DUMPFILE") {
+                    return Some("DUMPFILE");
+                }
+                previous_into = text.eq_ignore_ascii_case("INTO");
+            }
+            _ => previous_into = false,
+        }
+    }
+    None
+}
+
+/// Whether a PostgreSQL statement names something with `U&"..."`. The
+/// tokenizer sees the identifier `U`, the operator `&`, then a quoted name.
+fn unicode_name(statement: &str, tokens: &[Token]) -> bool {
+    let code: Vec<&Token> = tokens
+        .iter()
+        .filter(|token| token.kind != TokenKind::Whitespace)
+        .collect();
+    code.windows(3).any(|three| {
+        statement[three[0].range.clone()].eq_ignore_ascii_case("U")
+            && &statement[three[1].range.clone()] == "&"
+            && three[2].kind == TokenKind::QuotedIdentifier
+    })
+}
+
+/// What a statement looks like to the SQL editor, which runs a script that
+/// only reads in a read-only transaction and commits no other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementKind {
+    /// A query by its first word, with no word in it that changes data.
+    Read,
+    /// Anything else.
+    Write,
+}
+
+/// The words a statement that reads starts with.
+const READS: [&str; 8] = [
+    "SELECT", "VALUES", "TABLE", "WITH", "SHOW", "EXPLAIN", "DESCRIBE", "DESC",
+];
+
+/// The words that explain the statement after them. MySQL takes all three.
+const EXPLAINS: [&str; 3] = ["EXPLAIN", "DESCRIBE", "DESC"];
+
+/// The word that makes an `EXPLAIN` run its statement. PostgreSQL takes
+/// both spellings.
+const ANALYZES: [&str; 2] = ["ANALYZE", "ANALYSE"];
+
+/// The words that change data wherever they stand in a query: in a `WITH`,
+/// after `FOR`.
+const CHANGES: [&str; 4] = ["INSERT", "UPDATE", "DELETE", "MERGE"];
+
+/// The word a token spells when it is not quoted, upper-cased: a keyword
+/// or a bare name.
+fn bare_word(text: &str, token: &Token) -> Option<String> {
+    matches!(token.kind, TokenKind::Keyword | TokenKind::Identifier)
+        .then(|| text[token.range.clone()].to_ascii_uppercase())
+}
+
+/// Whether `statement` only reads, as far as its words say. It errs toward
+/// `Write`: a bare name spelled like a data-changing word counts. Taking a
+/// write for a read is safe, since a read runs in a read-only transaction
+/// where the database refuses the write; taking a read for a write only
+/// commits nothing.
+///
+/// An `EXPLAIN` without `ANALYZE` runs nothing, so it is a read whatever
+/// it explains. With `ANALYZE` it runs its statement, and is what that is.
+pub fn kind(dialect: Dialect, statement: &str) -> StatementKind {
+    let tokens = tokenize(dialect, statement);
+    // MySQL runs what an executable comment holds, and it can hold anything.
+    if tokens
+        .iter()
+        .any(|token| token.kind == TokenKind::ExecutableComment)
+    {
+        return StatementKind::Write;
+    }
+    let first = tokens
+        .iter()
+        .find(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment));
+    // Only comments: nothing runs.
+    let Some(first) = first else {
+        return StatementKind::Read;
+    };
+    let words: Vec<String> = tokens
+        .iter()
+        .filter_map(|token| bare_word(statement, token))
+        .collect();
+    let has = |wanted: &str| words.iter().any(|word| word == wanted);
+    let first_word = bare_word(statement, first);
+    let first_word = first_word.as_deref();
+    let explains = first_word.is_some_and(|word| EXPLAINS.contains(&word));
+    if explains && !ANALYZES.iter().any(|word| has(word)) {
+        return StatementKind::Read;
+    }
+    let reads = match first_word {
+        Some(word) => {
+            READS.contains(&word)
+                || match dialect {
+                    Dialect::Sqlite => word == "PRAGMA",
+                    // DuckDB reads a table from its FROM alone, and says
+                    // what one holds by DESCRIBE and SUMMARIZE.
+                    Dialect::DuckDb => {
+                        matches!(
+                            word,
+                            "FROM" | "DESCRIBE" | "SUMMARIZE" | "PIVOT" | "UNPIVOT"
+                        )
+                    }
+                    Dialect::Postgres | Dialect::MySql | Dialect::BigQuery => false,
+                }
+        }
+        None => &statement[first.range.clone()] == "(",
+    };
+    if reads && !CHANGES.iter().any(|word| has(word)) {
+        StatementKind::Read
+    } else {
+        StatementKind::Write
+    }
+}
+
+/// The words a statement that changes what the database holds (its
+/// schemas, tables, views, columns) starts with, on every engine.
+const DEFINES: [&str; 4] = ["CREATE", "DROP", "ALTER", "RENAME"];
+
+/// Whether `statement` may change the database's catalog, which the
+/// sidebar and the completion lists show: a `CREATE`, `DROP`, `ALTER` or
+/// `RENAME` by its first word, and SQLite's `ATTACH` and `DETACH`, which
+/// add and remove a schema. It errs toward yes: a MySQL executable comment
+/// counts, since it can hold any of them. What it misses is a statement
+/// that makes a table by another name (PostgreSQL's `SELECT ... INTO`).
+pub fn changes_catalog(dialect: Dialect, statement: &str) -> bool {
+    let tokens = tokenize(dialect, statement);
+    if tokens
+        .iter()
+        .any(|token| token.kind == TokenKind::ExecutableComment)
+    {
+        return true;
+    }
+    let Some(first) = tokens
+        .iter()
+        .find(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment))
+        .and_then(|token| bare_word(statement, token))
+    else {
+        return false;
+    };
+    DEFINES.contains(&first.as_str())
+        || match dialect {
+            Dialect::Sqlite | Dialect::DuckDb => first == "ATTACH" || first == "DETACH",
+            Dialect::Postgres | Dialect::MySql | Dialect::BigQuery => false,
+        }
+}
+
+/// A statement that changes or removes every row of a table: what
+/// [`unbounded`] and [`every_row`] name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    Update,
+    Delete,
+    Truncate,
+}
+
+/// The words a statement's own verb can be, once a `WITH` list and an
+/// `EXPLAIN` in front of it are passed.
+const VERBS: [&str; 8] = [
+    "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "VALUES", "TABLE", "REPLACE",
+];
+
+/// The words that bound an `UPDATE` or a `DELETE` among its own words:
+/// a `WHERE`, and a `LIMIT` (MySQL's, and SQLite's where it is built with
+/// one). MySQL's `ON` of an inner join bounds it too: see [`joins_target`].
+const BOUNDS: [&str; 2] = ["WHERE", "LIMIT"];
+
+/// `UPDATE` or `DELETE` when `statement` is one with nothing of its own to
+/// bound it (a `WHERE`, a `LIMIT`, MySQL's inner join with its `ON`): it
+/// reaches every row of its table. What stands inside parentheses belongs
+/// to a subquery and does not count. A `WITH`
+/// in front is passed, and so is an `EXPLAIN` that has `ANALYZE`, which
+/// runs the statement behind it. A `WITH`'s own `UPDATE` or `DELETE`
+/// (`WITH d AS (DELETE FROM books RETURNING *) SELECT ...`) is named too:
+/// it runs whatever the statement after it reads. An `INSERT` that updates
+/// on a conflict and a `MERGE` are bounded by their rows, and are never
+/// named; nor is a `TRUNCATE`, which has no `WHERE` to leave out
+/// ([`every_row`] names it).
+pub fn unbounded(dialect: Dialect, statement: &str) -> Option<Verb> {
+    unbounded_at(dialect, statement, &tokenize(dialect, statement)).map(|(verb, _)| verb)
+}
+
+/// A word of a statement, for [`unbounded_at`].
+struct Word {
+    /// Upper-cased.
+    text: String,
+    /// Its token's place.
+    at: usize,
+    /// The parentheses it stands in: 0 outside all of them, and a number
+    /// of its own for each pair.
+    group: usize,
+    /// It is the first thing inside its parentheses.
+    opens: bool,
+    /// The commas before it in its parentheses.
+    commas: usize,
+}
+
+/// The words of `tokens`, each with the parentheses it stands in, and
+/// whether an `ANALYZE` stands anywhere (also as an option:
+/// `EXPLAIN (ANALYZE)`).
+fn words_of(statement: &str, tokens: &[Token]) -> (Vec<Word>, bool) {
+    let mut words = Vec::new();
+    let mut analyzed = false;
+    let mut groups = vec![0];
+    let mut next = 1;
+    let mut opened = false;
+    // The commas so far in each pair of parentheses, by its number.
+    let mut commas = vec![0];
+    for (at, token) in tokens.iter().enumerate() {
+        let group = groups.last().copied().unwrap_or_default();
+        match (token.kind, &statement[token.range.clone()]) {
+            (TokenKind::Punctuation, ",") => {
+                commas[group] += 1;
+                opened = false;
+            }
+            (TokenKind::Punctuation, "(") => {
+                commas.push(0);
+                groups.push(next);
+                next += 1;
+                opened = true;
+            }
+            (TokenKind::Punctuation, ")") => {
+                // A `)` that closes nothing leaves the outermost as it is.
+                if groups.len() > 1 {
+                    groups.pop();
+                }
+                opened = false;
+            }
+            (TokenKind::Whitespace | TokenKind::Comment, _) => {}
+            _ => {
+                if let Some(text) = bare_word(statement, token) {
+                    analyzed |= ANALYZES.contains(&text.as_str());
+                    words.push(Word {
+                        text,
+                        at,
+                        group,
+                        opens: opened,
+                        commas: commas[group],
+                    });
+                }
+                opened = false;
+            }
+        }
+    }
+    (words, analyzed)
+}
+
+/// [`unbounded`] of `statement`, whose tokens are `tokens`, with the place
+/// in `tokens` of its verb.
+fn unbounded_at(dialect: Dialect, statement: &str, tokens: &[Token]) -> Option<(Verb, usize)> {
+    let (words, analyzed) = words_of(statement, tokens);
+    let mut top = words.iter().filter(|word| word.group == 0);
+    let leads = match top.next()?.text.as_str() {
+        "UPDATE" | "DELETE" | "WITH" => true,
+        word => EXPLAINS.contains(&word) && analyzed,
+    };
+    if !leads {
+        return None;
+    }
+    // The statement's own verb: the first word outside parentheses that
+    // can be one.
+    let own = words
+        .iter()
+        .find(|word| word.group == 0 && VERBS.contains(&word.text.as_str()));
+    // A WITH's statements: the verbs that open their parentheses.
+    let ctes = words.iter().filter(|word| word.group > 0 && word.opens);
+    let bounded = |verb: &Word| {
+        let own: Vec<&Word> = words
+            .iter()
+            .filter(|word| word.at > verb.at && word.group == verb.group)
+            .collect();
+        let joined = joins_target(dialect, verb, &own);
+        joined || own.iter().any(|word| BOUNDS.contains(&word.text.as_str()))
+    };
+    own.into_iter().chain(ctes).find_map(|word| {
+        let verb = match word.text.as_str() {
+            "UPDATE" => Verb::Update,
+            "DELETE" => Verb::Delete,
+            _ => return None,
+        };
+        (!bounded(word)).then_some((verb, word.at))
+    })
+}
+
+/// Whether `words`, a statement's own after its verb, join its target to
+/// another table with an `ON` that keeps only the rows that match: MySQL's
+/// `DELETE b FROM books b JOIN covers c ON ...` and `UPDATE books b JOIN
+/// covers c ON ... SET ...`, whose target is a side of the join. Not a
+/// `LEFT` or a `RIGHT` join, which keeps every row of one side, nor a join
+/// in a list of tables that has a comma, before it or after it
+/// (`UPDATE books b, covers c JOIN shelves s ON ...`): the target may be
+/// crossed with it. Nor on PostgreSQL
+/// and SQLite, where a join stands in the `FROM` or the `USING` and its
+/// `ON` does not touch the target: only a `WHERE` ties them.
+fn joins_target(dialect: Dialect, verb: &Word, words: &[&Word]) -> bool {
+    match dialect {
+        Dialect::MySql => {}
+        Dialect::Postgres | Dialect::Sqlite | Dialect::BigQuery | Dialect::DuckDb => return false,
+    }
+    words.iter().enumerate().any(|(at, word)| {
+        if word.text != "ON" {
+            return false;
+        }
+        // The join this ON is of: the last one before it.
+        let Some(join) = words[..at]
+            .iter()
+            .rposition(|word| matches!(word.text.as_str(), "JOIN" | "STRAIGHT_JOIN"))
+        else {
+            return false;
+        };
+        let kind = words[..join].iter().rev().take(2);
+        let outer = kind
+            .into_iter()
+            .any(|word| matches!(word.text.as_str(), "LEFT" | "RIGHT"));
+        // Where the list of tables starts: DELETE's FROM or USING, or the
+        // verb itself.
+        let list = words[..join]
+            .iter()
+            .rev()
+            .find(|word| matches!(word.text.as_str(), "FROM" | "USING"))
+            .map_or(verb.commas, |word| word.commas);
+        // Where it ends: UPDATE's SET, or what follows DELETE's tables.
+        let end = words[at..]
+            .iter()
+            .find(|word| matches!(word.text.as_str(), "SET" | "WHERE" | "ORDER" | "LIMIT"))
+            .or(words.last())
+            .map_or(list, |word| word.commas);
+        let crossed = end > list;
+        !outer && !crossed
+    })
+}
+
+/// A statement that reaches every row of the tables it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EveryRow {
+    pub verb: Verb,
+    /// The tables it names, each once, in order. Empty where they cannot
+    /// be read off the statement.
+    pub tables: Vec<NamedTable>,
+}
+
+/// A table as a statement names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedTable {
+    pub schema: Option<String>,
+    /// Without its quotes.
+    pub name: String,
+    /// The name was quoted: it is spelled as the database has it.
+    pub quoted: bool,
+}
+
+/// What reaches every row of a table: an `UPDATE` or a `DELETE` that
+/// [`unbounded`] names, or a `TRUNCATE` where the dialect has one (SQLite
+/// does not). Its tables are the ones after the verb, in order: `books`
+/// of `UPDATE ONLY books b SET`, both of MySQL's `DELETE a, b FROM ...`
+/// (by the tables their aliases stand for) and of PostgreSQL's
+/// `TRUNCATE a, b`.
+pub fn every_row(dialect: Dialect, statement: &str) -> Option<EveryRow> {
+    let tokens = tokenize(dialect, statement);
+    let (verb, at) = match unbounded_at(dialect, statement, &tokens) {
+        Some(found) => found,
+        None => (Verb::Truncate, truncate_at(dialect, statement, &tokens)?),
+    };
+    let after = code_of(&tokens[at + 1..]);
+    let (named, end) = tables_after(statement, &after);
+    // MySQL's DELETE of several tables names them by the aliases its FROM
+    // or USING, after them, gives them: `DELETE b FROM books b`.
+    let aliases = aliases(statement, &after[end..]);
+    let mut tables: Vec<NamedTable> = Vec::new();
+    for table in named {
+        let alias = aliases
+            .iter()
+            .find(|(alias, _)| table.schema.is_none() && alias.eq_ignore_ascii_case(&table.name));
+        let table = alias.map_or(table, |(_, aliased)| aliased.clone());
+        if !tables.contains(&table) {
+            tables.push(table);
+        }
+    }
+    Some(EveryRow { verb, tables })
+}
+
+/// `tokens` without their whitespace and comments.
+fn code_of(tokens: &[Token]) -> Vec<&Token> {
+    let code = |token: &&Token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment);
+    tokens.iter().filter(code).collect()
+}
+
+/// The place in `tokens` of the `TRUNCATE` that begins `statement`, where
+/// the dialect has the statement.
+fn truncate_at(dialect: Dialect, statement: &str, tokens: &[Token]) -> Option<usize> {
+    let truncates = match dialect {
+        Dialect::Postgres | Dialect::MySql | Dialect::BigQuery | Dialect::DuckDb => true,
+        Dialect::Sqlite => false,
+    };
+    let (at, first) = tokens
+        .iter()
+        .enumerate()
+        .find(|(_, token)| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment))?;
+    let word = bare_word(statement, first);
+    (truncates && word.as_deref() == Some("TRUNCATE")).then_some(at)
+}
+
+/// The words that may stand between a verb and its first table:
+/// `UPDATE ONLY`, MySQL's `DELETE LOW_PRIORITY QUICK IGNORE FROM`,
+/// `TRUNCATE TABLE ONLY`. SQLite's `OR` takes the word after it with it
+/// (`UPDATE OR REPLACE`). `ONLY` may stand before each table.
+const BEFORE_TABLES: [&str; 7] = [
+    "ONLY",
+    "LOW_PRIORITY",
+    "QUICK",
+    "IGNORE",
+    "FROM",
+    "TABLE",
+    "OR",
+];
+
+/// The words that end the list of a verb's tables, though they are not
+/// quoted: where an unquoted alias would stand.
+const AFTER_TABLES: [&str; 17] = [
+    "SET",
+    "FROM",
+    "USING",
+    "WHERE",
+    "JOIN",
+    "INNER",
+    "LEFT",
+    "RIGHT",
+    "CROSS",
+    "NATURAL",
+    "STRAIGHT_JOIN",
+    "RESTART",
+    "CONTINUE",
+    "CASCADE",
+    "RETURNING",
+    "ORDER",
+    "LIMIT",
+];
+
+/// The name `token` spells, without quotes, and whether it was quoted.
+/// With `keywords`, a keyword too, where it is none of [`AFTER_TABLES`].
+fn name_of(statement: &str, token: &Token, keywords: bool) -> Option<(String, bool)> {
+    let text = &statement[token.range.clone()];
+    match token.kind {
+        TokenKind::QuotedIdentifier => Some((unquoted(text), true)),
+        TokenKind::Identifier => Some((text.to_owned(), false)),
+        TokenKind::Keyword if keywords => {
+            let word = text.to_ascii_uppercase();
+            (!AFTER_TABLES.contains(&word.as_str())).then(|| (text.to_owned(), false))
+        }
+        _ => None,
+    }
+}
+
+/// The table named at `code[at]`, of as many parts as it has (the last two
+/// count: `db.schema.table`), and the place after it.
+fn table_at(
+    statement: &str,
+    code: &[&Token],
+    at: usize,
+    keywords: bool,
+) -> Option<(NamedTable, usize)> {
+    let part = |at: usize| name_of(statement, code.get(at)?, keywords);
+    let dot = |at: usize| {
+        code.get(at)
+            .is_some_and(|token| &statement[token.range.clone()] == ".")
+    };
+    let mut parts = vec![part(at)?];
+    let mut next = at + 1;
+    while dot(next)
+        && let Some(more) = part(next + 1)
+    {
+        parts.push(more);
+        next += 2;
+    }
+    let (name, quoted) = parts.pop()?;
+    let schema = parts.pop().map(|(schema, _)| schema);
+    Some((
+        NamedTable {
+            schema,
+            name,
+            quoted,
+        },
+        next,
+    ))
+}
+
+/// The tables named at the start of `code`, the ones after a verb: a list
+/// of names, each with its schema where it has one and its alias passed,
+/// separated by commas. With the place in `code` where the list ends.
+fn tables_after(statement: &str, code: &[&Token]) -> (Vec<NamedTable>, usize) {
+    let text = |at: usize| code.get(at).map(|token| &statement[token.range.clone()]);
+    let word = |at: usize| code.get(at).and_then(|token| bare_word(statement, token));
+    let mut at = 0;
+    while let Some(word) = word(at).filter(|word| BEFORE_TABLES.contains(&word.as_str())) {
+        at += if word == "OR" { 2 } else { 1 };
+    }
+    let mut tables = Vec::new();
+    loop {
+        if word(at).as_deref() == Some("ONLY") {
+            at += 1;
+        }
+        let Some((table, next)) = table_at(statement, code, at, true) else {
+            break;
+        };
+        tables.push(table);
+        at = next;
+        // PostgreSQL's `*` after a table takes its children in.
+        if text(at) == Some("*") {
+            at += 1;
+        }
+        if word(at).as_deref() == Some("AS") {
+            at += 2;
+        } else if code
+            .get(at)
+            .and_then(|token| name_of(statement, token, true))
+            .is_some()
+            && text(at + 1) != Some(".")
+        {
+            at += 1;
+        }
+        if text(at) != Some(",") {
+            break;
+        }
+        at += 1;
+    }
+    (tables, at.min(code.len()))
+}
+
+/// The aliases `code` gives tables: `books b`, `shop.books AS b`, each
+/// alias with its table. Names only, not keywords: an approximate scan.
+fn aliases(statement: &str, code: &[&Token]) -> Vec<(String, NamedTable)> {
+    let text = |at: usize| code.get(at).map(|token| &statement[token.range.clone()]);
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < code.len() {
+        let Some((table, after)) = table_at(statement, code, at, false) else {
+            at += 1;
+            continue;
+        };
+        let as_word = code
+            .get(after)
+            .and_then(|token| bare_word(statement, token))
+            .is_some_and(|word| word == "AS");
+        let alias_at = after + usize::from(as_word);
+        let alias = code
+            .get(alias_at)
+            .and_then(|token| name_of(statement, token, false))
+            .filter(|_| text(alias_at + 1) != Some("."));
+        match alias {
+            Some((alias, _)) => {
+                found.push((alias, table));
+                at = alias_at + 1;
+            }
+            None => at = after,
+        }
+    }
+    found
+}
+
+/// The name a quoted identifier spells: its quotes taken off and a
+/// doubled quote inside it made one. `[name]` has no doubling to undo; an
+/// unterminated one no closing quote to take off.
+pub(crate) fn unquoted(quoted: &str) -> String {
+    let mut chars = quoted.chars();
+    let Some(open) = chars.next() else {
+        return String::new();
+    };
+    let close = if open == '[' { ']' } else { open };
+    let inner = chars.as_str();
+    let inner = inner.strip_suffix(close).unwrap_or(inner);
+    if open == '[' {
+        inner.to_owned()
+    } else {
+        inner.replace(&format!("{open}{open}"), &open.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kinds(dialect: Dialect, text: &str) -> Vec<(TokenKind, &str)> {
+        tokenize(dialect, text)
+            .into_iter()
+            .filter(|token| token.kind != TokenKind::Whitespace)
+            .map(|token| (token.kind, &text[token.range]))
+            .collect()
+    }
+
+    #[test]
+    fn a_statement_does_not_print_its_text() {
+        let script = statements(
+            Dialect::Postgres,
+            "SELECT 1;\nSELECT 'hunter2' FROM secrets",
+        );
+        let printed = format!("{script:?}");
+        assert!(!printed.contains("hunter2"), "{printed}");
+        assert!(!printed.contains("secrets"), "{printed}");
+        assert!(!printed.contains("SELECT"), "{printed}");
+        // Where each statement sits is still there.
+        assert!(printed.contains("first_line: 2"), "{printed}");
+        assert!(printed.contains("range: 10..39"), "{printed}");
+    }
+
+    #[test]
+    fn words_numbers_strings_and_punctuation() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds(
+                Dialect::Postgres,
+                "SELECT a, 1.5e3 FROM t WHERE b = 'x''y';"
+            ),
+            vec![
+                (Keyword, "SELECT"),
+                (Identifier, "a"),
+                (Punctuation, ","),
+                (Number, "1.5e3"),
+                (Keyword, "FROM"),
+                (Identifier, "t"),
+                (Keyword, "WHERE"),
+                (Identifier, "b"),
+                (Operator, "="),
+                (String, "'x''y'"),
+                (Semicolon, ";"),
+            ]
+        );
+    }
+
+    #[test]
+    fn keywords_are_case_insensitive() {
+        assert_eq!(kinds(Dialect::Sqlite, "select")[0].0, TokenKind::Keyword);
+    }
+
+    #[test]
+    fn postgres_dollar_bodies_and_escape_strings() {
+        use TokenKind::*;
+        let text = "SELECT $$a;b$$, $fn$ x $$ y $fn$, E'it\\'s;', $1";
+        assert_eq!(
+            kinds(Dialect::Postgres, text),
+            vec![
+                (Keyword, "SELECT"),
+                (String, "$$a;b$$"),
+                (Punctuation, ","),
+                (String, "$fn$ x $$ y $fn$"),
+                (Punctuation, ","),
+                (String, "E'it\\'s;'"),
+                (Punctuation, ","),
+                (Punctuation, "$1"),
+            ]
+        );
+    }
+
+    #[test]
+    fn postgres_block_comments_nest() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds(Dialect::Postgres, "/* a /* b */ c */ SELECT"),
+            vec![(Comment, "/* a /* b */ c */"), (Keyword, "SELECT")]
+        );
+        // SQLite does not nest: the first */ ends it.
+        assert_eq!(
+            kinds(Dialect::Sqlite, "/* a /* b */ c")[0],
+            (Comment, "/* a /* b */")
+        );
+    }
+
+    #[test]
+    fn quoted_identifiers_per_dialect() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds(Dialect::Postgres, r#""we""ird""#),
+            vec![(QuotedIdentifier, r#""we""ird""#)]
+        );
+        assert_eq!(
+            kinds(Dialect::MySql, "`a;b`"),
+            vec![(QuotedIdentifier, "`a;b`")]
+        );
+        assert_eq!(
+            kinds(Dialect::Sqlite, "[a;b]"),
+            vec![(QuotedIdentifier, "[a;b]")]
+        );
+        // MySQL's default sql_mode reads "..." as a string.
+        assert_eq!(
+            kinds(Dialect::MySql, r#""a;b""#),
+            vec![(String, r#""a;b""#)]
+        );
+    }
+
+    #[test]
+    fn mysql_comments() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds(Dialect::MySql, "SELECT 1--no comment"),
+            vec![
+                (Keyword, "SELECT"),
+                (Number, "1"),
+                (Operator, "-"),
+                (Operator, "-"),
+                (Keyword, "no"),
+                (Identifier, "comment"),
+            ]
+        );
+        assert_eq!(
+            kinds(Dialect::MySql, "SELECT 1 -- a comment\n# another\n"),
+            vec![
+                (Keyword, "SELECT"),
+                (Number, "1"),
+                (Comment, "-- a comment"),
+                (Comment, "# another"),
+            ]
+        );
+        assert_eq!(
+            kinds(Dialect::MySql, "/*!50000 COMMIT */"),
+            vec![(ExecutableComment, "/*!50000 COMMIT */")]
+        );
+        assert_eq!(
+            kinds(Dialect::MySql, r"'it\'s'"),
+            vec![(String, r"'it\'s'")]
+        );
+    }
+
+    #[test]
+    fn unterminated_strings_and_comments_run_to_the_end() {
+        use TokenKind::*;
+        assert_eq!(kinds(Dialect::Postgres, "'abc"), vec![(String, "'abc")]);
+        assert_eq!(
+            kinds(Dialect::Postgres, "/* abc"),
+            vec![(Comment, "/* abc")]
+        );
+        assert_eq!(kinds(Dialect::Postgres, "$$abc"), vec![(String, "$$abc")]);
+    }
+
+    #[test]
+    fn non_ascii_text_keeps_char_boundaries() {
+        let text = "SELECT 'Zoë 🚀', naïve FROM t";
+        for token in tokenize(Dialect::Postgres, text) {
+            assert!(text.is_char_boundary(token.range.start));
+            assert!(text.is_char_boundary(token.range.end));
+        }
+        assert!(kinds(Dialect::Postgres, text).contains(&(TokenKind::Identifier, "naïve")));
+    }
+
+    #[test]
+    fn tokens_cover_the_whole_text() {
+        let text = "SELECT a -- x\n/* y */ FROM `t` WHERE c = 'd' ; §";
+        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            let tokens = tokenize(dialect, text);
+            let mut at = 0;
+            for token in &tokens {
+                assert_eq!(token.range.start, at);
+                at = token.range.end;
+            }
+            assert_eq!(at, text.len());
+        }
+    }
+
+    #[test]
+    fn postgres_line_comments_end_at_a_carriage_return() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds(Dialect::Postgres, "--x\rCOMMIT\nAND"),
+            vec![(Comment, "--x"), (Keyword, "COMMIT"), (Keyword, "AND")]
+        );
+        // MySQL and SQLite run a comment to the line feed only.
+        assert_eq!(
+            kinds(Dialect::Sqlite, "--x\rCOMMIT\nAND"),
+            vec![(Comment, "--x\rCOMMIT"), (Keyword, "AND")]
+        );
+        assert_eq!(
+            kinds(Dialect::MySql, "-- x\rCOMMIT\nAND"),
+            vec![(Comment, "-- x\rCOMMIT"), (Keyword, "AND")]
+        );
+        assert_eq!(
+            kinds(Dialect::MySql, "#x\rCOMMIT\nAND"),
+            vec![(Comment, "#x\rCOMMIT"), (Keyword, "AND")]
+        );
+    }
+
+    #[test]
+    fn mariadb_executable_comments() {
+        use TokenKind::*;
+        let tokens = kinds(Dialect::MySql, "/*M! COMMIT */ SELECT 1");
+        assert_eq!(tokens[0], (ExecutableComment, "/*M! COMMIT */"));
+        assert_eq!(tokens[1], (Keyword, "SELECT"));
+        // Only MySQL's dialect runs them; elsewhere they are comments.
+        assert_eq!(
+            kinds(Dialect::Postgres, "/*M! COMMIT */")[0],
+            (Comment, "/*M! COMMIT */")
+        );
+        assert_eq!(
+            kinds(Dialect::MySql, "/*M COMMIT */")[0],
+            (Comment, "/*M COMMIT */")
+        );
+    }
+
+    #[test]
+    fn postgres_escape_strings_continue_over_newlines() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds(Dialect::Postgres, "SELECT E'a'\n'\\''; COMMIT; --'"),
+            vec![
+                (Keyword, "SELECT"),
+                (String, "E'a'\n'\\''"),
+                (Semicolon, ";"),
+                (Keyword, "COMMIT"),
+                (Semicolon, ";"),
+                (Comment, "--'"),
+            ]
+        );
+        // Blanks and a comment before the newline, comment lines and blank
+        // lines after it, and several pieces.
+        let text = "E'a' -- c\r\n  -- d\n\n 'b\\'' \n'c'";
+        assert_eq!(kinds(Dialect::Postgres, text), vec![(String, text)]);
+        // A vertical tab may precede the newline too.
+        assert_eq!(
+            kinds(Dialect::Postgres, "E'a'\x0b\n'\\''x"),
+            vec![(String, "E'a'\x0b\n'\\''"), (Identifier, "x")]
+        );
+        // No newline, no continuation.
+        assert_eq!(
+            kinds(Dialect::Postgres, "E'a' 'b'"),
+            vec![(String, "E'a'"), (String, "'b'")]
+        );
+        // A comment after the newline must end in a newline itself.
+        assert_eq!(
+            kinds(Dialect::Postgres, "E'a'\n-- x"),
+            vec![(String, "E'a'"), (Comment, "-- x")]
+        );
+        // A non-quote ends it.
+        assert_eq!(
+            kinds(Dialect::Postgres, "E'a'\nSELECT"),
+            vec![(String, "E'a'"), (Keyword, "SELECT")]
+        );
+        // Plain strings stay separate tokens.
+        assert_eq!(
+            kinds(Dialect::Postgres, "'a'\n'b'"),
+            vec![(String, "'a'"), (String, "'b'")]
+        );
+        // MySQL has no continuation.
+        assert_eq!(
+            kinds(Dialect::MySql, "'a'\n'b'"),
+            vec![(String, "'a'"), (String, "'b'")]
+        );
+    }
+
+    #[test]
+    fn postgres_dollar_tags_may_hold_non_ascii_letters() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds(Dialect::Postgres, "SELECT $é$ ' $é$; COMMIT"),
+            vec![
+                (Keyword, "SELECT"),
+                (String, "$é$ ' $é$"),
+                (Semicolon, ";"),
+                (Keyword, "COMMIT"),
+            ]
+        );
+        // A dollar sign inside a word belongs to the word.
+        assert_eq!(
+            kinds(Dialect::Postgres, "a$$b$$"),
+            vec![(Identifier, "a$$b$$")]
+        );
+    }
+
+    #[test]
+    fn a_vertical_tab_is_whitespace_everywhere() {
+        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            assert_eq!(
+                kinds(dialect, "\x0bCOMMIT"),
+                vec![(TokenKind::Keyword, "COMMIT")]
+            );
+        }
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_whitespace_for_sqlite_only() {
+        // SQLite reads one at the start of a token as a space. In a word it
+        // is a letter like any other byte past ASCII.
+        assert_eq!(
+            kinds(
+                Dialect::Sqlite,
+                "\u{feff}COMMIT \u{feff}\u{feff}x a\u{feff}b"
+            ),
+            vec![
+                (TokenKind::Keyword, "COMMIT"),
+                (TokenKind::Identifier, "x"),
+                (TokenKind::Identifier, "a\u{feff}b"),
+            ]
+        );
+        for dialect in [Dialect::Postgres, Dialect::MySql] {
+            assert_eq!(
+                kinds(dialect, "\u{feff}COMMIT"),
+                vec![(TokenKind::Identifier, "\u{feff}COMMIT")]
+            );
+        }
+    }
+
+    #[test]
+    fn a_trailing_backslash_is_part_of_the_string() {
+        assert_eq!(
+            kinds(Dialect::MySql, "'abc\\"),
+            vec![(TokenKind::String, "'abc\\")]
+        );
+        assert_eq!(
+            kinds(Dialect::Postgres, "E'abc\\"),
+            vec![(TokenKind::String, "E'abc\\")]
+        );
+    }
+
+    #[test]
+    fn edges_of_comments_brackets_and_numbers() {
+        use TokenKind::*;
+        assert_eq!(kinds(Dialect::MySql, "--"), vec![(Comment, "--")]);
+        assert_eq!(
+            kinds(Dialect::Sqlite, "[a]b]"),
+            vec![
+                (QuotedIdentifier, "[a]"),
+                (Identifier, "b"),
+                (Punctuation, "]")
+            ]
+        );
+        assert_eq!(
+            kinds(Dialect::Postgres, "/* a /* b */ c"),
+            vec![(Comment, "/* a /* b */ c")]
+        );
+        assert_eq!(kinds(Dialect::Postgres, "1."), vec![(Number, "1.")]);
+    }
+
+    #[test]
+    fn every_short_text_is_covered_without_panics() {
+        let alphabet = [
+            "'", "\"", "\\", "$", "/", "*", "-", "#", "[", "]", "`", "E", "é", "\n", "\r", "!",
+            "1", ".", "e", "\x0b",
+        ];
+        let mut texts = vec![String::new()];
+        let mut level = vec![String::new()];
+        for _ in 0..4 {
+            level = level
+                .iter()
+                .flat_map(|prefix| alphabet.iter().map(move |piece| format!("{prefix}{piece}")))
+                .collect();
+            texts.extend(level.iter().cloned());
+        }
+        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            for text in &texts {
+                let mut at = 0;
+                for token in tokenize(dialect, text) {
+                    assert_eq!(token.range.start, at, "{dialect:?} {text:?}");
+                    assert!(token.range.end > at, "{dialect:?} {text:?}");
+                    assert!(text.is_char_boundary(token.range.end));
+                    at = token.range.end;
+                }
+                assert_eq!(at, text.len(), "{dialect:?} {text:?}");
+            }
+        }
+    }
+
+    fn texts(dialect: Dialect, text: &str) -> Vec<String> {
+        statements(dialect, text)
+            .into_iter()
+            .map(|s| s.text)
+            .collect()
+    }
+
+    #[test]
+    fn splits_on_semicolons_outside_strings_and_bodies() {
+        let script = "SELECT ';'; SELECT $$a;b$$;\n-- only a comment;\nSELECT 3";
+        assert_eq!(
+            texts(Dialect::Postgres, script),
+            // A leading comment belongs to the statement after it (its `;`
+            // is inside the comment).
+            vec![
+                "SELECT ';'",
+                "SELECT $$a;b$$",
+                "-- only a comment;\nSELECT 3"
+            ]
+        );
+        assert_eq!(
+            texts(Dialect::MySql, "SELECT `a;b`; SELECT \"c;d\""),
+            vec!["SELECT `a;b`", "SELECT \"c;d\""]
+        );
+    }
+
+    #[test]
+    fn empty_and_comment_only_pieces_are_dropped() {
+        assert!(statements(Dialect::Sqlite, " ;; -- nothing\n/* x */ ;").is_empty());
+    }
+
+    #[test]
+    fn statements_come_from_tokens_made_once() {
+        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            for script in [
+                "",
+                "SELECT 1",
+                "-- note\nSELECT 'a;b';\r\n  SELECT 2 ;\n/* done */",
+                "/*! COMMIT */; SELECT `x`",
+            ] {
+                let tokens = tokenize(dialect, script);
+                assert_eq!(
+                    statements_from(script, &tokens),
+                    statements(dialect, script),
+                    "{dialect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_script_has_no_statements() {
+        assert!(statements(Dialect::Postgres, "").is_empty());
+        assert!(statements(Dialect::Postgres, "  \n\t").is_empty());
+    }
+
+    #[test]
+    fn first_line_skips_leading_comments() {
+        let script = "SELECT 1;\n\n-- counts\nSELECT\n  2;";
+        let found = statements(Dialect::Postgres, script);
+        assert_eq!(found[0].first_line, 1);
+        assert_eq!(found[1].start_line, 3);
+        assert_eq!(found[1].first_line, 4);
+        assert_eq!(found[1].text, "-- counts\nSELECT\n  2");
+    }
+
+    #[test]
+    fn many_statements_are_numbered_by_line() {
+        let script = "SELECT 1;\n".repeat(5000);
+        let found = statements(Dialect::Postgres, &script);
+        assert_eq!(found.len(), 5000);
+        assert_eq!(found[4999].first_line, 5000);
+        assert_eq!(found[4999].start_line, 5000);
+    }
+
+    #[test]
+    fn executable_comments_are_code() {
+        let found = statements(Dialect::MySql, "/*! COMMIT */; SELECT 1");
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].text, "/*! COMMIT */");
+        let found = statements(Dialect::MySql, "/*M! SET x = 1 */");
+        assert_eq!(found.len(), 1);
+        let same_line = statements(Dialect::MySql, "-- note\n/*! COMMIT */ SELECT 1");
+        assert_eq!(same_line[0].first_line, 2);
+        let next_line = statements(Dialect::MySql, "-- note\n/*! COMMIT */\nSELECT 1");
+        assert_eq!(next_line[0].first_line, 2);
+    }
+
+    #[test]
+    fn end_is_past_the_semicolon_or_the_text() {
+        let found = statements(Dialect::Postgres, "SELECT 1 ;  SELECT 3\n\n");
+        assert_eq!((found[0].range.end, found[0].end), (8, 10));
+        assert_eq!((found[1].range.end, found[1].end), (20, 20));
+    }
+
+    #[test]
+    fn the_statement_at_the_cursor() {
+        let script = "SELECT 1;  SELECT 2;\n\nSELECT 3";
+        let found = statements(Dialect::Postgres, script);
+        let at = |cursor| statement_at(&found, cursor).map(|s| s.text.as_str());
+        assert_eq!(at(0), Some("SELECT 1"));
+        assert_eq!(at(8), Some("SELECT 1")); // just before the ;
+        assert_eq!(at(9), Some("SELECT 1")); // just after it
+        assert_eq!(at(10), Some("SELECT 1")); // between: the one before
+        assert_eq!(at(14), Some("SELECT 2"));
+        assert_eq!(at(21), Some("SELECT 2")); // blank line after it
+        assert_eq!(at(script.len()), Some("SELECT 3"));
+        assert_eq!(at(script.len() + 50), Some("SELECT 3")); // past the end
+        // Adjacent statements: just after a `;` is still the one before it.
+        let adjacent = statements(Dialect::Postgres, "SELECT 1;SELECT 2");
+        let tie = |cursor| statement_at(&adjacent, cursor).map(|s| s.text.as_str());
+        assert_eq!(tie(9), Some("SELECT 1"));
+        assert_eq!(tie(10), Some("SELECT 2"));
+        let leading = statements(Dialect::Postgres, "\n\n  SELECT 1");
+        assert_eq!(statement_at(&leading, 0).map(|s| s.first_line), Some(3));
+        assert!(statement_at(&[], 0).is_none());
+    }
+
+    #[test]
+    fn a_position_maps_to_a_line_and_column() {
+        let script = "SELECT 0;\nSELECT a,\n  bogus FROM t";
+        let second = &statements(Dialect::Postgres, script)[1];
+        // PostgreSQL positions are 1-based characters in the statement.
+        let position = second.text.find("bogus").unwrap() + 1;
+        assert_eq!(second.line_col(position), (3, 3));
+        assert_eq!(second.line_col(1), (2, 1));
+    }
+
+    #[test]
+    fn line_col_counts_characters_and_the_statement_offset() {
+        // The statement starts after "é; " on its line: 3 characters.
+        let script = "é; SELECT 'ü', zz";
+        let second = &statements(Dialect::Postgres, script)[1];
+        assert_eq!(second.start_column, 3);
+        let position = second.text.chars().position(|c| c == 'z').unwrap() + 1;
+        assert_eq!(second.line_col(position), (1, 3 + position));
+        // A position of 0 or past the end clamps instead of panicking.
+        assert_eq!(second.line_col(0), (1, 4));
+        assert_eq!(second.line_col(1000), (1, 4 + second.text.chars().count()));
+    }
+
+    #[test]
+    fn crlf_line_endings_keep_lines_and_columns() {
+        let script = "SELECT 1;\r\nSELECT a,\r\n  bogus";
+        let found = statements(Dialect::Postgres, script);
+        assert_eq!(found[0].text, "SELECT 1");
+        assert_eq!(found[1].start_line, 2);
+        assert_eq!(found[1].text, "SELECT a,\r\n  bogus");
+        let position = found[1].text.find("bogus").unwrap() + 1;
+        assert_eq!(found[1].line_col(position), (3, 3));
+    }
+
+    #[test]
+    fn an_unterminated_quoted_name_does_not_panic() {
+        assert_eq!(
+            words(Dialect::Postgres, "SELECT \"Zoë"),
+            vec!["SELECT", "ZOë"]
+        );
+        assert_eq!(words(Dialect::Sqlite, "[Zoë"), vec!["ZOë"]);
+    }
+
+    #[test]
+    fn words_skip_comments_and_upper_case() {
+        assert_eq!(
+            words(Dialect::MySql, "/* x */ set @@session.`tx_read_only` = 0"),
+            vec!["SET", "SESSION", "TX_READ_ONLY"]
+        );
+    }
+
+    #[test]
+    fn transaction_and_session_statements_are_refused() {
+        for text in [
+            "BEGIN",
+            "start transaction",
+            "COMMIT",
+            "end",
+            "ROLLBACK",
+            "abort",
+            "SAVEPOINT a",
+            "RELEASE a",
+            "PREPARE TRANSACTION 'x'",
+            "COMMIT PREPARED 'x'",
+            "SET TRANSACTION READ WRITE",
+            "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+            "set default_transaction_read_only = off",
+            r#"SET "default_transaction_read_only" = off"#,
+            "RESET ALL",
+            "reset default_transaction_read_only",
+            "SET standard_conforming_strings = off",
+            r#"SET U&"default_transaction_read\005fonly" = off"#,
+            "SELECT set_config('standard_conforming_strings', 'off', false)",
+            "SET client_encoding = 'SJIS'",
+            "DISCARD ALL",
+            "COPY users TO STDOUT",
+            "/* hi */ commit",
+        ] {
+            assert!(refusal(Dialect::Postgres, text).is_some(), "{text}");
+        }
+        for text in [
+            "SET SESSION TRANSACTION READ WRITE",
+            "SET GLOBAL TRANSACTION READ WRITE",
+            "SET @@session.transaction_read_only = 0",
+            "set `tx_read_only` = 0",
+            "SET autocommit = 1",
+            "XA START 'x'",
+            "LOCK TABLES t READ",
+            "UNLOCK TABLES",
+            "CALL p()",
+            "CREATE USER x",
+            "ALTER USER x IDENTIFIED BY 'y'",
+            "DROP USER x",
+            "RENAME USER x TO y",
+            "CREATE ROLE r",
+            "DROP ROLE r",
+            "GRANT ALL ON *.* TO x",
+            "REVOKE ALL ON *.* FROM x",
+            "SET PASSWORD = 'x'",
+            "SET DEFAULT ROLE ALL TO x",
+            "FLUSH PRIVILEGES",
+            "INSTALL PLUGIN p SONAME 'p.so'",
+            "UNINSTALL PLUGIN p",
+            "SELECT * FROM t INTO OUTFILE '/tmp/x'",
+            "SELECT 1 INTO DUMPFILE '/tmp/x'",
+            "SELECT 1 /*! , 2 */",
+            "SELECT 1 /*M! , 2 */",
+            "SET sql_mode = 'ANSI_QUOTES'",
+            "SET @@session.sql_mode = ''",
+            "SET NAMES gbk",
+            "SET CHARACTER SET gbk",
+            "SET character_set_client = gbk",
+            "RESET sql_mode",
+        ] {
+            assert!(refusal(Dialect::MySql, text).is_some(), "{text}");
+        }
+        assert!(refusal(Dialect::Sqlite, "BEGIN IMMEDIATE").is_some());
+    }
+
+    #[test]
+    fn unterminated_names_are_not_refused_or_a_panic() {
+        assert_eq!(refusal(Dialect::MySql, "SELECT `ë"), None);
+    }
+
+    #[test]
+    fn look_alikes_are_allowed() {
+        for (dialect, text) in [
+            (Dialect::Postgres, "SELECT 'COMMIT'"),
+            (Dialect::Postgres, "SELECT end_date FROM t"),
+            (Dialect::Postgres, "SET search_path = public"),
+            (Dialect::Postgres, "SELECT 1 -- COMMIT"),
+            (Dialect::Postgres, "WITH x AS (SELECT 1) SELECT * FROM x"),
+            (Dialect::MySql, r#"SELECT "into outfile""#),
+            (Dialect::MySql, "SET time_zone = '+00:00'"),
+            (Dialect::MySql, "SELECT * FROM users"),
+            (Dialect::Sqlite, "PRAGMA table_info(users)"),
+            (Dialect::Sqlite, "SELECT * FROM `call`"),
+        ] {
+            assert_eq!(refusal(dialect, text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn more_spellings_of_the_same_statements_are_refused() {
+        for text in [
+            "ROLLBACK PREPARED 'x'",
+            "SET SESSION TRANSACTION READ WRITE",
+            "SET LOCAL transaction_read_only = off",
+            "RESET character_set_client",
+            "RESET client_encoding",
+            "RESET \"standard_conforming_strings\"",
+            "  -- note\n  END",
+            "set U&\"x\" = 1",
+        ] {
+            assert!(refusal(Dialect::Postgres, text).is_some(), "{text}");
+        }
+        for text in [
+            "SET CHARSET utf8mb4",
+            "SET @@global.sql_mode = ''",
+            "SET SESSION sql_mode = ''",
+            "SET @a = 1, @@autocommit = 1",
+            "set `character_set_results` = NULL",
+            "COMMIT",
+            "SELECT 1 INTO\nOUTFILE '/tmp/x'",
+            "SELECT 1 INTO /* x */ DUMPFILE '/tmp/x'",
+        ] {
+            assert!(refusal(Dialect::MySql, text).is_some(), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_statement() {
+        assert_eq!(
+            refusal(Dialect::Postgres, "commit").as_deref(),
+            Some("COMMIT")
+        );
+        assert_eq!(
+            refusal(Dialect::MySql, "SELECT 1 INTO OUTFILE 'x'").as_deref(),
+            Some("INTO OUTFILE")
+        );
+        assert_eq!(
+            refusal(Dialect::Postgres, "SET client_encoding = 'x'").as_deref(),
+            Some("SET CLIENT_ENCODING")
+        );
+    }
+
+    #[test]
+    fn dialect_specific_refusals_stay_in_their_dialect() {
+        // `/*!` is an ordinary comment outside MySQL; COPY and CALL are
+        // ordinary names or other statements elsewhere.
+        assert_eq!(refusal(Dialect::Postgres, "SELECT 1 /*! , 2 */"), None);
+        assert_eq!(refusal(Dialect::Sqlite, "SELECT 1 /*! , 2 */"), None);
+        assert_eq!(refusal(Dialect::MySql, "SELECT set_config FROM t"), None);
+        assert_eq!(refusal(Dialect::Sqlite, "SELECT * FROM copy"), None);
+        assert_eq!(
+            refusal(Dialect::MySql, "SELECT 'x' AS `into`, outfile FROM t"),
+            None
+        );
+    }
+
+    #[test]
+    fn odd_text_never_panics_the_guard() {
+        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            for text in [
+                "",
+                "U",
+                "U&",
+                "U&\"",
+                "SET U&\"ë",
+                "set `ë",
+                "/*!",
+                "/*M!",
+                "SET",
+                "RESET",
+                "SET ë",
+                "'ë",
+                "$$ë",
+                "[ë",
+                "SELECT 1 INTO",
+            ] {
+                let _ = refusal(dialect, text);
+            }
+        }
+    }
+
+    #[test]
+    fn every_assignment_of_a_set_is_checked() {
+        for (dialect, text) in [
+            (Dialect::MySql, "SET @a = 1, NAMES gbk"),
+            (
+                Dialect::MySql,
+                "SET time_zone = '+00:00', CHARACTER SET gbk",
+            ),
+            (Dialect::MySql, "SET @a = 1, CHARSET gbk"),
+            (Dialect::Postgres, "SET SESSION NAMES 'SJIS'"),
+            (Dialect::Postgres, "SET LOCAL NAMES 'SJIS'"),
+            (Dialect::MySql, "SET @a = (1, 2), GLOBAL NAMES gbk"),
+        ] {
+            assert!(refusal(dialect, text).is_some(), "{text}");
+        }
+        assert_eq!(
+            refusal(Dialect::MySql, "SET @a = 1, CHARSET gbk").as_deref(),
+            Some("SET CHARSET")
+        );
+        assert_eq!(
+            refusal(Dialect::MySql, "SET CHARACTER SET gbk").as_deref(),
+            Some("SET CHARACTER SET")
+        );
+        assert_eq!(
+            refusal(Dialect::MySql, "SET NAMES gbk").as_deref(),
+            Some("SET NAMES")
+        );
+        // Commas inside parentheses do not start an assignment.
+        assert_eq!(refusal(Dialect::MySql, "SET @a = f(1, 2), @b = 3"), None);
+    }
+
+    #[test]
+    fn a_u_and_name_is_refused_in_any_postgres_statement() {
+        for text in [
+            r#"SELECT U&"set\005fconfig"('x', 'y', false)"#,
+            r#"SELECT u&"a" FROM t"#,
+            r#"SET U&"x" = 1"#,
+            r#"RESET U&"x""#,
+        ] {
+            assert_eq!(
+                refusal(Dialect::Postgres, text).as_deref(),
+                Some("a U& name"),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            refusal(Dialect::Postgres, r"SELECT U&'d\0061t\+000061'"),
+            None
+        );
+        assert_eq!(refusal(Dialect::Postgres, "SELECT a & b FROM t"), None);
+    }
+
+    #[test]
+    fn create_or_replace_user_and_role_are_refused() {
+        for text in ["CREATE OR REPLACE USER x", "CREATE OR REPLACE ROLE r"] {
+            assert!(refusal(Dialect::MySql, text).is_some(), "{text}");
+        }
+        assert_eq!(
+            refusal(Dialect::MySql, "create or replace user x").as_deref(),
+            Some("CREATE USER")
+        );
+        assert_eq!(
+            refusal(Dialect::MySql, "CREATE OR REPLACE VIEW v AS SELECT 1"),
+            None
+        );
+    }
+
+    #[test]
+    fn prepared_sql_and_server_state_are_refused() {
+        for (dialect, text) in [
+            (Dialect::Postgres, "PREPARE s AS SELECT 1"),
+            (Dialect::Postgres, "EXECUTE s"),
+            (Dialect::Postgres, "DEALLOCATE ALL"),
+            (Dialect::MySql, "PREPARE s FROM 'SELECT 1'"),
+            (Dialect::MySql, "EXECUTE s"),
+            (Dialect::MySql, "EXECUTE IMMEDIATE 'SELECT 1'"),
+            (Dialect::MySql, "DEALLOCATE PREPARE s"),
+            (Dialect::MySql, "SET PERSIST max_connections = 1"),
+            (Dialect::MySql, "SET PERSIST_ONLY max_connections = 1"),
+            (Dialect::MySql, "SET GLOBAL general_log_file = 'x'"),
+            (Dialect::MySql, "SET @@global.x = 1"),
+            (Dialect::MySql, "SET @@persist.x = 1"),
+            (Dialect::MySql, "RESET MASTER"),
+            (Dialect::MySql, "RESET PERSIST"),
+            (Dialect::MySql, "RESET REPLICA"),
+            (Dialect::MySql, "PURGE BINARY LOGS TO 'x'"),
+            (
+                Dialect::MySql,
+                "CHANGE REPLICATION SOURCE TO SOURCE_HOST='x'",
+            ),
+            (Dialect::MySql, "CHANGE MASTER TO MASTER_HOST='x'"),
+            (Dialect::MySql, "STOP REPLICA"),
+            (Dialect::MySql, "SHUTDOWN"),
+            (Dialect::MySql, "RESTART"),
+            (Dialect::MySql, "CLONE LOCAL DATA DIRECTORY = '/tmp/x'"),
+        ] {
+            assert!(refusal(dialect, text).is_some(), "{text}");
+        }
+        // KILL stays allowed: an accepted side effect.
+        assert_eq!(refusal(Dialect::MySql, "KILL QUERY 4"), None);
+        // PostgreSQL's own PREPARE TRANSACTION keeps its name.
+        assert_eq!(
+            refusal(Dialect::Postgres, "PREPARE TRANSACTION 'x'").as_deref(),
+            Some("PREPARE TRANSACTION")
+        );
+        // MySQL's SET GLOBAL is MySQL's; PostgreSQL has no such scope.
+        assert_eq!(refusal(Dialect::Postgres, "SET search_path = global"), None);
+    }
+
+    #[test]
+    fn refusal_messages_name_what_was_refused() {
+        for (dialect, text, what) in [
+            (
+                Dialect::Postgres,
+                "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+                "SET SESSION CHARACTERISTICS",
+            ),
+            (Dialect::MySql, "RESET sql_mode", "RESET SQL_MODE"),
+            (Dialect::Postgres, "RESET sql_mode", "RESET SQL_MODE"),
+            (Dialect::Postgres, "RESET ALL", "RESET ALL"),
+            (Dialect::Postgres, "PREPARE s AS SELECT 1", "PREPARE"),
+            (Dialect::MySql, "SET GLOBAL x = 1", "SET GLOBAL"),
+            (Dialect::MySql, "RESET MASTER", "RESET MASTER"),
+        ] {
+            assert_eq!(refusal(dialect, text).as_deref(), Some(what), "{text}");
+        }
+    }
+
+    #[test]
+    fn set_statement_wraps_nothing_past_the_guard() {
+        for text in [
+            "SET STATEMENT max_statement_time=0 FOR COMMIT",
+            "SET STATEMENT max_statement_time=0 FOR ROLLBACK",
+            "SET STATEMENT max_statement_time=0 FOR GRANT ALL ON *.* TO x",
+            "SET STATEMENT max_statement_time=0 FOR CALL p()",
+            "SET STATEMENT max_statement_time=0 FOR EXECUTE IMMEDIATE 'COMMIT'",
+            "set /* x */ statement a=1 for commit",
+        ] {
+            assert_eq!(
+                refusal(Dialect::MySql, text).as_deref(),
+                Some("SET STATEMENT"),
+                "{text}"
+            );
+        }
+        // Only the token right after SET counts.
+        assert_eq!(refusal(Dialect::MySql, "SET @statement = 1"), None);
+        assert_eq!(refusal(Dialect::MySql, "SET time_zone = 'statement'"), None);
+    }
+
+    #[test]
+    fn the_last_mysql_server_statements_are_refused() {
+        for (text, what) in [
+            ("DROP PREPARE s", "DROP PREPARE"),
+            ("ALTER INSTANCE ROTATE INNODB MASTER KEY", "ALTER INSTANCE"),
+            ("BACKUP STAGE START", "BACKUP"),
+            ("BACKUP LOCK db.t", "BACKUP"),
+        ] {
+            assert_eq!(
+                refusal(Dialect::MySql, text).as_deref(),
+                Some(what),
+                "{text}"
+            );
+        }
+        assert_eq!(refusal(Dialect::MySql, "SELECT backup FROM t"), None);
+        assert_eq!(refusal(Dialect::Postgres, "DROP PREPARE s"), None);
+    }
+
+    #[test]
+    fn completion_type_is_a_guarded_setting() {
+        for text in [
+            "SET SESSION completion_type = 2",
+            "SET completion_type = RELEASE",
+            "set @@session.`completion_type` = 'CHAIN'",
+            "SET @a = 1, @@completion_type = 1",
+            "SET LOCAL completion_type = DEFAULT",
+        ] {
+            assert_eq!(
+                refusal(Dialect::MySql, text).as_deref(),
+                Some("SET COMPLETION_TYPE"),
+                "{text}"
+            );
+        }
+        // Reading it, or a name like it, is fine.
+        for text in [
+            "SELECT @@session.completion_type",
+            "SET @completion = 'completion_type'",
+            "SHOW VARIABLES LIKE 'completion_type'",
+        ] {
+            assert_eq!(refusal(Dialect::MySql, text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn use_is_refused_on_mysql() {
+        for text in ["USE other", "use `other`", "-- note\n  Use other", "USE"] {
+            assert_eq!(
+                refusal(Dialect::MySql, text).as_deref(),
+                Some("USE"),
+                "{text}"
+            );
+        }
+        // A column or a table of that name is a name.
+        for text in [
+            "SELECT `use` FROM t",
+            "SELECT * FROM `use`",
+            "SELECT t.`use`, 'USE other' FROM `use` AS t",
+            "SELECT * FROM t USE INDEX (i)",
+            "EXPLAIN SELECT `use` FROM `use`",
+        ] {
+            assert_eq!(refusal(Dialect::MySql, text), None, "{text}");
+        }
+        // Not a statement of the others.
+        assert_eq!(refusal(Dialect::Postgres, "USE other"), None);
+        assert_eq!(refusal(Dialect::Sqlite, "USE other"), None);
+    }
+
+    #[test]
+    fn sqlite_refuses_setting_the_pragmas_that_keep_a_handle_from_writing() {
+        for refused in [
+            "PRAGMA query_only = OFF",
+            "pragma Query_Only=0",
+            "PRAGMA query_only(0)",
+            "PRAGMA main.query_only = 0",
+            "PRAGMA \"query_only\" = 0",
+            "PRAGMA 'query_only' = 0",
+            "PRAGMA `query_only` = 0",
+            "PRAGMA [query_only] = 0",
+            "PRAGMA main.'query_only'(0)",
+            "PRAGMA 'main'.\"query_only\" = 0",
+            "PRAGMA /* x */ query_only /* y */ = 0",
+            "PRAGMA writable_schema = ON",
+            "PRAGMA 'writable_schema'(1)",
+            // Not a form SQLite takes, and refused all the same.
+            "PRAGMA query_only OFF",
+            // SQLite applies a flag pragma when it prepares the statement,
+            // so EXPLAIN in front does not make it harmless.
+            "EXPLAIN PRAGMA query_only = OFF",
+            "explain query plan PRAGMA 'query_only'(0)",
+            // SQLite reads a byte-order mark in front of a token as a space.
+            "\u{feff}PRAGMA query_only = 0",
+            "PRAGMA \u{feff}query_only = 0",
+        ] {
+            assert!(refusal(Dialect::Sqlite, refused).is_some(), "{refused}");
+        }
+        assert_eq!(
+            refusal(Dialect::Sqlite, "PRAGMA 'query_only' = 0").as_deref(),
+            Some("PRAGMA QUERY_ONLY")
+        );
+        // Reading one is fine, and so is every other pragma.
+        for allowed in [
+            "PRAGMA query_only",
+            "PRAGMA main.query_only",
+            "PRAGMA 'query_only'",
+            "PRAGMA table_info(users)",
+            "PRAGMA foreign_keys = ON",
+            "SELECT 'PRAGMA query_only = OFF'",
+            "SELECT query_only FROM settings",
+            "EXPLAIN SELECT 1",
+            "EXPLAIN PRAGMA query_only",
+        ] {
+            assert_eq!(refusal(Dialect::Sqlite, allowed), None, "{allowed}");
+        }
+    }
+
+    #[test]
+    fn sqlite_refuses_a_statement_behind_a_byte_order_mark() {
+        assert_eq!(
+            refusal(Dialect::Sqlite, "\u{feff}COMMIT").as_deref(),
+            Some("COMMIT")
+        );
+    }
+
+    #[test]
+    fn sqlite_refuses_a_checkpoint_in_every_form() {
+        // The bare form checkpoints too: there is nothing to only read.
+        for refused in [
+            "PRAGMA wal_checkpoint",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            "PRAGMA main.wal_checkpoint",
+            "PRAGMA 'wal_checkpoint'",
+            "EXPLAIN PRAGMA wal_checkpoint",
+        ] {
+            assert_eq!(
+                refusal(Dialect::Sqlite, refused).as_deref(),
+                Some("PRAGMA WAL_CHECKPOINT"),
+                "{refused}"
+            );
+        }
+        // A setting of its own, and not a checkpoint.
+        assert_eq!(refusal(Dialect::Sqlite, "PRAGMA wal_autocheckpoint"), None);
+    }
+
+    #[test]
+    fn the_keywords_of_a_dialect_are_the_ones_it_highlights() {
+        let mysql: Vec<&str> = keywords(Dialect::MySql).collect();
+        assert!(mysql.contains(&"SELECT") && mysql.contains(&"REGEXP"));
+        assert!(!mysql.contains(&"ILIKE"));
+        // Shared words, each dialect's own, and no word twice.
+        for (dialect, own) in [
+            (Dialect::Postgres, "ILIKE"),
+            (Dialect::MySql, "REGEXP"),
+            (Dialect::Sqlite, "PRAGMA"),
+        ] {
+            let words: Vec<&str> = keywords(dialect).collect();
+            assert!(
+                words.contains(&"WHERE") && words.contains(&own),
+                "{dialect:?}"
+            );
+            for word in &words {
+                assert_eq!(*word, word.to_ascii_uppercase());
+                assert_eq!(
+                    words.iter().filter(|other| *other == word).count(),
+                    1,
+                    "{dialect:?}: {word}"
+                );
+            }
+        }
+        // Each list is kept in alphabetical order.
+        for words in [KEYWORDS, POSTGRES_KEYWORDS, MYSQL_KEYWORDS, SQLITE_KEYWORDS] {
+            assert!(words.is_sorted(), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn the_words_that_end_a_clause_are_keywords() {
+        // A whole word the list does not know is completed to a name that
+        // only starts like it: `NULLS LAST` to `last_name`.
+        let words = [
+            "FOLLOWING",
+            "LAST",
+            "LOCKED",
+            "NOTHING",
+            "NOWAIT",
+            "NULLS",
+            "PRECEDING",
+            "ROW",
+            "SKIP",
+            "UNBOUNDED",
+        ];
+        for dialect in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            for word in words {
+                assert!(is_keyword(dialect, word), "{dialect:?}: {word}");
+                assert!(
+                    is_keyword(dialect, &word.to_ascii_lowercase()),
+                    "{dialect:?}: {word}"
+                );
+            }
+        }
+        use TokenKind::{Identifier, Keyword};
+        assert_eq!(
+            kinds(
+                Dialect::Postgres,
+                "ORDER BY created_at DESC NULLS LAST FOR UPDATE SKIP LOCKED"
+            ),
+            vec![
+                (Keyword, "ORDER"),
+                (Keyword, "BY"),
+                (Identifier, "created_at"),
+                (Keyword, "DESC"),
+                (Keyword, "NULLS"),
+                (Keyword, "LAST"),
+                (Keyword, "FOR"),
+                (Keyword, "UPDATE"),
+                (Keyword, "SKIP"),
+                (Keyword, "LOCKED"),
+            ]
+        );
+        // A name that only starts like one is still a name.
+        assert_eq!(
+            kinds(Dialect::Postgres, "last_name locked_at rows_read"),
+            vec![
+                (Identifier, "last_name"),
+                (Identifier, "locked_at"),
+                (Identifier, "rows_read"),
+            ]
+        );
+    }
+
+    const DIALECTS: [Dialect; 3] = [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite];
+
+    #[test]
+    fn a_statement_that_only_reads_is_a_read() {
+        for dialect in DIALECTS {
+            for text in [
+                "SELECT * FROM books",
+                "select 1",
+                "-- a note\nSELECT 1",
+                "VALUES (1), (2)",
+                "TABLE books",
+                "WITH recent AS (SELECT 1) SELECT * FROM recent",
+                "(SELECT 1) UNION (SELECT 2)",
+                "SHOW search_path",
+                "EXPLAIN SELECT * FROM books",
+                "DESCRIBE books",
+                "DESC books",
+                // Nothing to run.
+                "",
+                "-- only a comment",
+            ] {
+                assert_eq!(
+                    kind(dialect, text),
+                    StatementKind::Read,
+                    "{dialect:?} {text}"
+                );
+            }
+        }
+        // A statement in SQLite only.
+        let pragma = "PRAGMA table_info(books)";
+        assert_eq!(kind(Dialect::Sqlite, pragma), StatementKind::Read);
+        assert_eq!(kind(Dialect::Postgres, pragma), StatementKind::Write);
+        assert_eq!(kind(Dialect::MySql, pragma), StatementKind::Write);
+    }
+
+    #[test]
+    fn everything_else_is_a_write() {
+        for dialect in DIALECTS {
+            for text in [
+                "INSERT INTO books VALUES (1)",
+                "update books set title = 'x'",
+                "DELETE FROM books",
+                "MERGE INTO books USING drafts ON books.id = drafts.id WHEN MATCHED THEN DELETE",
+                "REPLACE INTO books VALUES (1)",
+                "CREATE TABLE notes (id int)",
+                "DROP TABLE books",
+                "TRUNCATE books",
+                "CALL refill()",
+                "SET search_path = shop",
+                "VACUUM",
+                "ANALYZE books",
+                "GRANT SELECT ON books TO reader",
+                "/* first */ DELETE FROM books",
+            ] {
+                assert_eq!(
+                    kind(dialect, text),
+                    StatementKind::Write,
+                    "{dialect:?} {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_statement_that_defines_something_changes_the_catalog() {
+        for dialect in DIALECTS {
+            for text in [
+                "CREATE TABLE notes (id int)",
+                "create view cheap as select * from books",
+                "DROP TABLE books",
+                "drop table if exists books",
+                "ALTER TABLE books ADD COLUMN pages int",
+                "CREATE INDEX books_title ON books (title)",
+                "-- a new one\nCREATE TABLE notes (id int)",
+                "/* gone */ DROP VIEW cheap",
+            ] {
+                assert!(changes_catalog(dialect, text), "{dialect:?} {text}");
+            }
+            for text in [
+                "SELECT * FROM books",
+                "INSERT INTO books VALUES (1)",
+                "UPDATE books SET title = 'create'",
+                "DELETE FROM books",
+                "TRUNCATE books",
+                "SELECT 'DROP TABLE books'",
+                "-- DROP TABLE books",
+                "",
+            ] {
+                assert!(!changes_catalog(dialect, text), "{dialect:?} {text}");
+            }
+        }
+        assert!(changes_catalog(
+            Dialect::MySql,
+            "RENAME TABLE books TO tomes"
+        ));
+        assert!(changes_catalog(
+            Dialect::MySql,
+            "/*!40101 CREATE TABLE t (id int) */"
+        ));
+        // SQLite adds and removes a schema with these.
+        for text in ["ATTACH DATABASE 'shop.db' AS shop", "DETACH shop"] {
+            assert!(changes_catalog(Dialect::Sqlite, text), "{text}");
+            assert!(!changes_catalog(Dialect::Postgres, text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_query_that_holds_a_data_changing_word_is_a_write() {
+        for dialect in DIALECTS {
+            for text in [
+                "WITH gone AS (DELETE FROM books RETURNING *) SELECT * FROM gone",
+                "WITH s AS (SELECT 1) INSERT INTO books SELECT * FROM s",
+                "SELECT * FROM books FOR UPDATE",
+                // Erring toward a write: a bare name, a function.
+                "SELECT * FROM books WHERE update = 1",
+                "SELECT insert('abc', 1, 1, 'x')",
+                "select merge from books",
+            ] {
+                assert_eq!(
+                    kind(dialect, text),
+                    StatementKind::Write,
+                    "{dialect:?} {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn data_changing_words_in_strings_comments_and_quoted_names_do_not_count() {
+        for dialect in DIALECTS {
+            for text in [
+                "SELECT 'DELETE FROM books'",
+                "SELECT 1 -- then UPDATE it",
+                "SELECT /* INSERT */ 1",
+                "SELECT replace(title, 'a', 'b') FROM books",
+                "SELECT deleted_at, updated_by FROM books",
+            ] {
+                assert_eq!(
+                    kind(dialect, text),
+                    StatementKind::Read,
+                    "{dialect:?} {text}"
+                );
+            }
+        }
+        for (dialect, text) in [
+            (Dialect::Postgres, "SELECT \"update\" FROM books"),
+            (
+                Dialect::Sqlite,
+                "SELECT \"update\", [delete], `insert` FROM books",
+            ),
+            (Dialect::MySql, "SELECT `delete` FROM books"),
+            (Dialect::MySql, "SELECT \"MERGE\""),
+            (Dialect::Postgres, "SELECT $$ MERGE INTO books $$"),
+        ] {
+            assert_eq!(
+                kind(dialect, text),
+                StatementKind::Read,
+                "{dialect:?} {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explain_is_a_write_only_when_it_runs_a_data_change() {
+        for dialect in DIALECTS {
+            for text in [
+                "EXPLAIN DELETE FROM books",
+                "EXPLAIN UPDATE books SET title = 'x'",
+                "explain insert into books values (1)",
+                "EXPLAIN ANALYZE SELECT * FROM books",
+                "EXPLAIN (ANALYZE, BUFFERS) SELECT 1",
+                "EXPLAIN QUERY PLAN DELETE FROM books",
+                "DESCRIBE UPDATE books SET title = 'x'",
+                "DESC DELETE FROM books",
+            ] {
+                assert_eq!(
+                    kind(dialect, text),
+                    StatementKind::Read,
+                    "{dialect:?} {text}"
+                );
+            }
+            for text in [
+                "EXPLAIN ANALYZE DELETE FROM books",
+                "EXPLAIN (ANALYZE) DELETE FROM books",
+                "EXPLAIN ANALYSE DELETE FROM books",
+                "explain analyze verbose update books set title = 'x'",
+                "EXPLAIN (ANALYZE, BUFFERS) INSERT INTO books VALUES (1)",
+                "DESC ANALYZE DELETE FROM books",
+            ] {
+                assert_eq!(
+                    kind(dialect, text),
+                    StatementKind::Write,
+                    "{dialect:?} {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_mysql_executable_comment_makes_a_write() {
+        let text = "SELECT 1 /*! , sleep(1) */";
+        assert_eq!(kind(Dialect::MySql, text), StatementKind::Write);
+        // Elsewhere it is a comment like any other.
+        assert_eq!(kind(Dialect::Postgres, text), StatementKind::Read);
+        assert_eq!(kind(Dialect::Sqlite, text), StatementKind::Read);
+    }
+
+    #[test]
+    fn odd_text_never_panics_the_kind() {
+        for dialect in DIALECTS {
+            for text in [
+                "(", ")", "'", "\"", "/*", "é", ";", "((((", "EXPLAIN", "WITH",
+            ] {
+                let _ = kind(dialect, text);
+            }
+        }
+    }
+
+    #[test]
+    fn an_update_or_delete_without_a_where_is_unbounded() {
+        for dialect in DIALECTS {
+            for (text, verb) in [
+                ("UPDATE books SET title = 'x'", Verb::Update),
+                ("delete from books", Verb::Delete),
+                ("DELETE FROM books -- WHERE id = 1", Verb::Delete),
+                ("UPDATE books SET title = 'WHERE id = 1'", Verb::Update),
+                // A WHERE of a subquery bounds the subquery.
+                (
+                    "UPDATE books SET title = (SELECT name FROM drafts WHERE drafts.id = books.id)",
+                    Verb::Update,
+                ),
+                ("DELETE FROM books ORDER BY id", Verb::Delete),
+                // A LIMIT of a subquery bounds the subquery.
+                (
+                    "UPDATE books SET title = (SELECT name FROM drafts LIMIT 1)",
+                    Verb::Update,
+                ),
+                (
+                    "WITH old AS (SELECT id FROM books WHERE id < 5) DELETE FROM books",
+                    Verb::Delete,
+                ),
+                (
+                    "WITH old AS (SELECT 1) UPDATE books SET title = 'x'",
+                    Verb::Update,
+                ),
+                // It runs the statement behind it.
+                ("EXPLAIN ANALYZE DELETE FROM books", Verb::Delete),
+                ("EXPLAIN ANALYSE DELETE FROM books", Verb::Delete),
+                (
+                    "EXPLAIN (ANALYZE, BUFFERS) UPDATE books SET title = 'x'",
+                    Verb::Update,
+                ),
+            ] {
+                assert_eq!(unbounded(dialect, text), Some(verb), "{dialect:?} {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_where_outside_parentheses_bounds_the_statement() {
+        for dialect in DIALECTS {
+            for text in [
+                "UPDATE books SET title = 'x' WHERE id = 1",
+                "delete from books where id = 1",
+                "DELETE FROM books WHERE id IN (SELECT book_id FROM drafts)",
+                "UPDATE books SET title = 'x' WHERE CURRENT OF pick",
+                // A LIMIT of its own bounds it too.
+                "DELETE FROM books ORDER BY id LIMIT 5",
+                "UPDATE books SET title = 'x' LIMIT 1",
+                "WITH old AS (SELECT 1) DELETE FROM books WHERE id = 1",
+                "EXPLAIN ANALYZE DELETE FROM books WHERE id = 1",
+            ] {
+                assert_eq!(unbounded(dialect, text), None, "{dialect:?} {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_an_update_or_a_delete_is_ever_unbounded() {
+        for dialect in DIALECTS {
+            for text in [
+                "SELECT * FROM books",
+                "SELECT * FROM books FOR UPDATE",
+                "WITH x AS (SELECT 1) SELECT * FROM x FOR UPDATE",
+                "INSERT INTO books VALUES (1)",
+                "INSERT INTO books VALUES (1) ON CONFLICT (id) DO UPDATE SET title = 'x'",
+                "INSERT INTO books VALUES (1) ON DUPLICATE KEY UPDATE title = 'x'",
+                "WITH s AS (SELECT 1) INSERT INTO books SELECT * FROM s ON CONFLICT (id) DO UPDATE SET title = 'x'",
+                "MERGE INTO books USING drafts ON books.id = drafts.id WHEN MATCHED THEN UPDATE SET title = 'x'",
+                "TRUNCATE books",
+                "DROP TABLE books",
+                // Nothing runs.
+                "EXPLAIN DELETE FROM books",
+                "",
+                "-- DELETE FROM books",
+            ] {
+                assert_eq!(unbounded(dialect, text), None, "{dialect:?} {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn odd_text_never_panics_the_unbounded_check() {
+        for dialect in DIALECTS {
+            for text in [
+                "(",
+                ")",
+                ")))",
+                "'",
+                "/*",
+                "é",
+                "UPDATE",
+                "DELETE (",
+                "WITH",
+                "EXPLAIN ANALYZE",
+            ] {
+                let _ = unbounded(dialect, text);
+            }
+        }
+        assert_eq!(unbounded(Dialect::Postgres, "UPDATE"), Some(Verb::Update));
+    }
+
+    fn table(schema: Option<&str>, name: &str) -> NamedTable {
+        NamedTable {
+            schema: schema.map(str::to_owned),
+            name: name.to_owned(),
+            quoted: false,
+        }
+    }
+
+    fn quoted(schema: Option<&str>, name: &str) -> NamedTable {
+        NamedTable {
+            quoted: true,
+            ..table(schema, name)
+        }
+    }
+
+    #[test]
+    fn every_row_names_the_verb_and_the_tables_after_it() {
+        let reach = |dialect, text| every_row(dialect, text).expect(text);
+        for dialect in DIALECTS {
+            for (text, verb, tables) in [
+                (
+                    "UPDATE book_covers SET kind = 'ebook'",
+                    Verb::Update,
+                    vec![table(None, "book_covers")],
+                ),
+                (
+                    "update public.book_covers as c set kind = 'x'",
+                    Verb::Update,
+                    vec![table(Some("public"), "book_covers")],
+                ),
+                (
+                    "DELETE FROM book_covers b ORDER BY id",
+                    Verb::Delete,
+                    vec![table(None, "book_covers")],
+                ),
+                (
+                    "WITH old AS (SELECT id FROM covers WHERE id < 5) DELETE FROM books",
+                    Verb::Delete,
+                    vec![table(None, "books")],
+                ),
+                (
+                    "EXPLAIN ANALYZE DELETE FROM /* all */ books",
+                    Verb::Delete,
+                    vec![table(None, "books")],
+                ),
+                // Unreadable: the question names no table.
+                ("UPDATE", Verb::Update, vec![]),
+                ("DELETE FROM (", Verb::Delete, vec![]),
+            ] {
+                let found = reach(dialect, text);
+                assert_eq!(
+                    (found.verb, found.tables),
+                    (verb, tables),
+                    "{dialect:?} {text}"
+                );
+            }
+        }
+        // Each dialect's quotes, and its own words before the table.
+        let pg = reach(
+            Dialect::Postgres,
+            r#"UPDATE ONLY "Book ""Covers""" * SET a = 1"#,
+        );
+        assert_eq!(pg.tables, vec![quoted(None, r#"Book "Covers""#)]);
+        let mysql = reach(
+            Dialect::MySql,
+            "DELETE LOW_PRIORITY QUICK IGNORE FROM `shop`.`books`",
+        );
+        assert_eq!(mysql.tables, vec![quoted(Some("shop"), "books")]);
+        let sqlite = reach(Dialect::Sqlite, "UPDATE OR REPLACE [books] SET a = 1");
+        assert_eq!(sqlite.tables, vec![quoted(None, "books")]);
+        // A name of three parts: the last two are the schema and the table.
+        let three = reach(Dialect::Postgres, "DELETE FROM shop.public.books");
+        assert_eq!(three.tables, vec![table(Some("public"), "books")]);
+        // MySQL's statements of several tables: the ones the verb names,
+        // by the tables their aliases stand for.
+        let several = reach(Dialect::MySql, "UPDATE books b, covers c SET b.a = c.a");
+        assert_eq!(
+            several.tables,
+            vec![table(None, "books"), table(None, "covers")]
+        );
+        let targets = reach(Dialect::MySql, "DELETE b, c FROM shop.books AS b, covers c");
+        assert_eq!(
+            targets.tables,
+            vec![table(Some("shop"), "books"), table(None, "covers")]
+        );
+        let using = reach(Dialect::MySql, "DELETE FROM b USING books b");
+        assert_eq!(using.tables, vec![table(None, "books")]);
+        // A WITH's own DELETE or UPDATE runs whatever reads it.
+        let cte = reach(
+            Dialect::Postgres,
+            "WITH d AS (DELETE FROM books RETURNING *) SELECT count(*) FROM d",
+        );
+        assert_eq!(
+            (cte.verb, cte.tables),
+            (Verb::Delete, vec![table(None, "books")])
+        );
+        let logged = reach(
+            Dialect::Postgres,
+            "WITH u AS (UPDATE books SET a = 1 RETURNING id) INSERT INTO log SELECT id FROM u",
+        );
+        assert_eq!(logged.verb, Verb::Update);
+    }
+
+    #[test]
+    fn a_truncate_always_reaches_every_row_where_the_dialect_has_one() {
+        let pg = every_row(
+            Dialect::Postgres,
+            "TRUNCATE TABLE ONLY books, ONLY public.covers *, books RESTART IDENTITY",
+        );
+        // Each table once.
+        assert_eq!(
+            pg,
+            Some(EveryRow {
+                verb: Verb::Truncate,
+                tables: vec![table(None, "books"), table(Some("public"), "covers")],
+            })
+        );
+        let mysql = every_row(Dialect::MySql, "-- empty it\ntruncate `books`");
+        assert_eq!(
+            mysql.map(|found| found.tables),
+            Some(vec![quoted(None, "books")])
+        );
+        // SQLite has no TRUNCATE: the database refuses the word.
+        assert_eq!(every_row(Dialect::Sqlite, "TRUNCATE books"), None);
+        // `unbounded` still names UPDATE and DELETE alone.
+        assert_eq!(unbounded(Dialect::Postgres, "TRUNCATE books"), None);
+    }
+
+    #[test]
+    fn a_bounded_statement_and_a_read_reach_no_row_of_every_row() {
+        for dialect in DIALECTS {
+            for text in [
+                "UPDATE books SET title = 'x' WHERE id = 1",
+                "DELETE FROM books WHERE id IN (SELECT book_id FROM drafts)",
+                "SELECT * FROM books FOR UPDATE",
+                "INSERT INTO books VALUES (1) ON CONFLICT (id) DO UPDATE SET title = 'x'",
+                "SELECT 'TRUNCATE books'",
+                "-- TRUNCATE books",
+                "EXPLAIN DELETE FROM books",
+                // A LIMIT bounds it as a WHERE does.
+                "DELETE FROM logs LIMIT 1000",
+                // A WITH's DELETE with a WHERE of its own.
+                "WITH d AS (DELETE FROM books WHERE id = 1 RETURNING *) SELECT * FROM d",
+                "",
+            ] {
+                assert_eq!(every_row(dialect, text), None, "{dialect:?} {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_mysql_inner_join_with_the_target_bounds_by_its_on() {
+        // MySQL's statements of several tables, whose target is a side of
+        // an inner join: only the rows that match.
+        for text in [
+            "UPDATE books JOIN covers ON books.id = covers.book_id SET a = 1",
+            "DELETE b FROM books b JOIN covers c ON b.id = c.book_id",
+            "DELETE b FROM books b INNER JOIN covers c ON b.id = c.book_id",
+            // Several targets before the FROM; the FROM's own list joins.
+            "DELETE b, c FROM books b JOIN covers c ON b.id = c.book_id",
+            // Commas after SET are its own.
+            "UPDATE books b JOIN covers c ON b.id = c.book_id SET b.a = 1, b.b = 2",
+        ] {
+            assert_eq!(every_row(Dialect::MySql, text), None, "{text}");
+        }
+        // A LEFT or a RIGHT join keeps every row of a side: the orphan
+        // cleanup with its WHERE left out deletes every book.
+        for text in [
+            "DELETE b FROM books b LEFT JOIN covers c ON b.id = c.book_id",
+            "DELETE b FROM books b LEFT OUTER JOIN covers c ON b.id = c.book_id",
+            "UPDATE books b RIGHT JOIN covers c ON b.id = c.book_id SET b.a = c.a",
+            // The join is of the tables after a comma: books is crossed
+            // with it.
+            "UPDATE books b, covers c JOIN shelves s ON s.id = c.shelf_id SET b.a = 1",
+            "DELETE b FROM books b, covers c JOIN shelves s ON s.id = c.shelf_id",
+            // Or after it.
+            "UPDATE covers c JOIN shelves s ON s.id = c.shelf_id, books b SET b.a = 1",
+            "DELETE b FROM covers c JOIN shelves s ON s.id = c.shelf_id, books b",
+        ] {
+            assert!(every_row(Dialect::MySql, text).is_some(), "{text}");
+        }
+        // On PostgreSQL and SQLite a join stands in the FROM or the USING,
+        // and its ON does not touch the target: every row of it.
+        for dialect in [Dialect::Postgres, Dialect::Sqlite] {
+            for text in [
+                "UPDATE books SET price = p.price FROM prices p JOIN regions r ON r.id = p.region_id",
+                "DELETE FROM books USING covers c JOIN shelves s ON s.id = c.shelf_id",
+            ] {
+                let found = every_row(dialect, text).expect(text);
+                assert_eq!(
+                    found.tables,
+                    vec![table(None, "books")],
+                    "{dialect:?} {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn odd_text_never_panics_the_every_row_check() {
+        for dialect in DIALECTS {
+            for text in [
+                "UPDATE .",
+                "UPDATE a.",
+                "UPDATE a AS",
+                "TRUNCATE ,",
+                "TRUNCATE a,",
+                "DELETE OR",
+                "UPDATE \"",
+                "TRUNCATE `",
+                "DELETE FROM a..b",
+                "TRUNCATE ONLY",
+                "WITH x AS (UPDATE",
+                "WITH x AS (DELETE FROM a) (",
+                "UPDATE [",
+                "DELETE FROM a.b.c",
+            ] {
+                let _ = every_row(dialect, text);
+            }
+        }
+    }
+
+    #[test]
+    fn duckdb_refuses_what_outlives_the_rollback_or_reaches_past_the_files() {
+        for (statement, what) in [
+            ("SET threads = 1", "SET"),
+            ("RESET search_path", "RESET"),
+            ("PRAGMA enable_profiling", "PRAGMA"),
+            ("USE bookshop", "USE"),
+            ("ATTACH 'x.duckdb' AS x", "ATTACH"),
+            ("DETACH bookshop", "DETACH"),
+            ("INSTALL excel", "INSTALL"),
+            ("FORCE INSTALL excel", "FORCE"),
+            ("LOAD excel", "LOAD"),
+            ("COPY orders TO 'orders.csv'", "COPY"),
+            ("EXPORT DATABASE 'out'", "EXPORT"),
+            ("CHECKPOINT", "CHECKPOINT"),
+            ("PREPARE q AS SELECT 1", "PREPARE"),
+            ("BEGIN", "BEGIN"),
+            // What an EXPLAIN ANALYZE runs.
+            (
+                "EXPLAIN ANALYZE COPY (SELECT 1) TO 'orders.csv' (USE_TMP_FILE false)",
+                "EXPLAIN COPY",
+            ),
+            (
+                "EXPLAIN (ANALYZE, FORMAT json) COPY orders TO 'x.csv'",
+                "EXPLAIN COPY",
+            ),
+            ("explain analyze export database 'out'", "EXPLAIN EXPORT"),
+        ] {
+            assert_eq!(
+                refusal(Dialect::DuckDb, statement).as_deref(),
+                Some(what),
+                "{statement}"
+            );
+        }
+        for statement in [
+            "SELECT 'SET' AS word FROM orders",
+            "FROM orders SELECT count(*)",
+            "DESCRIBE orders",
+            "SUMMARIZE orders",
+            "WITH o AS (SELECT 1) SELECT * FROM o",
+            "EXPLAIN ANALYZE SELECT count(*) FROM orders",
+        ] {
+            assert_eq!(refusal(Dialect::DuckDb, statement), None, "{statement}");
+        }
+    }
+
+    #[test]
+    fn duckdb_reads_a_from_first_query_and_its_descriptions_as_reads() {
+        for statement in [
+            "FROM orders",
+            "FROM orders SELECT id",
+            "DESCRIBE orders",
+            "SUMMARIZE orders",
+            "SELECT * FROM orders",
+        ] {
+            assert_eq!(
+                kind(Dialect::DuckDb, statement),
+                StatementKind::Read,
+                "{statement}"
+            );
+        }
+        for statement in ["INSERT INTO t VALUES (1)", "CREATE TABLE t (a INT)"] {
+            assert_eq!(
+                kind(Dialect::DuckDb, statement),
+                StatementKind::Write,
+                "{statement}"
+            );
+        }
+        // Its strings, names and comments read as PostgreSQL's.
+        let tokens = tokenize(
+            Dialect::DuckDb,
+            "SELECT $$a;b$$, E'c\\';', \"d;\" /* /* e; */ */",
+        );
+        assert!(
+            !tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::Semicolon)
+        );
+    }
+}

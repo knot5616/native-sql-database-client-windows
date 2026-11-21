@@ -1,0 +1,87 @@
+# Databases for integration tests:
+#   docker compose up -d --build --wait postgres mysql ssh
+#   (and `mariadb`, to run the MySQL tests against it on port 53307)
+#   native-sql-database-client-windows_TEST_PG_URL=postgres://native-sql-database-client-windows:native-sql-database-client-windows@localhost:55432/native-sql-database-client-windows \
+#   native-sql-database-client-windows_TEST_MYSQL_URL=mysql://native-sql-database-client-windows:native-sql-database-client-windows@localhost:53306/native-sql-database-client-windows \
+#   native-sql-database-client-windows_TEST_SSH_URL=ssh://native-sql-database-client-windows:native-sql-database-client-windows@localhost:52222 \
+#     cargo test --workspace
+#
+# Ports are published on 127.0.0.1 only: the credentials are public.
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: native-sql-database-client-windows
+      POSTGRES_PASSWORD: native-sql-database-client-windows
+      POSTGRES_DB: native-sql-database-client-windows
+    ports:
+      - "127.0.0.1:55432:5432"
+    # TLS with the image's self-signed certificate, so every sslmode can be tested.
+    command:
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem
+      - -c
+      - ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "native-sql-database-client-windows"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: native-sql-database-client-windows-root
+      MYSQL_DATABASE: native-sql-database-client-windows
+      MYSQL_USER: native-sql-database-client-windows
+      MYSQL_PASSWORD: native-sql-database-client-windows
+    ports:
+      - "127.0.0.1:53306:3306"
+    # With its binary log on, the server lets only a SUPER user make a
+    # trigger. The tests' user is none, and one test needs a trigger.
+    command:
+      - --log-bin-trust-function-creators=1
+    volumes:
+      # A second database, so schema listing has more than one.
+      - ./compose/mysql-init.sql:/docker-entrypoint-initdb.d/billing.sql:ro
+    # Healthy only once the final server listens on TCP (the init server
+    # does not), so `docker compose up --wait` returns when tests can run.
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "native-sql-database-client-windows", "-pnative-sql-database-client-windows", "--silent"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+  # MariaDB, which the MySQL tests also run against, with its URL in
+  # native-sql-database-client-windows_TEST_MYSQL_URL (port 53307). 11.4 by default; MARIADB_VERSION
+  # picks another, such as 10.11, which still names some settings the old way.
+  mariadb:
+    image: mariadb:${MARIADB_VERSION:-11.4}
+    environment:
+      MARIADB_ROOT_PASSWORD: native-sql-database-client-windows-root
+      MARIADB_DATABASE: native-sql-database-client-windows
+      MARIADB_USER: native-sql-database-client-windows
+      MARIADB_PASSWORD: native-sql-database-client-windows
+    ports:
+      - "127.0.0.1:53307:3306"
+    volumes:
+      - ./compose/mysql-init.sql:/docker-entrypoint-initdb.d/billing.sql:ro
+    # `--connect` goes over TCP, which the init server does not listen on.
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+  # SSH server for tunnel tests. It reaches the databases by service name
+  # (postgres:5432, mysql:3306), which the host cannot resolve.
+  ssh:
+    build:
+      context: .
+      dockerfile: compose/ssh/Dockerfile
+    ports:
+      - "127.0.0.1:52222:22"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "22"]
+      interval: 2s
+      timeout: 5s
+      retries: 30

@@ -1,0 +1,883 @@
+//! Keyboard focus, shown: a ring round whatever has the keyboard, once the
+//! keyboard (not the pointer) put it there. One painter draws it for every
+//! widget, egui's own included, so no Tab stop is ever without one; a
+//! widget that wants another form than the default says so with [`hint`].
+
+use egui::{Color32, CornerRadius, EventFilter, Id, Key, Modifiers, Rect, Response, Sense, Stroke};
+use egui::{StrokeKind, Ui};
+
+use crate::theme::{Look, Palette};
+
+/// How far off a control its ring starts.
+const GAP: f32 = 2.0;
+/// How wide a ring is: what a pane keeps clear at its edge for its own.
+pub(super) const WIDTH: f32 = 2.0;
+/// A field's halo: this wide, the accent at a quarter.
+const HALO: f32 = 3.0;
+/// A field's border.
+const BORDER: f32 = 1.0;
+
+/// How the widget that has the keyboard shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ring {
+    /// Off the control, with a gap that shows what the control sits on:
+    /// buttons, chips, links. The default.
+    Outer { radius: u8 },
+    /// Inside the item's edge, where a ring outside it would be cut by the
+    /// list it scrolls in: rows, tabs, cells.
+    Inset { radius: u8 },
+    /// On the item's edge, with no gap: a segment in its track.
+    Edge { radius: u8 },
+    /// A text field: its border in the accent and a soft halo round it.
+    Field { radius: u8 },
+    /// A text field whose text fails its check, or one that takes the word
+    /// a write to production waits for: as [`Ring::Field`], in the danger
+    /// colour.
+    Failing { radius: u8 },
+    /// The terminal look's cursor on a field of a form: a bar in the accent
+    /// at the item's left edge. (The item stands on the selection's tone
+    /// while [`shown`] says it has the keyboard: a ground is painted
+    /// before its text, which this painter comes after.)
+    Bar,
+    /// The widget shows it by itself (a caret in text that has no box, the
+    /// terminal's reversed button).
+    Own,
+}
+
+/// What the focused widget said of its ring this frame.
+#[derive(Clone, Copy)]
+struct Hint {
+    id: Id,
+    rect: Rect,
+    ring: Ring,
+    clip: Rect,
+}
+
+/// The ring the focused widget asked for this frame, and where it goes:
+/// for the tests.
+#[cfg(test)]
+pub(crate) fn hinted(ctx: &egui::Context) -> Option<(Rect, Ring)> {
+    ctx.data(|data| data.get_temp::<Hint>(hint_id()))
+        .map(|hint| (hint.rect, hint.ring))
+}
+
+fn visible_id() -> Id {
+    Id::new("focus-visible")
+}
+
+fn hint_id() -> Id {
+    Id::new("focus-hint")
+}
+
+fn pane_id() -> Id {
+    Id::new("focus-pane")
+}
+
+fn regions_id() -> Id {
+    Id::new("focus-regions")
+}
+
+/// The parts of the window F6 steps between, in the order it takes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Region {
+    /// The connection bar: Connections, then a chip for each connection.
+    Header,
+    /// The sidebar's filter.
+    Search,
+    /// The object tree.
+    Tree,
+    /// The open tables and editors.
+    Tabs,
+    /// A table's header: the Data and Structure switch.
+    Toolbar,
+    /// A SQL editor's script.
+    Editor,
+    /// The start screen, where the rows would be with no tab open.
+    Start,
+    /// The rows.
+    Grid,
+    /// The row panel.
+    Panel,
+}
+
+impl Region {
+    /// The panes the terminal look steps between with ctrl+h and ctrl+l.
+    pub const PANES: [Region; 4] = [Region::Tree, Region::Start, Region::Grid, Region::Panel];
+    /// The panes one above the other, which it steps between with ctrl+k
+    /// and ctrl+j: a SQL editor's script over its results.
+    pub const STACKED: [Region; 2] = [Region::Editor, Region::Grid];
+}
+
+/// Where the regions are, and which one F6 asked for.
+#[derive(Clone, Default)]
+struct Regions {
+    /// The regions drawn so far this frame.
+    drawn: Vec<(Region, Rect)>,
+    /// The ones the frame before drew: what a key pressed now steps among.
+    before: Vec<(Region, Rect)>,
+    /// The region asked for, and in which frame.
+    wanted: Option<(Region, u64)>,
+}
+
+/// Says where `region` is this frame, so F6 can step to it and from it.
+pub fn region(ui: &Ui, region: Region, rect: Rect) {
+    ui.data_mut(|data| {
+        let regions: &mut Regions = data.get_temp_mut_or_default(regions_id());
+        regions.drawn.push((region, rect));
+    });
+}
+
+/// Gives `response`'s widget the keyboard when F6 asked for `region`: call
+/// it for the control a region starts with.
+pub fn claim(ui: &Ui, region: Region, response: &Response) {
+    let asked = ui.data_mut(|data| {
+        let regions: &mut Regions = data.get_temp_mut_or_default(regions_id());
+        let asked = matches!(regions.wanted, Some((wanted, _)) if wanted == region);
+        if asked {
+            regions.wanted = None;
+        }
+        asked
+    });
+    if asked {
+        response.request_focus();
+    }
+}
+
+/// F6: asks for the region after (or, not `forward`, before) the one the
+/// keyboard is in, among the ones on screen and in `among` if given. With
+/// the keyboard nowhere it counts from `from`.
+pub fn step(ctx: &egui::Context, forward: bool, among: Option<&[Region]>, from: Option<Region>) {
+    ask(ctx, forward, among, from, true);
+}
+
+/// Asks for the region next to the one the keyboard is in, as [`step`]
+/// does, among `among`, and says whether there is one. Only from one of
+/// `among`: from elsewhere, and past the last one (or before the first),
+/// there is none, and the keyboard stays where it is.
+pub fn neighbour(
+    ctx: &egui::Context,
+    forward: bool,
+    among: &[Region],
+    from: Option<Region>,
+) -> bool {
+    ask(ctx, forward, Some(among), from, false)
+}
+
+/// Whether ctrl+h or ctrl+l would move the keyboard from `from`: another
+/// region of `among` was drawn the frame before, among those [`step`]
+/// steps through.
+pub fn can_step(ctx: &egui::Context, among: &[Region], from: Region) -> bool {
+    ctx.data_mut(|data| {
+        let regions: &mut Regions = data.get_temp_mut_or_default(regions_id());
+        regions
+            .before
+            .iter()
+            .any(|(region, _)| *region != from && among.contains(region))
+    })
+}
+
+/// F6's question, and its neighbour's: which region takes the keyboard
+/// next, if any. Past the end it starts over where `wrap` says so, and
+/// from a region not `among` the ones stepped among.
+fn ask(
+    ctx: &egui::Context,
+    forward: bool,
+    among: Option<&[Region]>,
+    from: Option<Region>,
+    wrap: bool,
+) -> bool {
+    let at = ctx
+        .memory(|memory| memory.focused())
+        .and_then(|id| ctx.read_response(id))
+        .map(|response| response.rect.center());
+    let now = ctx.cumulative_frame_nr();
+    let asked = ctx.data_mut(|data| {
+        let regions: &mut Regions = data.get_temp_mut_or_default(regions_id());
+        let mut stops: Vec<Region> = regions
+            .before
+            .iter()
+            .map(|(region, _)| *region)
+            .filter(|region| among.is_none_or(|among| among.contains(region)))
+            .collect();
+        stops.sort();
+        stops.dedup();
+        // The region the keyboard is in: the smallest one round it.
+        let current = at
+            .and_then(|at| {
+                regions
+                    .before
+                    .iter()
+                    .filter(|(_, rect)| rect.contains(at))
+                    .min_by(|(_, a), (_, b)| a.area().total_cmp(&b.area()))
+                    .map(|(region, _)| *region)
+            })
+            .or(from);
+        let outside =
+            current.is_some_and(|current| among.is_some_and(|among| !among.contains(&current)));
+        if outside && !wrap {
+            return false;
+        }
+        let next = match (current, forward) {
+            (Some(current), true) => stops.iter().find(|stop| **stop > current),
+            (Some(current), false) => stops.iter().rev().find(|stop| **stop < current),
+            (None, _) => None,
+        };
+        // Past the last one it starts over, where it wraps.
+        let again = match (wrap, forward) {
+            (false, _) => None,
+            (true, true) => stops.first(),
+            (true, false) => stops.last(),
+        };
+        let next = next.or(again);
+        regions.wanted = next.map(|region| (*region, now));
+        next.is_some()
+    });
+    // The region takes the keyboard when it is next drawn.
+    ctx.request_repaint();
+    asked
+}
+
+/// Makes `response`'s widget a pane: one Tab stop for a list or a grid
+/// whose keys the app's shortcuts handle. With the keyboard on it Enter,
+/// Space and the arrows act on what it shows: egui neither presses it like
+/// a button nor moves focus off it with the arrows.
+pub fn pane(ui: &Ui, response: &Response) {
+    if !response.has_focus() {
+        return;
+    }
+    let arrows = EventFilter {
+        horizontal_arrows: true,
+        vertical_arrows: true,
+        ..Default::default()
+    };
+    ui.memory_mut(|memory| memory.set_focus_lock_filter(response.id, arrows));
+    ui.data_mut(|data| data.insert_temp(pane_id(), response.id));
+}
+
+/// Whether the keyboard is on a control of its own (a button, a field, a
+/// tab): it takes Enter and Space itself, and the arrows move focus from
+/// it. On a pane, or nowhere, the shortcuts have those keys.
+pub fn on_control(ctx: &egui::Context) -> bool {
+    ctx.memory(|memory| memory.focused())
+        .is_some_and(|id| ctx.data(|data| data.get_temp::<Id>(pane_id())) != Some(id))
+}
+
+/// The terminal look's mark of the pane the keys go to: a 2 pt accent line
+/// round it, inside its edge. The other looks mark the item, not the pane.
+pub fn pane_border(ui: &Ui, rect: Rect, look: &Look, palette: &Palette) {
+    if look.terminal {
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::ZERO,
+            Stroke::new(WIDTH, palette.accent),
+            StrokeKind::Inside,
+        );
+    }
+}
+
+/// One of the `count` choices of a segmented control, the one at `index`:
+/// the chosen one is the control's only Tab stop, and with the keyboard on
+/// it ← and → choose its neighbours. Returns its response and the choice
+/// the arrows made, if any; the keyboard follows that choice once the
+/// caller has made it the chosen one.
+pub fn segment(
+    ui: &Ui,
+    rect: Rect,
+    id: Id,
+    group: Id,
+    (index, count): (usize, usize),
+    chosen: bool,
+) -> (Response, Option<usize>) {
+    grid_segment(ui, rect, id, group, (index, count, count), chosen)
+}
+
+/// [`segment`] for choices `columns` to a row: ↑ and ↓ also choose the one
+/// above and below. Where there is none, the choice stays.
+pub fn grid_segment(
+    ui: &Ui,
+    rect: Rect,
+    id: Id,
+    group: Id,
+    (index, count, columns): (usize, usize, usize),
+    chosen: bool,
+) -> (Response, Option<usize>) {
+    let sense = if chosen { Sense::click() } else { Sense::CLICK };
+    let response = ui.interact(rect, id, sense);
+    let now = ui.ctx().cumulative_frame_nr();
+    // The choice the arrows made, and when: taken up within two frames or
+    // not at all (the caller may have refused it).
+    let moved: Option<(usize, u64)> = ui.data(|data| data.get_temp(group));
+    if let Some((target, when)) = moved
+        && chosen
+        && target == index
+    {
+        if now <= when + 2 {
+            response.request_focus();
+        }
+        ui.data_mut(|data| data.remove::<(usize, u64)>(group));
+    }
+    let mut picked = None;
+    if response.has_focus() {
+        // A single row leaves ↑ and ↓ to whatever holds it.
+        let rows = columns < count;
+        let arrows = EventFilter {
+            horizontal_arrows: true,
+            vertical_arrows: rows,
+            ..Default::default()
+        };
+        ui.memory_mut(|memory| memory.set_focus_lock_filter(response.id, arrows));
+        let (right, left, down, up) = ui.input_mut(|input| {
+            (
+                input.consume_key(Modifiers::NONE, Key::ArrowRight),
+                input.consume_key(Modifiers::NONE, Key::ArrowLeft),
+                rows && input.consume_key(Modifiers::NONE, Key::ArrowDown),
+                rows && input.consume_key(Modifiers::NONE, Key::ArrowUp),
+            )
+        });
+        let next = match (right, left, down, up) {
+            (true, false, _, _) => (index + 1).min(count.saturating_sub(1)),
+            (false, true, _, _) => index.saturating_sub(1),
+            (_, _, true, false) if index + columns < count => index + columns,
+            (_, _, false, true) => index.checked_sub(columns).unwrap_or(index),
+            _ => index,
+        };
+        if next != index {
+            picked = Some(next);
+            ui.data_mut(|data| data.insert_temp(group, (next, now)));
+        }
+    }
+    (response, picked)
+}
+
+/// Notes what this frame's input says of how the user works: a key makes
+/// focus visible, a pointer press hides it. A screen reader that moves
+/// focus counts as a key. Call before anything reads the frame's keys.
+pub fn begin_frame(ctx: &egui::Context) {
+    let keyboard = ctx.input(|input| {
+        input.events.iter().rev().find_map(|event| match event {
+            egui::Event::Key { pressed: true, .. } => Some(true),
+            egui::Event::AccessKitActionRequest(request)
+                if request.action == egui::accesskit::Action::Focus =>
+            {
+                Some(true)
+            }
+            egui::Event::PointerButton { pressed: true, .. } => Some(false),
+            _ => None,
+        })
+    });
+    let now = ctx.cumulative_frame_nr();
+    ctx.data_mut(|data| {
+        if let Some(keyboard) = keyboard {
+            data.insert_temp(visible_id(), keyboard);
+        }
+        let regions: &mut Regions = data.get_temp_mut_or_default(regions_id());
+        regions.before = std::mem::take(&mut regions.drawn);
+        // A region asked for and not drawn since is not there to take it.
+        if regions.wanted.is_some_and(|(_, when)| now > when + 1) {
+            regions.wanted = None;
+        }
+    });
+}
+
+fn behind_id() -> Id {
+    Id::new("focus-behind")
+}
+
+/// What had the keyboard when a dialog opened.
+#[derive(Clone, Copy, Default)]
+struct Behind {
+    /// A dialog was up when [`dialog`] was last called.
+    open: bool,
+    /// The widget, and where the app's keys went then.
+    had: Option<(Id, Id)>,
+}
+
+/// Gives the keyboard back to what had it before a dialog opened, once
+/// the dialog has gone: egui takes it from everything drawn behind a
+/// dialog and gives nothing back. Call before anything is drawn, with
+/// whether a dialog is up and `place`, where the app's keys go (its tab,
+/// its pane). A dialog whose answer moved them (quick open opening a
+/// table) leaves the keyboard where the answer put it. It goes back only
+/// to a widget the frame before drew, and only while nothing has it.
+pub fn dialog(ctx: &egui::Context, open: bool, place: Id) {
+    let focused = ctx.memory(|memory| memory.focused());
+    // egui keeps a closed dialog's layer for a frame, and in that one
+    // nothing behind it takes the keyboard.
+    let modal = ctx.memory(|memory| memory.top_modal_layer()).is_some();
+    let (back, waiting) = ctx.data_mut(|data| {
+        let behind: &mut Behind = data.get_temp_mut_or_default(behind_id());
+        let was_open = std::mem::replace(&mut behind.open, open);
+        if open {
+            // The dialog is not drawn yet: the keyboard is where it was.
+            if !was_open {
+                behind.had = focused.map(|id| (id, place));
+            }
+            (None, false)
+        } else if modal {
+            (None, behind.had.is_some())
+        } else {
+            (behind.had.take(), false)
+        }
+    });
+    // The frame that gives it back comes without waiting for a key.
+    if waiting {
+        ctx.request_repaint();
+    }
+    // Before anything is drawn a response is the frame before's.
+    if let Some((id, then)) = back
+        && then == place
+        && focused.is_none()
+        && ctx.read_response(id).is_some()
+    {
+        ctx.memory_mut(|memory| memory.request_focus(id));
+    }
+}
+
+/// Whether focus is shown: the keyboard was used last, not the pointer.
+pub fn visible(ctx: &egui::Context) -> bool {
+    ctx.data(|data| data.get_temp(visible_id()))
+        .unwrap_or(false)
+}
+
+/// Whether `response`'s widget has the keyboard and should show it: for a
+/// widget that draws its own focus ([`Ring::Own`]).
+pub fn shown(response: &Response) -> bool {
+    response.has_focus() && visible(&response.ctx)
+}
+
+/// Says how `response`'s widget shows focus: `ring` round `rect`. Without a
+/// hint a widget gets [`Ring::Outer`] round its own rectangle (a text field
+/// [`Ring::Field`]), at the look's radius.
+pub fn hint(ui: &Ui, response: &Response, rect: Rect, ring: Ring) {
+    if !response.has_focus() {
+        return;
+    }
+    let hint = Hint {
+        id: response.id,
+        rect,
+        ring,
+        clip: ui.clip_rect(),
+    };
+    ui.data_mut(|data| data.insert_temp(hint_id(), hint));
+}
+
+/// A laid out text added as a widget that answers `sense`.
+pub trait Link {
+    /// [`Laid::label`](crate::typography::Laid::label) that answers
+    /// `sense`. Text that can be clicked is a link: a tight ring round its
+    /// words.
+    fn label_sense(self, ui: &mut Ui, sense: Sense) -> Response;
+}
+
+impl Link for crate::typography::Laid {
+    fn label_sense(self, ui: &mut Ui, sense: Sense) -> Response {
+        let (rect, response) = self.allocate(ui, sense);
+        if sense.senses_click() {
+            hint(ui, &response, rect, Ring::Outer { radius: 3 });
+        }
+        response
+    }
+}
+
+/// Draws the ring of whatever has the keyboard. Call once the frame's
+/// widgets are drawn.
+pub fn paint(ctx: &egui::Context, look: &Look, palette: &Palette) {
+    let Some(id) = ctx.memory(|memory| memory.focused()) else {
+        return;
+    };
+    if !visible(ctx) {
+        return;
+    }
+    let Some(response) = ctx.read_response(id) else {
+        return;
+    };
+    let hint = ctx
+        .data(|data| data.get_temp::<Hint>(hint_id()))
+        .filter(|hint| hint.id == id);
+    let (rect, ring, clip) = match hint {
+        Some(hint) => (hint.rect, hint.ring, hint.clip),
+        None => {
+            let ring = if ctx.text_edit_focused() {
+                Ring::Field {
+                    radius: look.radius,
+                }
+            } else {
+                Ring::Outer {
+                    radius: look.radius,
+                }
+            };
+            (response.rect, ring, Rect::EVERYTHING)
+        }
+    };
+    let painter = ctx.layer_painter(response.layer_id);
+    let accent = Stroke::new(WIDTH, palette.accent);
+    // Concentric with the control: a ring further out is rounder. A
+    // square control keeps a square ring.
+    let round = |radius: u8, out: f32| {
+        if radius == 0 {
+            CornerRadius::ZERO
+        } else {
+            CornerRadius::same(radius.saturating_add(out as u8))
+        }
+    };
+    match ring {
+        Ring::Outer { radius } => {
+            // The ring stands outside the control, so it may pass the edge
+            // of what clips the control by its own reach.
+            painter
+                .with_clip_rect(clip.expand(GAP + WIDTH))
+                .rect_stroke(
+                    rect.expand(GAP),
+                    round(radius, GAP),
+                    accent,
+                    StrokeKind::Outside,
+                );
+        }
+        Ring::Inset { radius } => {
+            painter.with_clip_rect(clip).rect_stroke(
+                rect,
+                CornerRadius::same(radius),
+                accent,
+                StrokeKind::Inside,
+            );
+        }
+        Ring::Edge { radius } => {
+            painter.with_clip_rect(clip.expand(WIDTH)).rect_stroke(
+                rect,
+                CornerRadius::same(radius),
+                accent,
+                StrokeKind::Outside,
+            );
+        }
+        Ring::Field { radius } | Ring::Failing { radius } => {
+            let color = if matches!(ring, Ring::Failing { .. }) {
+                palette.danger
+            } else {
+                palette.accent
+            };
+            let painter = painter.with_clip_rect(clip.expand(HALO));
+            // The terminal's fields are square and take the border alone.
+            if !look.terminal {
+                painter.rect_stroke(
+                    rect,
+                    round(radius, 0.0),
+                    Stroke::new(HALO, halo_of(color)),
+                    StrokeKind::Outside,
+                );
+            }
+            painter.rect_stroke(
+                rect,
+                CornerRadius::same(radius),
+                Stroke::new(BORDER, color),
+                StrokeKind::Inside,
+            );
+        }
+        Ring::Bar => {
+            let bar = Rect::from_min_size(rect.min, egui::vec2(WIDTH, rect.height()));
+            painter
+                .with_clip_rect(clip)
+                .rect_filled(bar, CornerRadius::ZERO, palette.accent);
+        }
+        Ring::Own => {}
+    }
+}
+
+/// A field's halo: the accent at a quarter.
+pub fn halo(palette: &Palette) -> Color32 {
+    halo_of(palette.accent)
+}
+
+/// The halo round a field whose border is `color`: that colour at a
+/// quarter.
+fn halo_of(color: Color32) -> Color32 {
+    color.gamma_multiply(0.25)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Key, Modifiers, vec2};
+
+    /// One frame of two buttons and a text field, with `events`; the
+    /// second button asks for an inset ring. Returns what was painted.
+    fn frame(
+        ctx: &egui::Context,
+        look: &Look,
+        palette: &Palette,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            begin_frame(ui.ctx());
+            egui::CentralPanel::default().show(ui, |ui| {
+                let _ = ui.button("First");
+                let (rect, second) = ui.allocate_exact_size(vec2(80.0, 24.0), egui::Sense::click());
+                hint(ui, &second, rect, Ring::Inset { radius: 0 });
+                let mut text = String::new();
+                ui.text_edit_singleline(&mut text);
+            });
+            paint(ui.ctx(), look, palette);
+        });
+        output.textures_delta.clear();
+        output.shapes
+    }
+
+    /// The kinds of the accent outlines in `shapes`, by their width.
+    fn rings(shapes: &[egui::epaint::ClippedShape], palette: &Palette) -> Vec<(StrokeKind, f32)> {
+        shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(rect)
+                    if rect.fill == Color32::TRANSPARENT
+                        && (rect.stroke.color == palette.accent
+                            || rect.stroke.color == halo(palette)) =>
+                {
+                    Some((rect.stroke_kind, rect.stroke.width))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn context(look: &Look, palette: &Palette) -> egui::Context {
+        let ctx = egui::Context::default();
+        crate::style::install(&ctx, false, look);
+        crate::style::apply(&ctx, palette, look);
+        ctx
+    }
+
+    fn tab() -> Vec<egui::Event> {
+        vec![
+            crate::testing::key(Key::Tab, Modifiers::NONE),
+            crate::testing::release(Key::Tab, Modifiers::NONE),
+        ]
+    }
+
+    #[test]
+    fn the_keyboard_shows_focus_and_the_pointer_hides_it() {
+        for look in Look::ALL {
+            for palette in [Palette::light(), Palette::dark()] {
+                let ctx = context(&look, &palette);
+                let draw = |events| rings(&frame(&ctx, &look, &palette, events), &palette);
+                assert_eq!(draw(Vec::new()), [], "{}: nothing focused", look.name);
+                // Tab lands on the first button: the default, an outer ring.
+                draw(tab());
+                assert_eq!(
+                    draw(Vec::new()),
+                    [(StrokeKind::Outside, WIDTH)],
+                    "{}",
+                    look.name
+                );
+                // The second asked for an inset one.
+                draw(tab());
+                assert_eq!(
+                    draw(Vec::new()),
+                    [(StrokeKind::Inside, WIDTH)],
+                    "{}",
+                    look.name
+                );
+                // A press of the pointer elsewhere hides the ring.
+                let press = egui::Event::PointerButton {
+                    pos: egui::pos2(600.0, 500.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                };
+                draw(vec![
+                    egui::Event::PointerMoved(egui::pos2(600.0, 500.0)),
+                    press,
+                ]);
+                assert_eq!(draw(Vec::new()), [], "{}: the pointer hides it", look.name);
+            }
+        }
+    }
+
+    #[test]
+    fn a_text_field_takes_the_accent_border_and_a_halo() {
+        for look in Look::ALL {
+            let palette = Palette::light();
+            let ctx = context(&look, &palette);
+            let draw = |events| rings(&frame(&ctx, &look, &palette, events), &palette);
+            for _ in 0..3 {
+                draw(tab());
+            }
+            let rings = draw(Vec::new());
+            assert!(
+                rings.contains(&(StrokeKind::Inside, BORDER)),
+                "{}: {rings:?}",
+                look.name
+            );
+            assert_eq!(
+                rings.contains(&(StrokeKind::Outside, HALO)),
+                !look.terminal,
+                "{}: {rings:?}",
+                look.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_failing_field_takes_the_same_ring_in_the_danger_colour() {
+        for look in Look::ALL {
+            let palette = Palette::light();
+            let ctx = context(&look, &palette);
+            let draw = |events: Vec<egui::Event>| {
+                let input = egui::RawInput {
+                    events,
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| {
+                    begin_frame(ui.ctx());
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let mut text = String::new();
+                        let field = ui.text_edit_singleline(&mut text);
+                        hint(ui, &field, field.rect, Ring::Failing { radius: 0 });
+                    });
+                    paint(ui.ctx(), &look, &palette);
+                });
+                output.textures_delta.clear();
+                output.shapes
+            };
+            draw(tab());
+            let strokes: Vec<(StrokeKind, f32, Color32)> = draw(Vec::new())
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Rect(rect) if rect.fill == Color32::TRANSPARENT => {
+                        Some((rect.stroke_kind, rect.stroke.width, rect.stroke.color))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let border = (StrokeKind::Inside, BORDER, palette.danger);
+            assert!(strokes.contains(&border), "{}: {strokes:?}", look.name);
+            let around = (StrokeKind::Outside, HALO, halo_of(palette.danger));
+            assert_eq!(
+                strokes.contains(&around),
+                !look.terminal,
+                "{}: {strokes:?}",
+                look.name
+            );
+            // Nothing of the accent's ring beside it.
+            assert!(
+                !strokes.iter().any(|(_, width, color)| {
+                    (*color == palette.accent && *width == WIDTH) || *color == halo(&palette)
+                }),
+                "{}: {strokes:?}",
+                look.name
+            );
+        }
+    }
+
+    /// One frame: the button `Behind` where `drawn`, `Other` asking for
+    /// the keyboard where `takes`, and over them a dialog while `open`.
+    /// The app's keys go to `place`. Returns Behind's and Other's ids.
+    fn scene(
+        ctx: &egui::Context,
+        open: bool,
+        (drawn, takes): (bool, bool),
+        place: &str,
+    ) -> (Id, Id) {
+        let (mut behind, mut other) = (Id::NULL, Id::NULL);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            dialog(ui.ctx(), open, Id::new(place));
+            egui::CentralPanel::default().show(ui, |ui| {
+                if drawn {
+                    behind = ui.push_id("behind", |ui| ui.button("Behind")).inner.id;
+                }
+                other = ui.push_id("other", |ui| ui.button("Other")).inner.id;
+                if takes {
+                    ui.memory_mut(|memory| memory.request_focus(other));
+                }
+            });
+            if open {
+                egui::Modal::new(Id::new("dialog")).show(ui.ctx(), |ui| {
+                    let _ = ui.button("Inside");
+                });
+            }
+        });
+        output.textures_delta.clear();
+        (behind, other)
+    }
+
+    /// `Behind` has the keyboard, a dialog opens over it, then closes.
+    /// `after` is what each frame without the dialog draws (`Other` asks
+    /// for the keyboard in the first of them only), and `place` where its
+    /// keys go. Returns Behind's and Other's ids, and what had the
+    /// keyboard after each frame without the dialog.
+    fn across_a_dialog(
+        ctx: &egui::Context,
+        (drawn, takes): (bool, bool),
+        place: &str,
+    ) -> (Id, Id, Vec<Option<Id>>) {
+        let (button, _) = scene(ctx, false, (true, false), "tree");
+        ctx.memory_mut(|memory| memory.request_focus(button));
+        scene(ctx, false, (true, false), "tree");
+        for _ in 0..3 {
+            scene(ctx, true, (true, false), "tree");
+        }
+        // egui's doing: nothing behind a dialog keeps the keyboard.
+        assert_eq!(ctx.memory(|memory| memory.focused()), None);
+        let mut other = Id::NULL;
+        let mut had = Vec::new();
+        for frame in 0..4 {
+            other = scene(ctx, false, (drawn, takes && frame == 0), place).1;
+            had.push(ctx.memory(|memory| memory.focused()));
+        }
+        (button, other, had)
+    }
+
+    #[test]
+    fn a_closed_dialog_gives_the_keyboard_back() {
+        let ctx = egui::Context::default();
+        let (button, _, had) = across_a_dialog(&ctx, (true, false), "tree");
+        assert_eq!(had.last(), Some(&Some(button)), "{had:?}");
+    }
+
+    #[test]
+    fn the_keyboard_goes_back_only_to_a_widget_still_drawn() {
+        let ctx = egui::Context::default();
+        let (_, _, had) = across_a_dialog(&ctx, (false, false), "tree");
+        assert!(had.iter().all(Option::is_none), "{had:?}");
+    }
+
+    #[test]
+    fn a_widget_that_took_the_keyboard_keeps_it() {
+        let ctx = egui::Context::default();
+        let (_, other, had) = across_a_dialog(&ctx, (true, true), "tree");
+        assert!(had.iter().all(|had| *had == Some(other)), "{had:?}");
+    }
+
+    #[test]
+    fn a_dialog_that_moved_the_keys_leaves_the_keyboard_alone() {
+        let ctx = egui::Context::default();
+        let (_, _, had) = across_a_dialog(&ctx, (true, false), "grid");
+        assert!(had.iter().all(Option::is_none), "{had:?}");
+    }
+
+    #[test]
+    fn focus_the_pointer_gave_is_not_shown() {
+        let (look, palette) = (Look::macos(), Palette::light());
+        let ctx = context(&look, &palette);
+        let draw = |ctx: &egui::Context| {
+            let mut id = Id::NULL;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                begin_frame(ui.ctx());
+                egui::CentralPanel::default().show(ui, |ui| {
+                    id = ui.button("First").id;
+                });
+                paint(ui.ctx(), &look, &palette);
+            });
+            output.textures_delta.clear();
+            (id, rings(&output.shapes, &palette))
+        };
+        let (id, _) = draw(&ctx);
+        // Focus with no key behind it: code asked for it after a click.
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        draw(&ctx);
+        assert_eq!(draw(&ctx).1, []);
+        assert!(!visible(&ctx));
+    }
+}

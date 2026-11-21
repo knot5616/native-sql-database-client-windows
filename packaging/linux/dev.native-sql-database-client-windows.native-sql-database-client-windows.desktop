@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=native-sql-database-client-windows
+Comment=Browse PostgreSQL, MySQL and SQLite databases
+Exec=native-sql-database-client-windows
+Icon=dev.native-sql-database-client-windows.native-sql-database-client-windows
+Terminal=false
+Categories=Development;Database;
+StartupWMClass=dev.native-sql-database-client-windows.native-sql-database-client-windows
+Keywords=database;sql;postgres;postgresql;mysql;sqlite;
+StartupNotify=true

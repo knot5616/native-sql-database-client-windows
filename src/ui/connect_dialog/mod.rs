@@ -1,0 +1,1474 @@
+//! The connection dialog: new or edit, any driver, with an optional SSH
+//! tunnel. macOS draws a sheet of labelled fields in groups under the
+//! environment's colour; the terminal look a two-column form with its keys
+//! in the footer.
+
+mod agents;
+mod choice;
+mod files;
+mod reading;
+mod sheet;
+mod terminal;
+
+use egui::{
+    Color32, CornerRadius, Rect, Response, Sense, Stroke, Ui, WidgetInfo, WidgetType, pos2, vec2,
+};
+use native-sql-database-client-windows_db::ssh_config::Proxy;
+use native-sql-database-client-windows_db::{Driver, TlsMode};
+
+use crate::connections::PasswordMode;
+use crate::env::{EnvColors, Environment, Platform, env_colors};
+use crate::i18n::{Locale, Msgid, gettext, msgid, ngettext};
+use crate::keymap::{Command, Keymap, Scope};
+use crate::model::{
+    Action, ConnectionForm, FilesKind, LoadedTables, SshAuthKind, SshHints, TestState,
+};
+use crate::style::Icon;
+use crate::theme::{self, Look, Palette};
+use crate::typography::{Text, TextRole};
+use crate::ui::widgets::{self, ButtonSpec};
+use crate::ui::{Paint, menu};
+
+use sheet::{body, footer, header};
+use terminal::{terminal_body, terminal_footer, terminal_header, terminal_row};
+
+/// The TLS modes by their libpq names, as the picker says them: the same
+/// in every language.
+const TLS_MODES: [(TlsMode, Msgid); 5] = [
+    (TlsMode::Disable, Msgid::as_is("disable")),
+    (TlsMode::Prefer, Msgid::as_is("prefer")),
+    (TlsMode::Require, Msgid::as_is("require")),
+    (TlsMode::VerifyCa, Msgid::as_is("verify-ca")),
+    (TlsMode::VerifyFull, Msgid::as_is("verify-full")),
+];
+
+/// What the Type row says beside its choices: what a choice changes, and
+/// what the file types are.
+fn type_hint(driver: Driver) -> Msgid {
+    match driver {
+        Driver::Sqlite => msgid("One database file on this computer"),
+        Driver::Files => msgid("Opens CSV, Parquet, JSON, Excel and .duckdb files as tables"),
+        Driver::Postgres | Driver::MySql | Driver::BigQuery => msgid("Changes the fields below"),
+    }
+}
+
+/// Whether the form is a Files connection's: no URL, a Source, keys of
+/// its own.
+fn is_files(form: &ConnectionForm) -> bool {
+    match form.driver {
+        Driver::Files => true,
+        Driver::Postgres | Driver::MySql | Driver::Sqlite | Driver::BigQuery => false,
+    }
+}
+
+/// Whether the read-only box is on and cannot be turned off: a Files
+/// connection's, until editing files is built.
+fn read_only_fixed(form: &ConnectionForm) -> bool {
+    is_files(form)
+}
+
+/// What a Files connection's read-only box says.
+const FILES_READ_ONLY_NOTE: Msgid = msgid("Files open read-only.");
+
+/// Why a Files connection's URL tab is off, as its tooltip says it.
+const NO_URL: Msgid =
+    msgid("Files connections have no URL. Choose a folder or files under Source.");
+
+const INTERCEPT_WARNING: Msgid = msgid(
+    "The password can be intercepted on the network. \
+                                 To prevent it, verify the certificate and host, \
+                                 or use an SSH tunnel.",
+);
+
+/// Where the dialog's top edge settled once it opened (see [`Placement`]).
+fn placement_id() -> egui::Id {
+    egui::Id::new("connection-dialog-placement")
+}
+
+/// Set for one frame after the URL field appears: it takes the keyboard.
+fn focus_url_id() -> egui::Id {
+    egui::Id::new("connection-dialog-focus-url")
+}
+
+/// The dialog's place. egui centres a modal on its size, so a dialog that
+/// grows (PostgreSQL's fields, the SSH section, the TLS warning) would move
+/// under the pointer. It opens where a server's form would be centred, so
+/// the short SQLite form and that one share a top edge; then the edge stays
+/// put and the dialog grows downwards.
+#[derive(Clone, Copy, Default)]
+struct Placement {
+    /// The top edge, once a frame has measured the form. Until then the
+    /// dialog is laid out but not painted, so it is first seen where it
+    /// stays.
+    top: Option<f32>,
+}
+
+/// The height the dialog keeps room for when it opens: a server's form
+/// without a tunnel or a message, rounded up. The sheet's is the macOS
+/// look's, the taller of its two.
+fn reserve(look: &Look) -> f32 {
+    if look.terminal { 615.0 } else { 885.0 }
+}
+
+/// Where the top edge of a dialog `height` tall goes on a screen
+/// `screen` tall.
+fn top_edge(screen: f32, height: f32) -> f32 {
+    ((screen - height) / 2.0).max(24.0)
+}
+
+/// How the dialog draws: the look, the palette, and the environment that
+/// colours it.
+#[derive(Clone, Copy)]
+struct Skin<'a> {
+    look: &'a Look,
+    palette: &'a Palette,
+    locale: Locale,
+    environment: Environment,
+    env: EnvColors,
+    /// The dialog's own background.
+    fill: Color32,
+}
+
+impl<'a> Skin<'a> {
+    fn new(look: &'a Look, palette: &'a Palette, locale: Locale, environment: Environment) -> Self {
+        Self {
+            look,
+            palette,
+            locale,
+            environment,
+            env: env_colors(environment, Platform::of(look), palette),
+            fill: if look.terminal {
+                palette.window
+            } else {
+                palette.overlay
+            },
+        }
+    }
+
+    /// `text` translated, in the look's case.
+    fn say(&self, text: Msgid) -> String {
+        self.look.label(&text.say(self.locale))
+    }
+
+    /// What a closed section's terminal heading ends with: the key that
+    /// chooses, as the keymap has it, and "opens".
+    fn opens(&self, ctx: &egui::Context) -> String {
+        let key = crate::ui::keys::written(ctx, self.look, crate::keymap::Command::FormChoose);
+        format!("{key} {}", self.say(msgid("opens")))
+    }
+
+    /// `environment`'s colours in this look and palette.
+    fn colors(&self, environment: Environment) -> EnvColors {
+        env_colors(environment, Platform::of(self.look), self.palette)
+    }
+
+    /// The dialog's border: the terminal look's 2 pt edge in the
+    /// environment's colour, a hairline where a dark dialog would merge
+    /// with a dark window, none on light.
+    fn stroke(&self) -> Stroke {
+        if self.look.terminal {
+            Stroke::new(2.0, self.env.base())
+        } else if self.palette.dark {
+            Stroke::new(1.0, self.palette.outline)
+        } else {
+            Stroke::NONE
+        }
+    }
+
+    /// The dialog's corners, and those of what fills it edge to edge.
+    fn radius(&self) -> u8 {
+        if self.look.terminal {
+            6
+        } else {
+            self.look.dialog_radius + 2
+        }
+    }
+
+    fn inner_radius(&self) -> u8 {
+        self.radius().saturating_sub(self.stroke().width as u8)
+    }
+
+    /// Rules between the dialog's parts and round its groups.
+    fn rule(&self) -> Color32 {
+        if self.look.terminal {
+            self.palette.outline
+        } else {
+            self.palette.surface_hover
+        }
+    }
+
+    /// The footer's fill: the panel tone, or the window's where the dialog
+    /// itself has the panel's.
+    fn footer(&self) -> Color32 {
+        if self.fill == self.palette.panel {
+            self.palette.window
+        } else {
+            self.palette.panel
+        }
+    }
+
+    /// An environment's colour as text on the dialog. The sheet takes the
+    /// badge's text colour, which is made to read (4.5 to 1) on the badge's
+    /// own fill and on no other. The raised segment and the read-only note
+    /// are other fills, close to the badge's in tone (the sheet's colour,
+    /// raised or tinted a little): it reads there with somewhat less
+    /// contrast on a dark sheet, and is kept so that the name has the
+    /// colour its badge has everywhere else. The terminal look takes the
+    /// environment's own, the theme's, moved towards the text colour until
+    /// it reads on the dialog: a light theme's yellow would not.
+    fn env_ink(&self, colors: &EnvColors) -> Color32 {
+        if !self.look.terminal {
+            return colors.badge_fg();
+        }
+        let base = colors.base();
+        let mut ink = base;
+        let mut amount = 0.0;
+        while theme::contrast(ink, self.fill) < 4.5 && amount < 1.0 {
+            amount += 0.1;
+            ink = theme::mix(base, self.palette.text, amount);
+        }
+        ink
+    }
+
+    /// Where saved passwords go, as this platform calls it
+    /// ([`Look::keychain`]).
+    fn keyring(&self) -> Msgid {
+        if self.look.keychain(crate::update::release::Os::current()) {
+            msgid("Keychain")
+        } else {
+            msgid("Keyring")
+        }
+    }
+
+    /// The name of the box that keeps the SSH secret: the database
+    /// password's has the same text beside it.
+    fn ssh_keyring(&self) -> Msgid {
+        if self.look.keychain(crate::update::release::Os::current()) {
+            msgid("Keychain for the SSH secret")
+        } else {
+            msgid("Keyring for the SSH secret")
+        }
+    }
+
+    fn saved_hint(&self) -> Msgid {
+        if self.look.keychain(crate::update::release::Os::current()) {
+            msgid("Saved in the keychain")
+        } else {
+            msgid("Saved in the keyring")
+        }
+    }
+
+    /// The height of a field: the terminal's 30, macOS's 32 (34 for the
+    /// name).
+    fn field_height(&self) -> f32 {
+        if self.look.terminal { 30.0 } else { 32.0 }
+    }
+
+    /// Where a field's text starts from its edge: past the border and the
+    /// designs' padding (8 in the terminal look, 10 on macOS). A list of
+    /// choices starts its text there too.
+    fn text_inset(&self) -> i8 {
+        if self.look.terminal { 9 } else { 11 }
+    }
+
+    /// Monospace for what goes to the server: hosts, names, paths.
+    fn value_role(&self) -> TextRole {
+        TextRole::pick(self.look, TextRole::GridCell, TextRole::OBody)
+    }
+}
+
+/// Whether `form` lists names of its connection's tables, for its Tables
+/// and Masked columns controls: only then is what an open window of the
+/// connection has loaded asked for, as what it costs is spent on them.
+pub fn lists_names(form: &ConnectionForm) -> bool {
+    form.agents_tables.names().is_some()
+        || !form.agents_masked.is_empty()
+        || form.agents_column_typed.is_some()
+}
+
+/// Draws the dialog over the window, and returns what it asks for.
+/// `loaded` is what an open window of the connection the form edits has
+/// loaded, read again on each frame, as a sidebar loads: `None` where it
+/// lists no names ([`lists_names`]), is a new connection, or no window of
+/// it is open.
+pub fn show(
+    ctx: &egui::Context,
+    paint: Paint,
+    form: &mut ConnectionForm,
+    keymap: &Keymap,
+    loaded: Option<LoadedTables>,
+) -> Vec<Action> {
+    let Paint {
+        locale,
+        palette,
+        look,
+    } = paint;
+    // The form's own keys, as the keymap has them for the look.
+    let layout = paint.layout();
+    let on = |input: &mut egui::InputState, command: Command| {
+        crate::ui::keys::asked(input, keymap, layout, command, Scope::Prompt, true)
+    };
+    // The columns of the tables the masked columns name, for their mark,
+    // and of the one Add column…'s field names, for its list: asked for
+    // once the frame is drawn.
+    let wanted = match (&form.editing, &loaded) {
+        (Some(conn), Some(loaded)) => {
+            let mut wanted: Vec<native-sql-database-client-windows_db::ObjectRef> = form
+                .agents_masked
+                .iter()
+                .flat_map(|entry| loaded.named(entry.schema.as_deref(), &entry.table))
+                .collect();
+            if let Some(typed) = &form.agents_column_typed {
+                wanted.extend(loaded.offered_columns(typed, &[]).tables);
+            }
+            // Only what no window has, nor is fetching, nor failed to get.
+            wanted.retain(|object| {
+                !loaded.columns.iter().any(|(known, _)| known == object)
+                    && !loaded.columns_loading.contains(object)
+                    && !loaded.columns_failed.contains(object)
+            });
+            (!wanted.is_empty()).then(|| Action::LoadAgentColumns {
+                conn: conn.clone(),
+                objects: wanted,
+            })
+        }
+        _ => None,
+    };
+    form.agents_loaded = loaded;
+    let placement: Placement = ctx
+        .data(|data| data.get_temp(placement_id()))
+        .unwrap_or_default();
+    // Until the form's height is known the dialog is measured, not shown.
+    let measuring = placement.top.is_none();
+    // A frame that is not shown cannot keep the keyboard, so Name is given
+    // it again on each one, and a last time on the first frame shown.
+    let focus_name = form.focus_name;
+    form.focus_name &= measuring;
+    let mut actions: Vec<Action> = wanted.into_iter().collect();
+    // The dialog's own keys are taken before anything draws: a focused
+    // button would read the chord that saves and connects as a press of
+    // itself. An open list keeps them, as it keeps Escape. A press of its
+    // own each: a held chord saves once.
+    if !egui::Popup::is_any_open(ctx) {
+        // A Test that is running is not started again by its key.
+        let testing = matches!(form.test, TestState::Running(_));
+        ctx.input_mut(|input| {
+            if on(input, Command::FormSaveAndConnect).fresh {
+                actions.push(Action::SaveConnection { connect: true });
+            }
+            if on(input, Command::FormSave).fresh {
+                actions.push(Action::SaveConnection { connect: false });
+            }
+            if on(input, Command::FormTest).fresh && !testing {
+                actions.push(Action::TestConnection);
+            }
+            // A Files connection's file chooser.
+            if is_files(form) && on(input, Command::FormPick).fresh {
+                actions.push(match form.files_kind {
+                    FilesKind::Folder => Action::PickFolder,
+                    FilesKind::Files => Action::PickDataFiles,
+                });
+            }
+        });
+    }
+    let skin = Skin::new(&look, &palette, locale, form.environment());
+    let screen = ctx.content_rect();
+    let width: f32 = if look.terminal { 780.0 } else { 700.0 };
+    let width = width.min(screen.width() - 48.0).max(320.0);
+    // A modal: nothing behind it can be clicked while it is open.
+    let id = egui::Id::new("connection-dialog");
+    let top = placement
+        .top
+        .unwrap_or_else(|| top_edge(screen.height(), reserve(&look)));
+    let frame = if measuring {
+        unseen(frame(&skin))
+    } else {
+        frame(&skin)
+    };
+    // The dialog is whole on the first frame it paints. egui fades an area
+    // in by drawing everything in it see-through for a moment, and through
+    // a sheet this large the window shows in every field.
+    let area = egui::Modal::default_area(id)
+        .anchor(egui::Align2::CENTER_TOP, vec2(0.0, top))
+        .fade_in(false);
+    let mut modal = widgets::modal(id, &look, &palette).frame(frame).area(area);
+    if measuring {
+        // Nor is the window veiled before there is a dialog over it.
+        modal = modal.backdrop_color(Color32::TRANSPARENT);
+    }
+    let modal = modal.show(ctx, |ui| {
+        if measuring {
+            ui.set_invisible();
+        }
+        ui.set_width(width);
+        // An area offers its content the height it had on the last frame,
+        // so a form that grew would reach its new height a step per frame.
+        ui.set_max_height(screen.height());
+        style_controls(ui, &skin);
+        if look.terminal {
+            terminal_header(ui, form, &skin);
+        } else {
+            header(ui, form, &skin, &mut actions);
+        }
+        // The fields scroll when the window is short, so the messages and
+        // the footer stay on screen.
+        let chrome = if look.terminal { 86.0 } else { 140.0 };
+        let space = screen.bottom() - top - chrome - 24.0;
+        let messages = Messages::new(ui.ctx(), form, width, (space / 3.0).max(60.0), &skin);
+        let room = (space - messages.height(&skin)).max(120.0);
+        let fields = egui::ScrollArea::vertical()
+            .max_height(room)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                if look.terminal {
+                    terminal_body(ui, form, &skin, focus_name, &mut actions);
+                } else {
+                    body(ui, form, &skin, focus_name, &mut actions);
+                }
+            });
+        messages.show(ui, &skin, &mut actions);
+        if look.terminal {
+            terminal_footer(ui, form, &skin, &mut actions);
+        } else {
+            footer(ui, form, &skin, &mut actions);
+        }
+        // What the form needs beyond what it got, unless this frame only
+        // sized the area: egui squeezes that one, so it measures nothing.
+        let hidden = (fields.content_size.y - fields.inner_rect.height()).max(0.0);
+        (!ui.is_sizing_pass()).then_some(hidden)
+    });
+    // A form taller than the room kept for it (a tunnel's fields) is
+    // centred on its own height; the edge stays put from then on.
+    if measuring {
+        if let Some(hidden) = modal.inner {
+            let height = modal.response.rect.height() + hidden;
+            let top = top_edge(screen.height(), height.max(reserve(&look)));
+            ctx.data_mut(|data| data.insert_temp(placement_id(), Placement { top: Some(top) }));
+        }
+        // Shown from the next frame on.
+        ctx.request_repaint();
+    }
+    if modal.is_top_modal && !modal.any_popup_open {
+        let typing = ctx.text_edit_focused();
+        // The override whose row has the keyboard, which `R` resets (the
+        // terminal look's key).
+        let mut reset = reading::focused_override(ctx, form);
+        let toggle_url = ctx.input_mut(|input| {
+            // The form's cancel closes the dialog, unless it is closing an
+            // open list first.
+            if on(input, Command::FormCancel).count > 0 {
+                actions.push(Action::CloseDialog);
+            }
+            // The letter that shows the URL field, in the look that has
+            // one, when it is not a letter being typed.
+            let mut toggled = false;
+            if !typing {
+                let when = crate::keymap::When::ConnectionForm;
+                input.events.retain(|event| {
+                    let egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        repeat,
+                        ..
+                    } = event
+                    else {
+                        return true;
+                    };
+                    let letter = crate::keymap::char_of(*key, modifiers.shift)
+                        .filter(|_| !(modifiers.command || modifiers.ctrl || modifiers.alt));
+                    let command = letter.and_then(|letter| {
+                        let typed = letter.to_string();
+                        crate::ui::keys::prompt_letter(keymap, layout, when, &typed)
+                    });
+                    // A Files connection has no URL; its list has letters
+                    // of its own.
+                    let files = is_files(form);
+                    let listed = files && form.files_kind == FilesKind::Files;
+                    match command {
+                        Some(Command::FormPasteUrl) if !files => {
+                            toggled = true;
+                            false
+                        }
+                        Some(Command::FormAddFiles) if listed => {
+                            actions.push(Action::PickDataFiles);
+                            false
+                        }
+                        Some(Command::FormResetOverride) if files => {
+                            // Once a press: a held `R` would take off the
+                            // override that moves up into its place, and on.
+                            if !*repeat && let Some(at) = reset.take() {
+                                actions.push(Action::SetCsv(crate::model::CsvChange::Reset(at)));
+                            }
+                            false
+                        }
+                        Some(Command::FormRemoveFile) if listed => {
+                            if let Some(at) = form
+                                .files_cursor
+                                .or((!form.files_list.is_empty()).then_some(0))
+                            {
+                                actions.push(Action::RemoveFile(at));
+                            }
+                            false
+                        }
+                        _ => true,
+                    }
+                });
+                // The arrows move through the list of files.
+                if is_files(form) && form.files_kind == FilesKind::Files {
+                    let rows = form.files_list.len();
+                    let step = moves(input, keymap, layout);
+                    if rows > 0 && step != 0 {
+                        let at = form.files_cursor.unwrap_or(0) as isize + step;
+                        form.files_cursor = Some(at.clamp(0, rows as isize - 1) as usize);
+                    }
+                }
+            }
+            toggled
+        });
+        // After the input is released: showing the field writes to egui's
+        // memory, which sits behind the same lock.
+        if toggle_url {
+            show_url(ctx, form, !form.url_mode);
+        }
+    }
+    resets_once(&mut actions);
+    // A save goes last: what the same frame changed in the form (a key's
+    // Reset, a choice) is saved with it, not dropped with the dialog.
+    actions.sort_by_key(|action| matches!(action, Action::SaveConnection { .. }));
+    actions
+}
+
+/// What the dialog does on a frame it is not open: the next one opened
+/// settles its own top edge.
+pub fn fold(ctx: &egui::Context) {
+    ctx.data_mut(|data| data.remove::<Placement>(placement_id()));
+}
+
+/// How far the form's list was asked to move this frame, by the keys the
+/// keymap gives it: up by one, down by one, or not.
+fn moves(
+    input: &mut egui::InputState,
+    keymap: &crate::keymap::Keymap,
+    layout: crate::keymap::Layout,
+) -> isize {
+    let mut step = 0;
+    for keys in keymap.chords_now(layout, Command::FormTableMove, Scope::Prompt, true) {
+        let way = if keys == "up" { -1 } else { 1 };
+        if crate::ui::keys::presses(input, layout, keys).count > 0 {
+            step += way;
+        }
+    }
+    step
+}
+
+/// Shows or hides the URL field; shown, it takes the keyboard.
+fn show_url(ctx: &egui::Context, form: &mut ConnectionForm, shown: bool) {
+    form.url_mode = shown;
+    if shown {
+        ctx.data_mut(|data| data.insert_temp(focus_url_id(), true));
+    }
+}
+
+/// `frame` taking the same room and painting nothing, for the frames that
+/// only measure the dialog.
+fn unseen(frame: egui::Frame) -> egui::Frame {
+    let stroke = Stroke::new(frame.stroke.width, Color32::TRANSPARENT);
+    frame
+        .fill(Color32::TRANSPARENT)
+        .stroke(stroke)
+        .shadow(egui::epaint::Shadow::NONE)
+}
+
+/// The dialog's frame: its parts fill it edge to edge, so it has no margin
+/// of its own.
+fn frame(skin: &Skin) -> egui::Frame {
+    let frame = egui::Frame::new()
+        .fill(skin.fill)
+        .corner_radius(CornerRadius::same(skin.radius()))
+        .stroke(skin.stroke());
+    if skin.look.terminal {
+        frame
+    } else {
+        frame.shadow(egui::epaint::Shadow {
+            offset: [0, 24],
+            blur: 64,
+            spread: 0,
+            color: skin.palette.shadow,
+        })
+    }
+}
+
+/// Fields as the designs draw them: boxes with a border on the field
+/// colour, and no spacing but what the layout adds. A dropdown takes the
+/// fill from here.
+fn style_controls(ui: &mut Ui, skin: &Skin) {
+    let Skin { look, palette, .. } = *skin;
+    let (fill, border, radius, width) = if look.terminal {
+        (palette.panel, palette.outline, 3, 1.0)
+    } else {
+        let fill = if palette.dark {
+            palette.surface
+        } else {
+            palette.window
+        };
+        (
+            fill,
+            palette.border,
+            look.radius.saturating_sub(1),
+            widgets::hairline(ui),
+        )
+    };
+    let visuals = ui.visuals_mut();
+    visuals.extreme_bg_color = fill;
+    for state in [
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        state.corner_radius = CornerRadius::same(radius);
+        state.bg_stroke = Stroke::new(width, border);
+    }
+    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+    ui.spacing_mut().interact_size.y = skin.field_height();
+}
+
+fn title(form: &ConnectionForm) -> Msgid {
+    if form.editing.is_some() {
+        msgid("Edit connection")
+    } else {
+        msgid("New connection")
+    }
+}
+
+/// What the header says under (or after) the title: the connection's name
+/// and environment, or its kind until it has either. The name is as typed;
+/// the rest is in the look's case.
+fn subtitle(form: &ConnectionForm, skin: &Skin) -> String {
+    let name = form.name.trim();
+    let mut parts = Vec::new();
+    if !name.is_empty() {
+        parts.push(name.to_owned());
+    }
+    if skin.environment != Environment::None {
+        // As its badge says it on the sheet, in the look's case.
+        // The environment's name stays English in every language.
+        parts.push(skin.look.label(skin.environment.label(Platform::Native)));
+    }
+    if parts.is_empty() {
+        parts.push(skin.look.label(form.driver.label()));
+    }
+    parts.join(" · ")
+}
+
+/// The header's line about the connection, from `left` on the line centred
+/// at `center`. A long name (a URL names a connection `user@host:port/db`)
+/// is cut short with "…" to `room`, and shown whole under the pointer.
+fn connection_line(
+    ui: &mut Ui,
+    (left, center): (f32, f32),
+    text: &str,
+    role: TextRole,
+    room: f32,
+    skin: &Skin,
+) {
+    let Skin { look, palette, .. } = *skin;
+    let shown = crate::ui::grid::ellipsize(text, room.max(0.0), false, |text| {
+        role.width(ui.ctx(), look.faces, text)
+    });
+    let laid = Text::one(look, role, &shown, palette.dim).layout(ui.ctx());
+    laid.paint_left(ui.painter(), left, center);
+    let place = Rect::from_min_size(pos2(left, center - laid.height() / 2.0), laid.size());
+    let response = ui.interact(place, ui.id().with("connection-line"), Sense::hover());
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &*shown));
+    if shown != text {
+        response.on_hover_text(text);
+    }
+}
+
+/// A column of a [`row`]: a share of the free width, or a fixed width.
+#[derive(Clone, Copy)]
+enum Column {
+    Fr(f32),
+    Px(f32),
+}
+
+/// The widths `columns` take in `total`, `gap` apart.
+fn column_widths(total: f32, gap: f32, columns: &[Column]) -> Vec<f32> {
+    let fixed: f32 = columns
+        .iter()
+        .map(|column| match column {
+            Column::Px(width) => *width,
+            Column::Fr(_) => 0.0,
+        })
+        .sum();
+    let shares: f32 = columns
+        .iter()
+        .map(|column| match column {
+            Column::Fr(share) => *share,
+            Column::Px(_) => 0.0,
+        })
+        .sum();
+    let free = (total - fixed - gap * columns.len().saturating_sub(1) as f32).max(0.0);
+    columns
+        .iter()
+        .map(|column| match column {
+            Column::Px(width) => *width,
+            Column::Fr(share) => (free * share / shares.max(f32::EPSILON)).floor(),
+        })
+        .collect()
+}
+
+/// Cells side by side across the available width, their tops in line.
+fn row(ui: &mut Ui, gap: f32, columns: &[Column], mut cell: impl FnMut(&mut Ui, usize)) {
+    let widths = column_widths(ui.available_width(), gap, columns);
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        for (index, width) in widths.into_iter().enumerate() {
+            ui.allocate_ui_with_layout(
+                vec2(width, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_width(width);
+                    cell(ui, index);
+                },
+            );
+        }
+    });
+}
+
+/// A field filling its cell, `height` tall.
+fn input<'t>(
+    ui: &Ui,
+    text: &'t mut String,
+    role: TextRole,
+    height: f32,
+    skin: &Skin,
+) -> egui::TextEdit<'t> {
+    let pad = skin.text_inset();
+    widgets::field(ui, text, skin.look, role, height, pad).desired_width(f32::INFINITY)
+}
+
+/// The placeholder of the field that fills `ui`, in the field's role. A
+/// field grows to hold a placeholder laid out for it, so one longer than
+/// the field (a value from ~/.ssh/config in a narrow column) is cut to
+/// the field's room with "…". Screen readers still hear all of it.
+fn hint(ui: &Ui, text: &str, role: TextRole, skin: &Skin) -> std::sync::Arc<egui::Galley> {
+    let room = ui.available_width() - 2.0 * f32::from(skin.text_inset());
+    let mut text = Text::one(skin.look, role, text, skin.palette.faint);
+    text.job_mut().wrap = egui::text::TextWrapping::truncate_at_width(room.max(0.0));
+    text.layout(ui.ctx()).galley
+}
+
+/// The button beside a field, with the field's corners: it says `text`
+/// and screen readers hear `name`.
+fn side_button<'a>(text: &'a str, name: &'a str, skin: &Skin) -> ButtonSpec<'a> {
+    ButtonSpec::new(text)
+        .label(name)
+        .padding(10.0)
+        .radius(if skin.look.terminal {
+            3
+        } else {
+            skin.look.radius.saturating_sub(1)
+        })
+}
+
+/// The space between a field and the button beside it.
+fn side_gap(skin: &Skin) -> f32 {
+    if skin.look.terminal { 8.0 } else { 6.0 }
+}
+
+/// A field and the button that picks a file for it, 6 apart (8 in the
+/// terminal look). Returns the field, and whether the button was clicked.
+fn field_with_button(
+    ui: &mut Ui,
+    button: &str,
+    name: Msgid,
+    skin: &Skin,
+    field: impl FnOnce(&mut Ui) -> Response,
+) -> (Response, bool) {
+    let Skin { look, palette, .. } = *skin;
+    let height = skin.field_height();
+    let name = name.say(skin.locale);
+    let spec = || side_button(button, &name, skin);
+    let gap = side_gap(skin);
+    let width = spec().width(ui, look);
+    let mut field = Some(field);
+    let mut output = None;
+    let mut clicked = false;
+    row(
+        ui,
+        gap,
+        &[Column::Fr(1.0), Column::Px(width)],
+        |ui, column| {
+            if column == 0 {
+                if let Some(field) = field.take() {
+                    output = Some(field(ui));
+                }
+            } else {
+                clicked = spec().show(ui, height, look, palette).clicked();
+            }
+        },
+    );
+    let response = output.unwrap_or_else(|| ui.response());
+    (response, clicked)
+}
+
+/// Names `response` for screen readers, where no label beside it does.
+/// Only the name is set: the node keeps the role and the state egui gave
+/// it, so a password field stays one and a check box keeps its mark.
+fn named(response: &Response, name: Msgid, skin: &Skin) {
+    let name = name.say(skin.locale);
+    response
+        .ctx
+        .accesskit_node_builder(response.id, |node| node.set_label(&*name));
+}
+
+/// The key that deletes the saved password from the Password `field`, as
+/// it would delete the dots of one shown there. It holds while the field
+/// has the keyboard and was, before it drew, empty and saying the password
+/// is saved (`forgettable`): a key that deletes the last letter typed
+/// leaves the saved password alone, and so do its repeats while it is
+/// held.
+fn forget_saved_password(
+    ui: &Ui,
+    field: &egui::Response,
+    forgettable: bool,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    if !(forgettable && field.has_focus()) {
+        return;
+    }
+    let keymap = crate::ui::keys::published(ui.ctx());
+    let layout = crate::keymap::Layout::of(skin.look);
+    let asked = ui.input_mut(|input| {
+        let command = Command::FormForgetPassword;
+        crate::ui::keys::asked(input, &keymap, layout, command, Scope::Prompt, false)
+    });
+    if asked.fresh {
+        actions.push(Action::ForgetSavedPassword);
+    }
+}
+
+/// The password's mode as a check box: saved in the keyring, or asked for
+/// on every connect.
+fn keeps(mode: PasswordMode) -> bool {
+    mode != PasswordMode::Ask
+}
+
+fn set_keeps(mode: &mut PasswordMode, keep: bool) {
+    *mode = if keep {
+        PasswordMode::Keyring
+    } else {
+        PasswordMode::Ask
+    };
+}
+
+/// SQLite: the file, and the button that picks one.
+fn file_field(ui: &mut Ui, form: &mut ConnectionForm, skin: &Skin, actions: &mut Vec<Action>) {
+    let role = skin.value_role();
+    let height = skin.field_height();
+    let choose = skin.say(msgid("Choose…"));
+    let mut pick = |ui: &mut Ui, label: egui::Id| {
+        let (field, clicked) =
+            field_with_button(ui, &choose, msgid("Choose a database file"), skin, |ui| {
+                ui.add(input(ui, &mut form.sqlite_path, role, height, skin))
+            });
+        field.labelled_by(label);
+        if clicked {
+            actions.push(Action::PickSqliteFile);
+        }
+    };
+    if skin.look.terminal {
+        terminal_row(ui, &skin.say(msgid("File")), skin, |ui, label| {
+            pick(ui, label);
+        });
+    } else {
+        let label = widgets::label(
+            ui,
+            TextRole::Secondary,
+            &skin.say(msgid("File")),
+            skin.palette.secondary,
+            skin.look,
+        );
+        ui.add_space(5.0);
+        pick(ui, label.id);
+    }
+}
+
+/// Whether the TLS mode checks the server against a CA file. `require`
+/// uses one too (as verify-ca, like libpq).
+fn uses_ca_file(mode: TlsMode) -> bool {
+    matches!(
+        mode,
+        TlsMode::Require | TlsMode::VerifyCa | TlsMode::VerifyFull
+    )
+}
+
+/// What an empty CA file means in each mode. verify-ca refuses the system
+/// roots: they vouch for any public certificate.
+fn ca_hint(mode: TlsMode) -> Msgid {
+    match mode {
+        TlsMode::Require => msgid("None (not checked)"),
+        TlsMode::VerifyCa => msgid("Required"),
+        TlsMode::VerifyFull => msgid("System certificates"),
+        TlsMode::Disable | TlsMode::Prefer => msgid("Not used"),
+    }
+}
+
+/// The CA certificate's field and its button, greyed out in the modes that
+/// check nothing.
+fn ca_field(
+    ui: &mut Ui,
+    form: &mut ConnectionForm,
+    label: egui::Id,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) {
+    let role = TextRole::pick(skin.look, TextRole::MonoSecondary, TextRole::OBody);
+    let height = skin.field_height();
+    let placeholder = skin.say(ca_hint(form.tls));
+    ui.add_enabled_ui(uses_ca_file(form.tls), |ui| {
+        let (field, clicked) = field_with_button(
+            ui,
+            &skin.say(msgid("Choose…")),
+            msgid("Choose a CA certificate"),
+            skin,
+            |ui| {
+                let hint = hint(ui, &placeholder, role, skin);
+                ui.add(input(ui, &mut form.ca_file, role, height, skin).hint_text(hint))
+            },
+        );
+        field.labelled_by(label);
+        if clicked {
+            actions.push(Action::PickCaFile);
+        }
+    });
+}
+
+/// The warning under the TLS mode when it leaves the password readable.
+fn intercept_warning(ui: &mut Ui, skin: &Skin) {
+    let text = INTERCEPT_WARNING.say(skin.locale);
+    note(ui, &text, skin.palette.warning, skin);
+}
+
+/// What the SSH secret is, for the chosen login.
+fn ssh_secret_name(auth: SshAuthKind) -> Msgid {
+    if auth == SshAuthKind::Password {
+        msgid("SSH password")
+    } else {
+        msgid("Passphrase")
+    }
+}
+
+/// The SSH host's field with `placeholder`. When ~/.ssh/config names hosts,
+/// a button after it lists their aliases, each with its HostName; choosing
+/// one fills the field.
+fn ssh_host_field(
+    ui: &mut Ui,
+    form: &mut ConnectionForm,
+    role: TextRole,
+    placeholder: &str,
+    skin: &Skin,
+    actions: &mut Vec<Action>,
+) -> Response {
+    let Skin { look, palette, .. } = *skin;
+    let height = skin.field_height();
+    let hosts = &form.ssh_hosts;
+    let host = &mut form.ssh_host;
+    let field = |ui: &mut Ui, host: &mut String| {
+        let hint = hint(ui, placeholder, role, skin);
+        ui.add(input(ui, host, role, height, skin).hint_text(hint))
+    };
+    if hosts.is_empty() {
+        return field(ui, host);
+    }
+    let name = gettext(skin.locale, "Hosts from ~/.ssh/config");
+    let spec = || {
+        side_button("", &name, skin)
+            .icon(Icon::ChevronDown)
+            // A button's width counts the gap after its icon even when no
+            // text follows.
+            .gap(0.0)
+    };
+    let width = spec().width(ui, look);
+    let mut output = None;
+    row(
+        ui,
+        side_gap(skin),
+        &[Column::Fr(1.0), Column::Px(width)],
+        |ui, column| {
+            if column == 0 {
+                output = Some(field(ui, host));
+                return;
+            }
+            let button = spec().show(ui, height, look, palette).on_hover_text(&*name);
+            menu::under(&button, 0.0, look, palette, |ui| {
+                for host in hosts {
+                    let item = menu::Item::action(&host.alias);
+                    let item = match &host.config.host_name {
+                        Some(name) => item.detail(name),
+                        None => item,
+                    };
+                    if item.show(ui, look, palette).clicked() {
+                        actions.push(Action::PickSshHost(host.alias.clone()));
+                        // A menu closes by itself on a pointer's click
+                        // only: the keyboard and a screen reader pick
+                        // too.
+                        ui.close();
+                    }
+                }
+            });
+        },
+    );
+    output.unwrap_or_else(|| ui.response())
+}
+
+/// What an empty SSH port means: the port ~/.ssh/config gives the typed
+/// host, else 22.
+fn ssh_port_hint(hints: &SshHints) -> String {
+    hints.port.unwrap_or(22).to_string()
+}
+
+/// A value ~/.ssh/config gives the typed host, saying where it is from.
+fn from_config(value: &str, skin: &Skin) -> String {
+    format!("{value} ({})", gettext(skin.locale, "from ~/.ssh/config"))
+}
+
+/// What an empty SSH user means: the config's user for the typed host,
+/// else the login name. Empty when that is not known.
+fn ssh_user_hint(hints: &SshHints, skin: &Skin) -> String {
+    match &hints.user {
+        Some(user) => from_config(user, skin),
+        None => native-sql-database-client-windows_db::ssh_config::login().unwrap_or_default(),
+    }
+}
+
+/// What an empty key file means: the config's key for the typed host, when
+/// it names one.
+fn ssh_key_hint(hints: &SshHints, skin: &Skin) -> Option<String> {
+    hints.key_file.as_ref().map(|path| from_config(path, skin))
+}
+
+/// What goes under the SSH host, and its colour: the host name
+/// ~/.ssh/config resolves the typed host to, and the ProxyJump or
+/// ProxyCommand the tunnel goes through. `None` when there is nothing to
+/// say.
+fn ssh_host_note(hints: &SshHints, skin: &Skin) -> Option<(String, Color32)> {
+    let locale = skin.locale;
+    // Whole sentences, so a translation can put the host and the hops where
+    // its language wants them.
+    let sentence = match (&hints.host_name, &hints.proxy) {
+        (Some(_), Some(Proxy::Jump(_))) => {
+            msgid("{name} through ProxyJump {hops} from ~/.ssh/config")
+        }
+        (Some(_), Some(Proxy::Command(_))) => {
+            msgid("{name} through a ProxyCommand from ~/.ssh/config")
+        }
+        (None, Some(Proxy::Jump(_))) => msgid("Through ProxyJump {hops} from ~/.ssh/config"),
+        (None, Some(Proxy::Command(_))) => msgid("Through a ProxyCommand from ~/.ssh/config"),
+        (Some(name), Some(Proxy::Off) | None) => {
+            let text = gettext(locale, "{name} from ~/.ssh/config").replace("{name}", name);
+            return Some((text, skin.palette.dim));
+        }
+        (None, Some(Proxy::Off) | None) => return None,
+    };
+    let hops = match &hints.proxy {
+        Some(Proxy::Jump(hops)) => hops.as_str(),
+        _ => "",
+    };
+    let name = hints.host_name.as_deref().unwrap_or("");
+    let text = crate::i18n::fill(&sentence.say(locale), &[("{hops}", hops), ("{name}", name)]);
+    Some((text, skin.palette.dim))
+}
+
+/// A line of small print about a field, wrapped to the room there is.
+fn note(ui: &mut Ui, text: &str, color: Color32, skin: &Skin) {
+    Text::one(skin.look, widgets::secondary(skin.look), text, color)
+        .wrap(ui.available_width())
+        .layout(ui.ctx())
+        .label(ui);
+}
+
+/// The URL field, with the chosen driver's URL as its placeholder. It
+/// takes the keyboard on the frame it appears.
+fn url_field(ui: &mut Ui, form: &mut ConnectionForm, skin: &Skin) -> Response {
+    let role = skin.value_role();
+    let example = match form.driver {
+        Driver::Sqlite => "sqlite:///path/to/file.db",
+        Driver::MySql => "mysql://user@host/db",
+        Driver::Postgres => "postgres://user@host/db",
+        Driver::BigQuery => "bigquery:project-id?credentials=/path/key.json",
+        Driver::Files => "~/Data/exports",
+    };
+    let hint = hint(ui, example, role, skin);
+    let field = ui.add(input(ui, &mut form.url, role, skin.field_height(), skin).hint_text(hint));
+    let focus = ui
+        .ctx()
+        .data_mut(|data| data.remove_temp::<bool>(focus_url_id()))
+        .unwrap_or(false);
+    if focus {
+        field.request_focus();
+    }
+    field
+}
+
+/// Each override is taken off once a frame (Enter on its row and `R` both
+/// ask), the last first, as taking one off moves up those after it; the
+/// Resets stay where the first was among the frame's actions, so a Test or
+/// a Delete asked after them still comes after.
+fn resets_once(actions: &mut Vec<Action>) {
+    let reset = |action: &Action| match action {
+        Action::SetCsv(crate::model::CsvChange::Reset(at)) => Some(*at),
+        _ => None,
+    };
+    let Some(first) = actions.iter().position(|action| reset(action).is_some()) else {
+        return;
+    };
+    let mut resets: Vec<usize> = actions.iter().filter_map(reset).collect();
+    resets.sort_unstable_by(|a, b| b.cmp(a));
+    resets.dedup();
+    actions.retain(|action| reset(action).is_none());
+    actions.splice(
+        first..first,
+        resets
+            .into_iter()
+            .map(|at| Action::SetCsv(crate::model::CsvChange::Reset(at))),
+    );
+}
+
+/// What went wrong: a field that does not describe a connection, a failed
+/// Test, or an SSH host key to trust first. It sits between the fields and
+/// the footer, outside what scrolls, so it is on screen wherever the
+/// fields are scrolled to. It is laid out before anything is drawn, so the
+/// fields get the room it leaves on the same frame.
+struct Messages {
+    /// Each text in its colour, wrapped to the dialog's width.
+    notices: Vec<(crate::typography::Laid, Color32)>,
+    /// The texts scroll by themselves past this height, so a long message
+    /// cannot push the footer off the screen.
+    cap: f32,
+    /// An unknown SSH host key: the button that trusts it follows.
+    untrusted: bool,
+}
+
+impl Messages {
+    /// The space between two notices, and before the button.
+    const GAP: f32 = 8.0;
+
+    fn new(ctx: &egui::Context, form: &ConnectionForm, width: f32, cap: f32, skin: &Skin) -> Self {
+        let Skin { look, palette, .. } = *skin;
+        let mut texts: Vec<(std::borrow::Cow<'_, str>, Color32)> = Vec::new();
+        if let Some(message) = &form.message {
+            texts.push((message.into(), palette.danger));
+        }
+        let mut untrusted = false;
+        match &form.test {
+            TestState::Idle | TestState::Running(_) | TestState::Passed => {}
+            TestState::Failed(message) => texts.push((message.into(), palette.danger)),
+            TestState::Untrusted {
+                host, fingerprint, ..
+            } => {
+                let text = crate::i18n::fill(
+                    &gettext(
+                        skin.locale,
+                        "Unknown SSH host key for {host}: {fingerprint}",
+                    ),
+                    &[("{host}", host), ("{fingerprint}", fingerprint)],
+                );
+                texts.push((text.into(), palette.warning));
+                untrusted = true;
+            }
+        }
+        // As wide as the dialog less its margins, and a box's own.
+        let wrap = width - 2.0 * Self::side(skin) - 2.0 * Self::pad(skin).x;
+        let lay = |wrap: f32| -> Vec<(crate::typography::Laid, Color32)> {
+            texts
+                .iter()
+                .map(|(text, color)| {
+                    let laid = Text::one(look, widgets::body(look), text, *color)
+                        .wrap(wrap)
+                        .layout(ctx);
+                    (laid, *color)
+                })
+                .collect()
+        };
+        let mut messages = Self {
+            notices: lay(wrap),
+            cap,
+            untrusted,
+        };
+        // Texts that will scroll leave room for the scroll bar.
+        if messages.texts_height(skin) > cap {
+            let bar = ctx.global_style().spacing.scroll.allocated_width();
+            messages.notices = lay(wrap - bar);
+        }
+        messages
+    }
+
+    /// The margin at each side of the messages.
+    fn side(skin: &Skin) -> f32 {
+        if skin.look.terminal { 18.0 } else { 20.0 }
+    }
+
+    /// The margin over the messages. The terminal look's are plain lines,
+    /// which would touch a field the scrolling cuts short.
+    fn above(skin: &Skin) -> f32 {
+        if skin.look.terminal { 8.0 } else { 0.0 }
+    }
+
+    /// The margin under the messages, above the footer.
+    fn below(skin: &Skin) -> f32 {
+        if skin.look.terminal { 12.0 } else { 18.0 }
+    }
+
+    /// What a notice keeps clear around its text: macOS draws a tinted
+    /// box, the terminal look a plain coloured line.
+    fn pad(skin: &Skin) -> egui::Vec2 {
+        if skin.look.terminal {
+            egui::Vec2::ZERO
+        } else {
+            vec2(14.0, 10.0)
+        }
+    }
+
+    /// How tall the notices are, one under the other, with nothing cut.
+    fn texts_height(&self, skin: &Skin) -> f32 {
+        let pad = 2.0 * Self::pad(skin).y;
+        let texts: f32 = self
+            .notices
+            .iter()
+            .map(|(laid, _)| laid.height() + pad)
+            .sum();
+        texts + Self::GAP * self.notices.len().saturating_sub(1) as f32
+    }
+
+    /// The height the messages take in the dialog: nothing when nothing
+    /// went wrong.
+    fn height(&self, skin: &Skin) -> f32 {
+        if self.notices.is_empty() {
+            return 0.0;
+        }
+        let button = if self.untrusted {
+            Self::GAP + skin.field_height()
+        } else {
+            0.0
+        };
+        Self::above(skin) + self.texts_height(skin).min(self.cap) + button + Self::below(skin)
+    }
+
+    fn show(self, ui: &mut Ui, skin: &Skin, actions: &mut Vec<Action>) {
+        if self.notices.is_empty() {
+            return;
+        }
+        let Skin { look, palette, .. } = *skin;
+        let side = Self::side(skin) as i8;
+        let pad = Self::pad(skin);
+        egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: side,
+                right: side,
+                top: Self::above(skin) as i8,
+                bottom: Self::below(skin) as i8,
+            })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::ScrollArea::vertical()
+                    .id_salt("messages")
+                    .max_height(self.cap)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for (index, (laid, color)) in self.notices.into_iter().enumerate() {
+                            if index > 0 {
+                                ui.add_space(Self::GAP);
+                            }
+                            if look.terminal {
+                                laid.label(ui);
+                                continue;
+                            }
+                            egui::Frame::new()
+                                .fill(theme::mix(skin.fill, color, 0.08))
+                                .corner_radius(CornerRadius::same(10))
+                                .inner_margin(egui::Margin::symmetric(pad.x as i8, pad.y as i8))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    laid.label(ui);
+                                });
+                        }
+                    });
+                // The way out of an unknown host key stays in reach however
+                // long the text above it is.
+                if self.untrusted {
+                    ui.add_space(Self::GAP);
+                    let trust = skin.say(msgid("Trust and test"));
+                    if ButtonSpec::new(&trust)
+                        .label(&gettext(skin.locale, "Trust and test"))
+                        .show(ui, skin.field_height(), look, palette)
+                        .clicked()
+                    {
+                        actions.push(Action::TrustTestHostKey);
+                    }
+                }
+            });
+    }
+}
+
+/// What the footer says about the last Test: that it is running, or what
+/// it reached and how long that took.
+enum Status {
+    Running(String),
+    Passed(String),
+}
+
+fn status(form: &ConnectionForm, skin: &Skin) -> Option<Status> {
+    match form.test {
+        TestState::Running(_) => Some(Status::Running(skin.say(msgid("Testing…")))),
+        TestState::Passed => {
+            let driver = form
+                .test_spec
+                .as_ref()
+                .map_or(form.driver, |spec| spec.driver);
+            // Only a Files Test read files: what one read stays in the
+            // form when the type changes.
+            let read = match driver {
+                Driver::Files => form.files_tested.as_ref(),
+                Driver::Postgres | Driver::MySql | Driver::Sqlite | Driver::BigQuery => None,
+            };
+            let mut text = match read {
+                // What a Files connection's Test read: "Read 3 files ·
+                // 2.4 GB".
+                Some(read) => ngettext(
+                    skin.locale,
+                    "Read {n} file · {size}",
+                    "Read {n} files · {size}",
+                    read.files,
+                )
+                .replace("{n}", &crate::i18n::number(skin.locale, read.files))
+                .replace("{size}", &native-sql-database-client-windows_db::files::size_text(read.bytes)),
+                None => format!("{} · {}", gettext(skin.locale, "Connected"), driver.label()),
+            };
+            if let Some(took) = form.test_took {
+                text = format!("{text} · {}", crate::format::elapsed(skin.locale, took));
+            }
+            Some(Status::Passed(skin.look.label(&text)))
+        }
+        TestState::Idle | TestState::Failed(_) | TestState::Untrusted { .. } => None,
+    }
+}
+
+/// Where the Test's status goes: from its left edge on, or up to its right
+/// edge.
+#[derive(Clone, Copy)]
+enum StatusAt {
+    Left(f32),
+    Right(f32),
+}
+
+/// Paints the Test's status at `x`, centred on `y`. Returns its width:
+/// nothing when there is no status to show.
+fn paint_status(ui: &mut Ui, form: &ConnectionForm, x: StatusAt, y: f32, skin: &Skin) -> f32 {
+    let Skin { look, palette, .. } = *skin;
+    let Some(status) = status(form, skin) else {
+        return 0.0;
+    };
+    let role = widgets::secondary(look);
+    let (text, color) = match &status {
+        Status::Running(text) => (text, palette.dim),
+        Status::Passed(text) => (text, palette.success),
+    };
+    let laid = Text::one(look, role, text, color).layout(ui.ctx());
+    // The mark and the gap after it. The terminal look's are smaller:
+    // together about what a letter and a space of its text take, where
+    // its design has a tick typed before the words.
+    let (mark, gap) = if look.terminal {
+        (10.0, 5.0)
+    } else {
+        (12.0, 6.0)
+    };
+    let left = match x {
+        StatusAt::Left(left) => left,
+        StatusAt::Right(right) => right - laid.width() - mark - gap,
+    };
+    let place = Rect::from_center_size(pos2(left + mark / 2.0, y), vec2(mark, mark));
+    match status {
+        Status::Running(_) => {
+            ui.put(place, egui::Spinner::new().size(mark).color(color));
+        }
+        Status::Passed(_) => paint_check(ui.painter(), place, color),
+    }
+    let x = left + mark + gap;
+    laid.paint_left(ui.painter(), x, y);
+    widgets::announce(
+        ui,
+        Rect::from_min_size(pos2(x, y - laid.height() / 2.0), laid.size()),
+        laid.galley.text(),
+    );
+    mark + gap + laid.width()
+}
+
+/// A check mark filling `place`: the plain tick the designs put before a
+/// Test that passed, and in the box of what always holds.
+fn paint_check(painter: &egui::Painter, place: Rect, color: Color32) {
+    let unit = place.width() / 24.0;
+    let at = |x: f32, y: f32| place.min + vec2(x, y) * unit;
+    painter.line(
+        vec![at(5.0, 12.0), at(10.0, 17.0), at(19.0, 7.0)],
+        Stroke::new(2.6 * unit, color),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A ProxyJump from ~/.ssh/config that holds the host's placeholder is
+    /// written as it is, before the host's name.
+    #[test]
+    fn a_braced_proxy_jump_is_written_as_it_is() {
+        let (look, palette) = (Look::macos(), Palette::light());
+        let skin = Skin::new(&look, &palette, Locale::English, Environment::None);
+        let hints = SshHints {
+            host_name: Some("db.internal".into()),
+            proxy: Some(Proxy::Jump("{name}".into())),
+            ..SshHints::default()
+        };
+        let (text, _) = ssh_host_note(&hints, &skin).unwrap();
+        assert_eq!(
+            text,
+            "db.internal through ProxyJump {name} from ~/.ssh/config"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resets_tests {
+    use super::*;
+    use crate::model::CsvChange;
+
+    /// Resets stay before what the frame asked after them, each override
+    /// once, the last first.
+    #[test]
+    fn resets_keep_their_place_and_go_last_first() {
+        let reset = |at| Action::SetCsv(CsvChange::Reset(at));
+        let mut actions = vec![
+            reset(0),
+            Action::TestConnection,
+            reset(1),
+            reset(0),
+            Action::SaveConnection { connect: false },
+        ];
+        resets_once(&mut actions);
+        let said = |actions: &[Action]| format!("{actions:?}");
+        assert_eq!(
+            said(&actions),
+            said(&[
+                reset(1),
+                reset(0),
+                Action::TestConnection,
+                Action::SaveConnection { connect: false },
+            ])
+        );
+    }
+}

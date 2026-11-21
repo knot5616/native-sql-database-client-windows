@@ -1,0 +1,10 @@
+- title: Guide
+  url: /what-is-native-sql-database-client-windows/
+  collections:
+    - guide
+- title: Reference
+  url: /connections/
+  collections:
+    - reference
+- title: Download
+  url: /download/

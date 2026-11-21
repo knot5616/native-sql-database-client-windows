@@ -1,0 +1,34 @@
+<style>
+  /* Screenshots (the shot include): a frame around each, and no link styling. */
+  .vp-doc a.shot {
+    display: block;
+    margin: 20px 0;
+    text-decoration: none;
+  }
+  .vp-doc a.shot img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    border: 1px solid var(--vp-c-divider);
+    border-radius: 10px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.12);
+  }
+
+  /* The Download page is in the Guide collection, so the theme marks both
+     Guide and Download as the current menu item, here and in the mobile
+     menu, and again after each frame visit. A link to the page itself wins
+     over a link to its collection. */
+  .VPNavBarMenu:has(.VPNavBarMenuLink.active:not([data-collections])) .VPNavBarMenuLink.active[data-collections]:not(:hover),
+  .VPNavScreenMenu:has(.VPNavScreenMenuLink.active:not([data-collections])) .VPNavScreenMenuLink.active[data-collections]:not(:hover) {
+    color: var(--vp-c-text-1);
+  }
+</style>
+
+<!-- Simple Analytics: cookie-free visit counts, in igor.works' dashboard. It
+     sits in the head, which a Turbo frame visit keeps, so it runs once per
+     page load and counts each frame visit by the history entry it pushes. -->
+<script async defer src="https://scripts.simpleanalyticscdn.com/latest.js"></script>
+
+<!-- Names the author's X account: Build in Public reads it to verify that
+     igor.works is Igor's. -->
+<meta name="twitter:creator" content="@igor_alexandrov">

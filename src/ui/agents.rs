@@ -1,0 +1,2367 @@
+//! The Agents tab: what agents do on the window's connection. One state
+//! of four, as the sidebar's Agents entry names it: the server off, access
+//! Off here, nobody here with the command that connects one, or the
+//! sessions that are here with what they called. The sessions that work
+//! elsewhere are "Also:", and each can be stopped.
+
+use egui::{Frame, Id, Margin, Rect, pos2, vec2};
+
+use crate::connections::{SavedConnection, SavedConnections};
+use crate::i18n::{Msgid, gettext, msgid, ngettext, pgettext};
+use crate::keymap::Keymap;
+use crate::model::{Action, AgentsHere, AgentsView, ConnTabId, Workspace};
+use crate::style::Icon;
+use crate::theme::{Look, Palette};
+use crate::typography::{Text, TextRole};
+use crate::ui::{Paint, states, widgets};
+
+/// What the app says once the command is on the clipboard.
+pub const COPIED_COMMAND: Msgid = msgid("Copied the command");
+
+/// Puts the command that connects an agent on the clipboard, and says so.
+/// Nothing while it is still being worked out, which takes a moment once,
+/// as the app starts.
+pub fn copy_command(ctx: &egui::Context, locale: crate::i18n::Locale) {
+    if let Some(command) = crate::endpoint::agent_command_ready() {
+        ctx.copy_text(command.to_owned());
+        crate::ui::toast::say(ctx, &COPIED_COMMAND.say(locale));
+    }
+}
+
+/// What the Nobody here state's buttons ask for.
+enum NoneAsk {
+    /// Other agents…: Settings › Agents.
+    Settings,
+    Log,
+}
+
+/// A segment of the macOS look's Activity and Log switch.
+const SEGMENT: f32 = 64.0;
+
+/// The height of the tab's line at its top, and of its status bar.
+const HEADER: f32 = 40.0;
+const STATUS: f32 = 33.0;
+
+/// What the Agents tab asks of the app, answered by its caller.
+pub struct Asked {
+    /// Which state the tab shows.
+    pub here: AgentsHere,
+    /// The connection as an agent names it: "Bookshop · dev".
+    pub connection: String,
+    /// What the connection allows, whether the server runs or not: what
+    /// is in force, where a change made outside the app is held. None for
+    /// a connection saved no more.
+    pub allowed: Option<crate::connections::AgentAccess>,
+    /// The sessions here, those that work elsewhere and the calls made
+    /// here.
+    pub sessions: Vec<native-sql-database-client-windows_mcp::SessionInfo>,
+    pub elsewhere: Vec<Elsewhere>,
+    pub calls: Vec<native-sql-database-client-windows_mcp::Call>,
+    /// The session the terminal look's list has selected.
+    pub selected: Option<String>,
+    /// How many days the log keeps.
+    pub log_days: u32,
+}
+
+/// Draws the Agents tab of the workspace `tab`, and returns what it asks
+/// for. `saved` are the saved connections, which say the environment an
+/// agent's session runs as and whether a logged call's statement opens.
+pub fn show(
+    ui: &mut egui::Ui,
+    paint: Paint,
+    tab: ConnTabId,
+    workspace: &Workspace,
+    saved: &SavedConnections,
+    keymap: &Keymap,
+    asked: Asked,
+) -> Vec<Action> {
+    let Paint {
+        locale,
+        palette,
+        look,
+    } = paint;
+    let Asked {
+        here,
+        connection,
+        allowed,
+        sessions,
+        elsewhere,
+        calls,
+        selected,
+        log_days,
+    } = asked;
+    let conn = workspace.conn_id.clone();
+    // As the saved connection is, which the agent's session is opened as:
+    // the window keeps what it was opened with.
+    let environment = saved
+        .get(&conn)
+        .map_or(workspace.environment, |saved| saved.environment);
+    let runs_as = environment.named(crate::env::Platform::Native);
+    let access = look.label(&match allowed {
+        Some(crate::connections::AgentAccess::Read) => gettext(locale, "Read"),
+        Some(crate::connections::AgentAccess::Off) | None => gettext(locale, "Off"),
+    });
+    // Which view shows, and the log's page: borrowed, as it may be long.
+    let agents_tab = workspace.tabs.iter().find_map(|open| match open {
+        crate::model::Tab::Agents(agents) => Some(agents),
+        crate::model::Tab::Object(_)
+        | crate::model::Tab::Sql(_)
+        | crate::model::Tab::History(_) => None,
+    });
+    let view = agents_tab.map_or_else(AgentsView::default, |agents| agents.view);
+    let empty = crate::model::AgentsLog::default();
+    let log = agents_tab.map_or(&empty, |agents| &agents.log);
+    let layout = paint.layout();
+    // The tab's own `l`, not the prompt's `:agents log`.
+    let log_key = keymap.key_in(
+        layout,
+        crate::keymap::Command::ShowAgentsLog,
+        crate::keymap::Scope::Agents,
+    );
+    let allow_key = keymap.key(layout, crate::keymap::Command::AllowAgents);
+    let scope_key = keymap.key(layout, crate::keymap::Command::ToggleAgentsLogScope);
+    let filter_key = keymap.key(layout, crate::keymap::Command::FilterAgentsLog);
+    let close_key = keymap.key(layout, crate::keymap::Command::CloseAgentsLogPane);
+    let details_key = keymap.key(layout, crate::keymap::Command::ShowAgentsLogDetails);
+    let open_key = keymap.key(layout, crate::keymap::Command::OpenAgentsLogCall);
+    let export_key = keymap.key(layout, crate::keymap::Command::ExportAgentsLog);
+    // The selected call's connection, as it is saved now: whether its
+    // statement opens, and the dialect it is read in.
+    let call = log
+        .selected
+        .and_then(|id| log.calls.iter().find(|logged| logged.id == id))
+        .map(|logged| {
+            let saved = logged
+                .entry
+                .connection_id
+                .as_ref()
+                .and_then(|id| saved.get(&crate::connections::ConnectionId(id.clone())));
+            LogCall {
+                open: logged.entry.sql.as_ref().map(|_| saved.is_some()),
+                dialect: saved.map(|saved| saved.spec.driver.dialect()),
+            }
+        })
+        .unwrap_or_default();
+    let show_key = keymap.key(layout, crate::keymap::Command::ShowAgents);
+    let copy_key = keymap.key(layout, crate::keymap::Command::CopyAgentCommand);
+    let on_key = keymap.key(layout, crate::keymap::Command::TurnAgentsOn);
+    let settings_key = keymap.key(layout, crate::keymap::Command::ShowAgentSettings);
+    let stop_key = keymap.key(layout, crate::keymap::Command::StopAgentSession);
+    let show_elsewhere_key = keymap.key(layout, crate::keymap::Command::ShowAgentsElsewhere);
+    let mut actions = Vec::new();
+    egui::Panel::top(Id::new(("agents-header", tab.0)))
+        .exact_size(HEADER)
+        .resizable(false)
+        .show_separator_line(false)
+        .frame(
+            Frame::new()
+                .fill(palette.panel)
+                .inner_margin(Margin::symmetric(16, 0)),
+        )
+        .show(ui, |ui| {
+            let full = ui.max_rect().expand2(vec2(16.0, 0.0));
+            let rule = if look.terminal {
+                palette.outline
+            } else {
+                palette.border
+            };
+            widgets::hline(ui, full.x_range(), full.bottom() - 0.5, rule);
+            // At the right, and in the macOS look alone: Stop agents here
+            // while anyone is, and before it who works elsewhere. The
+            // terminal look lists those under its sessions, with its keys.
+            let mut right = full.right() - 16.0;
+            if !look.terminal && matches!(here, AgentsHere::Connected { .. }) {
+                let label = gettext(locale, "Stop agents here");
+                let button = states::button(&label, &look).drops();
+                let width = button.width(ui, &look);
+                let at = Rect::from_center_size(
+                    pos2(right - width / 2.0, full.center().y),
+                    vec2(width, 28.0),
+                );
+                if button.show_at(ui, at, &look, &palette).clicked() {
+                    stop_here(
+                        ui.ctx(),
+                        tab,
+                        sessions.len(),
+                        &connection,
+                        locale,
+                        &mut actions,
+                    );
+                }
+                right -= width + 12.0;
+            }
+            if !look.terminal
+                && let Some(first) = elsewhere.first()
+            {
+                right = also(
+                    ui,
+                    (full, right),
+                    first,
+                    elsewhere.len() - 1,
+                    (&look, &palette, locale),
+                    &mut actions,
+                ) - 16.0;
+            }
+            // At the left in the macOS look: Activity and Log. The terminal
+            // look has `l`.
+            let mut left = full.left() + 16.0;
+            if !look.terminal {
+                let names = [gettext(locale, "Activity"), gettext(locale, "Log")];
+                let parts = [
+                    widgets::Segment::Text(&names[0]),
+                    widgets::Segment::Text(&names[1]),
+                ];
+                let chosen = usize::from(view == AgentsView::Log);
+                let place = Rect::from_min_size(
+                    pos2(left, full.center().y - 12.0),
+                    vec2(2.0 * SEGMENT, 24.0),
+                );
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(place));
+                let segment = vec2(SEGMENT, 24.0);
+                if let Some(index) =
+                    widgets::segmented(&mut child, &parts, chosen, segment, None, &look, &palette)
+                {
+                    let view = [AgentsView::Activity, AgentsView::Log][index];
+                    actions.push(Action::ShowAgentsView { tab, view });
+                }
+                left = child.min_rect().right().max(place.right()) + 12.0;
+            }
+            // The words either side of the connection's name, which is
+            // drawn in its own weight.
+            let on = look.label(&gettext(locale, "Agents on {connection}"));
+            let (before, after) = crate::i18n::around(&on, "{connection}");
+            // A connection's name gives way at its end to a narrow tab.
+            let strong = TextRole::pick(&look, TextRole::UiBodyStrong, TextRole::OBody);
+            let body = widgets::body(&look);
+            let around = body.width(ui.ctx(), look.faces, &format!("{before}{after} · {access}"));
+            let room = (right - left - around).max(0.0);
+            let name = crate::ui::grid::ellipsize(&connection, room, false, |text| {
+                strong.width(ui.ctx(), look.faces, text)
+            });
+            let line = Text::new(&look)
+                .add(widgets::body(&look), before, palette.secondary)
+                .add(strong, &name, palette.text)
+                .add(
+                    widgets::body(&look),
+                    &format!("{after} · {access}"),
+                    palette.secondary,
+                );
+            widgets::paint_text(ui, left, full.center().y, line);
+            let said = on.replace("{connection}", &connection);
+            widgets::announce(ui, full, &format!("{said} · {access}"));
+        });
+    if !look.terminal {
+        status_bar(ui, tab, (&here, &show_key), (&look, &palette, locale));
+    }
+    egui::CentralPanel::default()
+        .frame(Frame::new().fill(palette.window))
+        .show(ui, |ui| {
+            let rect = ui.max_rect();
+            // The log, whatever the state: past calls stay readable with
+            // the server off and access Off.
+            if view == AgentsView::Log {
+                let days = log_days;
+                let keys = LogKeys {
+                    scope: &scope_key,
+                    filter: &filter_key,
+                    close: &close_key,
+                    details: &details_key,
+                    open: &open_key,
+                    export: &export_key,
+                };
+                let shown = log_view(
+                    ui,
+                    rect,
+                    (log, keys, days, call),
+                    (&look, &palette, locale),
+                );
+                match shown {
+                    Some(LogAsk::Scope) => actions.push(Action::ToggleAgentsLogScope(tab)),
+                    Some(LogAsk::Filter(filter)) => {
+                        actions.push(Action::FilterAgentsLog { tab, filter });
+                    }
+                    Some(LogAsk::CloseFilters) => {
+                        actions.push(Action::ShowAgentsLogFilters { tab, open: false });
+                    }
+                    Some(LogAsk::CloseDetails) => {
+                        actions.push(Action::ShowAgentsLogDetails { tab, open: false });
+                    }
+                    Some(LogAsk::Open(id)) => {
+                        actions.push(Action::OpenAgentsLogCall { tab, id });
+                    }
+                    Some(LogAsk::Export) => actions.push(Action::ExportAgentsLog(tab)),
+                    Some(LogAsk::More) => actions.push(Action::MoreAgentsLog(tab)),
+                    Some(LogAsk::Select(id)) => {
+                        actions.push(Action::SelectAgentsLogCall { tab, id });
+                    }
+                    None => {}
+                }
+                return;
+            }
+            match &here {
+                AgentsHere::ServerOff => {
+                    let notice = states::Notice {
+                        icon: Icon::SquareTerminal,
+                        title: &gettext(locale, "The agent server is off"),
+                        text: &gettext(
+                            locale,
+                            "Turn it on to let agents like Claude Code use the connections you allow. It runs only while native-sql-database-client-windows is open, on this computer.",
+                        ),
+                    };
+                    let (settings_label, label) =
+                        (gettext(locale, "Settings…"), gettext(locale, "Turn on"));
+                    let buttons = vec![
+                        states::key_button(&settings_label, &settings_key, &look),
+                        states::key_button(&label, &on_key, &look).primary(),
+                    ];
+                    match states::empty(ui, rect, &notice, buttons, &look, &palette) {
+                        Some(0) => actions.push(Action::ShowAgentSettings),
+                        Some(_) => actions.push(Action::TurnAgentsOn),
+                        None => {}
+                    }
+                }
+                AgentsHere::OffHere => {
+                    let title = gettext(locale, "Agents can't use {connection}")
+                        .replace("{connection}", &connection);
+                    let notice = states::Notice {
+                        icon: Icon::SquareTerminal,
+                        title: &title,
+                        text: &gettext(
+                            locale,
+                            "Access is Off for this connection, so agents don't see it at all.",
+                        ),
+                    };
+                    let (log_label, allow_label) =
+                        (gettext(locale, "Show log"), gettext(locale, "Allow agents…"));
+                    let mut buttons = vec![states::key_button(&log_label, &log_key, &look)];
+                    // A connection saved no more has nothing to allow.
+                    if saved.get(&conn).is_some() {
+                        let allow = states::key_button(&allow_label, &allow_key, &look).primary();
+                        buttons.push(allow);
+                    }
+                    match states::empty(ui, rect, &notice, buttons, &look, &palette) {
+                        Some(0) => {
+                            let view = AgentsView::Log;
+                            actions.push(Action::ShowAgentsView { tab, view });
+                        }
+                        Some(_) => actions.push(Action::EditAgents {
+                            conn: conn.clone(),
+                            allow: true,
+                        }),
+                        None => {}
+                    }
+                }
+                AgentsHere::NoneConnected if look.terminal && !elsewhere.is_empty() => {
+                    // Who works elsewhere is listed at the left, as with
+                    // agents here, and the way to connect one beside it.
+                    let listed = (&sessions[..], &elsewhere[..], selected.as_deref());
+                    terminal_nav(ui, tab, listed, &show_elsewhere_key, (&look, &palette, locale));
+                    let name = workspace.name.clone();
+                    egui::CentralPanel::default()
+                        .frame(Frame::new().fill(palette.window))
+                        .show(ui, |ui| {
+                            let rect = ui.max_rect();
+                            let keys = (&copy_key, &log_key, &settings_key);
+                            let said = (&connection[..], &name[..], &access[..]);
+                            let style = (&look, &palette, locale);
+                            match none_connected(ui, rect, said, keys, style) {
+                                Some(NoneAsk::Log) => {
+                                    let view = AgentsView::Log;
+                                    actions.push(Action::ShowAgentsView { tab, view });
+                                }
+                                Some(NoneAsk::Settings) => actions.push(Action::ShowAgentSettings),
+                                None => {}
+                            }
+                        });
+                }
+                AgentsHere::NoneConnected => {
+                    let name = workspace.name.clone();
+                    let keys = (&copy_key, &log_key, &settings_key);
+                    let said = (&connection[..], &name[..], &access[..]);
+                    match none_connected(ui, rect, said, keys, (&look, &palette, locale)) {
+                        Some(NoneAsk::Log) => {
+                            let view = AgentsView::Log;
+                            actions.push(Action::ShowAgentsView { tab, view });
+                        }
+                        Some(NoneAsk::Settings) => actions.push(Action::ShowAgentSettings),
+                        None => {}
+                    }
+                }
+                AgentsHere::Connected { .. } if look.terminal => {
+                    let keys = (&stop_key, &show_elsewhere_key);
+                    let listed = (&sessions[..], &elsewhere[..], selected.as_deref());
+                    terminal_activity(ui, tab, listed, &calls, keys, runs_as.as_deref(), (&look, &palette, locale));
+                }
+                AgentsHere::Connected { .. } => {
+                    let stopped = activity(
+                        ui,
+                        rect,
+                        (&sessions, &calls),
+                        runs_as.as_deref(),
+                        (&look, &palette, locale),
+                    );
+                    actions.extend(stopped.into_iter().map(Action::StopAgentSession));
+                }
+            }
+        });
+    actions
+}
+
+/// The macOS look's status bar: who is here, the server, and the key that
+/// shows the tab.
+fn status_bar(
+    ui: &mut egui::Ui,
+    tab: ConnTabId,
+    (here, key): (&AgentsHere, &crate::keymap::Written),
+    (look, palette, locale): (&Look, &Palette, crate::i18n::Locale),
+) {
+    // Who is here, in the state that has anyone: an agent stays among
+    // those that named this connection once its access is Off.
+    let count = match here {
+        AgentsHere::Connected { count, .. } => *count,
+        AgentsHere::ServerOff | AgentsHere::OffHere | AgentsHere::NoneConnected => 0,
+    };
+    let people = match count {
+        0 => gettext(locale, "No agents here").into_owned(),
+        count => ngettext(locale, "{n} agent here", "{n} agents here", count)
+            .replace("{n}", &crate::i18n::number(locale, count)),
+    };
+    let server = match here {
+        AgentsHere::ServerOff => gettext(locale, "Server: off"),
+        _ => gettext(locale, "Server: stdio"),
+    };
+    let shows = gettext(locale, "{key} shows this tab").replace("{key}", key.as_str());
+    egui::Panel::bottom(Id::new(("agents-status", tab.0)))
+        .exact_size(STATUS)
+        .resizable(false)
+        .show_separator_line(false)
+        .frame(Frame::new().fill(palette.panel))
+        .show(ui, |ui| {
+            let full = ui.max_rect();
+            widgets::hline(ui, full.x_range(), full.top() + 0.5, palette.outline);
+            let status = palette.secondary.lerp_to_gamma(palette.dim, 0.5);
+            let role = widgets::secondary(look);
+            let left = format!("{people} · {server}");
+            widgets::paint_text(
+                ui,
+                full.left() + 16.0,
+                full.center().y,
+                Text::one(look, role, &left, status),
+            );
+            widgets::announce(ui, full, &left);
+            let laid = Text::one(look, role, &shows, status).layout(ui.ctx());
+            laid.paint_left(
+                ui.painter(),
+                full.right() - 16.0 - laid.width(),
+                full.center().y,
+            );
+        });
+}
+
+/// Nobody here: how to connect an agent, the command with Copy beside it,
+/// and what agents may do on this connection, with Other agents… and Show
+/// log under them. Centred under an icon tile, or in the terminal look
+/// from the top left without one, as an empty state is (`states::empty`).
+fn none_connected(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    (connection, name, access): (&str, &str, &str),
+    (copy_key, log_key, settings_key): (
+        &crate::keymap::Written,
+        &crate::keymap::Written,
+        &crate::keymap::Written,
+    ),
+    (look, palette, locale): (&Look, &Palette, crate::i18n::Locale),
+) -> Option<NoneAsk> {
+    let ctx = ui.ctx().clone();
+    let terminal = look.terminal;
+    let room = (rect.width() - 2.0 * states::INSET).max(0.0);
+    let measure = if terminal { room } else { room.min(420.0) };
+    let align = if terminal {
+        egui::Align::Min
+    } else {
+        egui::Align::Center
+    };
+    let lay = |role: TextRole, text: &str, color| {
+        let mut text = Text::one(look, role, text, color).wrap(measure);
+        text.job_mut().halign = align;
+        text.layout(&ctx)
+    };
+    let title =
+        gettext(locale, "No agents connected to {connection}").replace("{connection}", connection);
+    let text = gettext(
+        locale,
+        "Agents like Claude Code can read this database. Connect one with this command, then ask it about {name}.",
+    )
+    .replace("{name}", name);
+    let title_laid = lay(states::title_role(look), &title, palette.text);
+    let text_laid = lay(widgets::body(look), &text, palette.secondary);
+    // The command, and Copy beside it: the command gives way in its
+    // middle to a window too narrow for it, and is copied whole.
+    let label = gettext(locale, "Copy");
+    let copy = states::key_button(&label, copy_key, look).icon(Icon::Copy);
+    let copy_width = copy.width(ui, look);
+    let height = states::button_height(look);
+    let mono = TextRole::pick(look, TextRole::GridCell, TextRole::OBody);
+    // Worked out off the UI thread as the app starts: a moment's "…" until
+    // then, and a frame asked for to show it.
+    let command = crate::endpoint::agent_command_ready().unwrap_or_else(|| {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(100));
+        "…"
+    });
+    let fits = (room - 8.0 - copy_width - 24.0).clamp(0.0, 520.0);
+    let shown = crate::ui::grid::ellipsize(command, fits, true, |text| {
+        mono.width(&ctx, look.faces, text)
+    });
+    let command_laid = Text::one(look, mono, &shown, palette.text).layout(&ctx);
+    let row_width = command_laid.width() + 24.0 + 8.0 + copy_width;
+    // What agents may do here.
+    let on_this = look.label(&gettext(locale, "On this connection"));
+    let access_word = look.label(&gettext(locale, "Access"));
+    let small = widgets::secondary(look);
+    let facts = Text::new(look)
+        .add(small, &on_this, palette.dim)
+        .space(small, "   ")
+        .add(small, &access_word, palette.secondary)
+        .space(small, " ")
+        .add(small, access, palette.text)
+        .layout(&ctx);
+    let (tile, under_tile) = if terminal { (0.0, 0.0) } else { (44.0, 14.0) };
+    let total = tile
+        + under_tile
+        + title_laid.height()
+        + 8.0
+        + text_laid.height()
+        + 14.0
+        + height
+        + 18.0
+        + facts.height()
+        + 18.0
+        + height;
+    let (x, mut y) = if terminal {
+        (rect.left() + states::INSET, rect.top() + states::INSET)
+    } else {
+        let top = rect.center().y - total / 2.0;
+        (rect.center().x, top.max(rect.top() + states::INSET))
+    };
+    // A piece's left edge, for one `width` wide.
+    let left = |width: f32| if terminal { x } else { x - width / 2.0 };
+    if !terminal {
+        let tile_rect = Rect::from_center_size(pos2(x, y + tile / 2.0), vec2(tile, tile));
+        ui.painter().rect_filled(
+            tile_rect,
+            egui::CornerRadius::same(look.radius + 4),
+            palette.surface,
+        );
+        Icon::SquareTerminal.image(palette.dim, 20.0).paint_at(
+            ui,
+            Rect::from_center_size(tile_rect.center(), vec2(20.0, 20.0)),
+        );
+        y += tile + under_tile;
+    }
+    let paint = |ui: &egui::Ui, laid: &crate::typography::Laid, said: &str, y: f32| {
+        laid.paint(ui.painter(), pos2(x, y));
+        widgets::announce(
+            ui,
+            Rect::from_min_size(pos2(left(laid.width()), y), laid.size()),
+            said,
+        );
+    };
+    paint(ui, &title_laid, &title, y);
+    y += title_laid.height() + 8.0;
+    paint(ui, &text_laid, &text, y);
+    y += text_laid.height() + 14.0;
+    let row_left = left(row_width);
+    let boxed = Rect::from_min_size(pos2(row_left, y), vec2(command_laid.width() + 24.0, height));
+    widgets::card(ui, boxed, false, look, palette);
+    command_laid.paint_left(ui.painter(), boxed.left() + 12.0, boxed.center().y);
+    widgets::announce(ui, boxed, command);
+    let at = Rect::from_min_size(pos2(boxed.right() + 8.0, y), vec2(copy_width, height));
+    if copy.show_at(ui, at, look, palette).clicked() {
+        copy_command(ui.ctx(), locale);
+    }
+    y += height + 18.0;
+    let facts_left = left(facts.width());
+    facts.paint_left(ui.painter(), facts_left, y + facts.height() / 2.0);
+    widgets::announce(
+        ui,
+        Rect::from_min_size(pos2(facts_left, y), facts.size()),
+        &format!("{on_this}: {access_word} {access}"),
+    );
+    // Under them, how to connect other agents, and the calls agents made
+    // here before.
+    y += facts.height() + 18.0;
+    let (other_label, label) = (
+        gettext(locale, "Other agents…"),
+        gettext(locale, "Show log"),
+    );
+    let other = states::key_button(&other_label, settings_key, look);
+    let show = states::key_button(&label, log_key, look);
+    let (other_width, width) = (other.width(ui, look), show.width(ui, look));
+    let both = other_width + 8.0 + width;
+    let at = Rect::from_min_size(pos2(left(both), y), vec2(other_width, height));
+    let mut asked = other
+        .show_at(ui, at, look, palette)
+        .clicked()
+        .then_some(NoneAsk::Settings);
+    let at = Rect::from_min_size(pos2(at.right() + 8.0, y), vec2(width, height));
+    if show.show_at(ui, at, look, palette).clicked() {
+        asked = Some(NoneAsk::Log);
+    }
+    asked
+}
+
+/// A session that works elsewhere, as "Also:" names it: its agent, and
+/// the connection it named last, by the name an agent sees, where that is
+/// a connection that is saved.
+pub struct Elsewhere {
+    pub id: String,
+    pub agent: String,
+    pub on: Option<(crate::connections::ConnectionId, String)>,
+}
+
+impl Elsewhere {
+    pub fn of(saved: &[SavedConnection], session: &native-sql-database-client-windows_mcp::SessionInfo) -> Self {
+        let names = crate::backend::agent_names(saved);
+        let on = session.connections.iter().rev().find_map(|id| {
+            saved
+                .iter()
+                .zip(&names)
+                .find(|(saved, _)| saved.id.0 == *id)
+                .map(|(saved, name)| (saved.id.clone(), name.clone()))
+        });
+        Self {
+            id: session.id.clone(),
+            agent: crate::model::agent_name(session),
+            on,
+        }
+    }
+
+    /// "Cursor on Bookshop · staging", or "Cursor · no connection yet".
+    fn said(&self, locale: crate::i18n::Locale) -> String {
+        match &self.on {
+            Some((_, name)) => crate::i18n::fill(
+                &gettext(locale, "{agent} on {connection}"),
+                &[("{agent}", &self.agent), ("{connection}", name)],
+            ),
+            None => format!("{} · {}", self.agent, gettext(locale, "no connection yet")),
+        }
+    }
+}
+
+/// Stops the agents here, and says so: the toast names how many and the
+/// connection whose access is Off now.
+pub fn stop_here(
+    ctx: &egui::Context,
+    tab: ConnTabId,
+    count: usize,
+    connection: &str,
+    locale: crate::i18n::Locale,
+    actions: &mut Vec<Action>,
+) {
+    actions.push(Action::StopAgentsHere(tab));
+    let said = ngettext(
+        locale,
+        "Stopped {n} agent. Access is now Off for {name}.",
+        "Stopped {n} agents. Access is now Off for {name}.",
+        count,
+    )
+    .replace("{n}", &crate::i18n::number(locale, count))
+    .replace("{name}", connection);
+    crate::ui::toast::say(ctx, &said);
+}
+
+/// The macOS header's "Also:": the session elsewhere that called last,
+/// with Show where it works on a saved connection, and how many more there
+/// are. Drawn from `right` leftwards on `full`'s line; returns where it
+/// starts.
+fn also(
+    ui: &mut egui::Ui,
+    (full, right): (Rect, f32),
+    first: &Elsewhere,
+    more: usize,
+    (look, palette, locale): (&Look, &Palette, crate::i18n::Locale),
+    actions: &mut Vec<Action>,
+) -> f32 {
+    let mut right = right;
+    if let Some((conn, _)) = &first.on {
+        let label = gettext(locale, "Show");
+        let show = widgets::ButtonSpec::new(&label).link().padding(6.0);
+        let width = show.width(ui, look);
+        let at = Rect::from_center_size(
+            pos2(right - width / 2.0, full.center().y),
+            vec2(width, 24.0),
+        );
+        if show.show_at(ui, at, look, palette).clicked() {
+            actions.push(Action::ShowAgentsOn(conn.clone()));
+        }
+        right -= width + 4.0;
+    }
+    let mut said = format!("{} {}", gettext(locale, "Also:"), first.said(locale));
+    if more > 0 {
+        said.push_str(
+            &ngettext(locale, " and {n} more", " and {n} more", more)
+                .replace("{n}", &crate::i18n::number(locale, more)),
+        );
+    }
+    let laid = Text::one(look, widgets::secondary(look), &said, palette.secondary).layout(ui.ctx());
+    let left = right - laid.width();
+    laid.paint_left(ui.painter(), left, full.center().y);
+    widgets::announce(
+        ui,
+        Rect::from_min_max(pos2(left, full.top()), pos2(right, full.bottom())),
+        &said,
+    );
+    left
+}
+
+/// The macOS look's activity: the sessions that are here, each with Stop
+/// session, and under them the calls on this connection. Returns the
+/// sessions whose Stop session was clicked.
+fn activity(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    (sessions, calls): (&[native-sql-database-client-windows_mcp::SessionInfo], &[native-sql-database-client-windows_mcp::Call]),
+    runs_as: Option<&str>,
+    (look, palette, locale): (&Look, &Palette, crate::i18n::Locale),
+) -> Vec<String> {
+    let mut stopped = Vec::new();
+    // More than the tab has the height for scrolls, under its header and
+    // above its status bar.
+    let mut area = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+    egui::ScrollArea::vertical()
+        .id_salt("agents-activity")
+        .auto_shrink([false, false])
+        .show(&mut area, |ui| {
+            let rows = SESSION_ROW * sessions.len() as f32;
+            let height = rows + 16.0 + feed_height(calls.len(), look);
+            let (rect, _) =
+                ui.allocate_exact_size(vec2(ui.available_width(), height), egui::Sense::hover());
+            stopped = session_rows(ui, rect, sessions, runs_as, (look, palette, locale));
+            let feed_rect =
+                Rect::from_min_max(pos2(rect.left(), rect.top() + rows + 16.0), rect.max);
+            feed(ui, feed_rect, calls, (look, palette, locale));
+        });
+    stopped
+}
+
+/// A session's row in the macOS look.
+const SESSION_ROW: f32 = 44.0;
+
+/// The sessions' rows in `rect`, from its top: who, where it was started,
+/// since when and how many calls; at the right as what it runs, and Stop
+/// session. Returns the sessions whose Stop session was clicked.
+fn session_rows(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    sessions: &[native-sql-database-client-windows_mcp::SessionInfo],
+    runs_as: Option<&str>,
+    (look, palette, locale): (&Look, &Palette, crate::i18n::Locale),
+) -> Vec<String> {
+    let mut stopped = Vec::new();
+    let mut top = rect.top();
+    let label = gettext(locale, "Stop session");
+    for session in sessions {
+        let line = Rect::from_min_size(pos2(rect.left(), top), vec2(rect.width(), SESSION_ROW));
+        let agent = crate::model::agent_name(session);
+        let facts = session_facts(session, locale);
+        // Stop session at the right, and as what it runs before it.
+        let button = states::button(&label, look).salt(&session.id);
+        let width = button.width(ui, look);
+        let at = Rect::from_center_size(
+            pos2(line.right() - 16.0 - width / 2.0, line.center().y),
+            vec2(width, 26.0),
+        );
+        if button.show_at(ui, at, look, palette).clicked() {
+            stopped.push(session.id.clone());
+        }
+        let mut right = at.left() - 12.0;
+        let small = widgets::secondary(look);
+        let mut said = format!("{agent} · {facts}");
+        if let Some(runs_as) = runs_as {
+            let runs = gettext(locale, "Runs as {environment}").replace("{environment}", runs_as);
+            let laid = Text::one(look, small, &runs, palette.secondary).layout(ui.ctx());
+            laid.paint_left(ui.painter(), right - laid.width(), line.center().y);
+            right -= laid.width() + 16.0;
+            said = format!("{said} · {runs}");
+        }
+        let strong = TextRole::pick(look, TextRole::UiBodyStrong, TextRole::OBody);
+        // What does not fit the line gives way at its end, the name last.
+        let room = (right - line.left() - 30.0).max(0.0);
+        let name_width = |text: &str| strong.width(ui.ctx(), look.faces, text);
+        let shown_agent = crate::ui::grid::ellipsize(&agent, room, false, name_width);
+        let after = (room - name_width(&shown_agent) - name_width("  ")).max(0.0);
+        let shown_facts = crate::ui::grid::ellipsize(&facts, after, false, |text| {
+            small.width(ui.ctx(), look.faces, text)
+        });
+        let text = Text::new(look)
+            .add(strong, &shown_agent, palette.text)
+            .space(strong, "  ")
+            .add(small, &shown_facts, palette.secondary);
+        // The dot is painted: not every face has the glyph.
+        let dot = states::Tone::Success.color(palette);
+        ui.painter()
+            .circle_filled(pos2(line.left() + 19.5, line.center().y), 3.5, dot);
+        widgets::paint_text(ui, line.left() + 30.0, line.center().y, text);
+        widgets::announce(ui, line, &said);
+        widgets::hline(ui, line.x_range(), line.bottom() - 0.5, palette.border);
+        top += SESSION_ROW;
+    }
+    stopped
+}
+
+/// Where a session was started, since when by the clock, and how many
+/// calls it made.
+fn session_facts(session: &native-sql-database-client-windows_mcp::SessionInfo, locale: crate::i18n::Locale) -> String {
+    let mut facts = Vec::new();
+    if let Some(project) = &session.project {
+        facts.push(project.clone());
+    }
+    facts.push(
+        gettext(locale, "connected {time}")
+            .replace("{time}", &crate::clock::hour(session.connected_at)),
+    );
+    facts.push(
+        ngettext(locale, "{n} call", "{n} calls", session.calls)
+            .replace("{n}", &crate::i18n::number(locale, session.calls)),
+    );
+    facts.join(" · ")
+}
+
+/// The terminal look's activity, as its board draws it: at the left the
+/// sessions here, then those elsewhere, one of them selected; at the right
+/// the selected one with its key, over the calls on this connection.
+fn terminal_activity(
+    ui: &mut egui::Ui,
+    tab: ConnTabId,
+    (here, elsewhere, selected): (&[native-sql-database-client-windows_mcp::SessionInfo], &[Elsewhere], Option<&str>),
+    calls: &[native-sql-database-client-windows_mcp::Call],
+    (stop_key, show_key): (&crate::keymap::Written, &crate::keymap::Written),
+    runs_as: Option<&str>,
+    (look, palette, locale): (&Look, &Palette, crate::i18n::Locale),
+) {
+    terminal_nav(
+        ui,
+        tab,
+        (here, elsewhere, selected),
+        show_key,
+        (look, palette, locale),
+    );
+    egui::CentralPanel::default()
+        .frame(Frame::new().fill(palette.window))
+        .show(ui, |ui| {
+            let full = ui.max_rect();
+            // The selected session's line, where it is one of those here.
+            let chosen = here
+                .iter()
+                .find(|session| selected == Some(session.id.as_str()));
+            let line = Rect::from_min_size(full.min, vec2(full.width(), 34.0));
+            if let Some(session) = chosen {
+                ui.painter().rect_filled(line, 0.0, palette.panel);
+                widgets::hline(ui, line.x_range(), line.bottom() - 0.5, palette.outline);
+                let mut facts = session_facts(session, locale);
+                if let Some(runs_as) = runs_as {
+                    let runs = gettext(locale, "runs as {environment}");
+                    facts = format!("{facts} · {}", runs.replace("{environment}", runs_as));
+                }
+                let agent = look.label(&crate::model::agent_name(session));
+                let strong = TextRole::pick(look, TextRole::UiBodyStrong, TextRole::OBody);
+                let body = widgets::body(look);
+                let stop = Text::new(look)
+                    .add(body, stop_key.as_str(), palette.accent)
+                    .space(body, " ")
+                    .add(body, &gettext(locale, "stop session"), palette.secondary)
+                    .layout(ui.ctx());
+                let right = line.right() - 12.0 - stop.width();
+                stop.paint_left(ui.painter(), right, line.center().y);
+                let room = (right - line.left() - 24.0).max(0.0);
+                let text = format!("{agent}  {facts}");
+                let shown = crate::ui::grid::ellipsize(&text, room, false, |text| {
+                    body.width(ui.ctx(), look.faces, text)
+                });
+                // The name in the text colour, as far as it was not cut.
+                let (name, rest) = match shown.strip_prefix(agent.as_str()) {
+                    Some(rest) => (agent.as_str(), rest),
+                    None => (shown.as_ref(), ""),
+                };
+                let laid = Text::new(look).add(strong, name, palette.text).add(
+                    body,
+                    rest,
+                    palette.secondary,
+                );
+                widgets::paint_text(ui, line.left() + 12.0, line.center().y, laid);
+                widgets::announce(ui, line, &text);
+            }
+            let top = if chosen.is_some() {
+                line.bottom() + 14.0
+            } else {
+                full.top() + 14.0
+            };
+            let area_rect = Rect::from_min_max(
+                pos2(full.left() + 14.0, top),
+                pos2(full.right() - 14.0, full.bottom()),
+            );
+            let mut area = ui.new_child(egui::UiBuilder::new().max_rect(area_rect));
+            egui::ScrollArea::vertical()
+                .id_salt("agents-feed")
+                .auto_shrink([false, false])
+                .show(&mut area, |ui| {
+                    let height = feed_height(calls.len(), look);
+                    let (rect, _) = ui.allocate_exact_size(
+                        vec2(ui.available_width(), height),
+                        egui::Sense::hover(),
+                    );
+                    feed(ui, rect, calls, (look, palette, locale));
+                });
+        });
+}
+
+/// The terminal look's list of sessions, at the left: those here, then
+/// those elsewhere, the selected one filled.
+fn terminal_nav(
+    ui: &mut egui::Ui,
+    tab: ConnTabId,
+    (here, elsewhere, selected): (&[native-sql-database-client-windows_mcp::SessionInfo], &[Elsewhere], Option<&str>),
+    show_key: &crate::keymap::Written,
+    (look, palette, locale): (&Look, &Palette, crate::i18n::Locale),
+) {
+    let shows = gettext(locale, "{key} shows").replace("{key}", show_key.as_str());
+    // A narrow window gives the calls the room the list would take.
+    let nav = NAV.min(ui.available_width() * 0.35);
+    egui::Panel::left(Id::new(("agents-sessions", tab.0)))
+        .exact_size(nav)
+        .resizable(false)
+        .show_separator_line(false)
+        .frame(Frame::new().fill(palette.window))
+        .show(ui, |ui| {
+            let full = ui.max_rect();
+            widgets::vline(ui, full.right() - 0.5, full.y_range(), palette.outline);
+            let mut y = full.top() + 10.0;
+            nav_group(
+                ui,
+                (full, &mut y),
+                &gettext(locale, "On this connection"),
+                (look, palette),
+            );
+            for session in here {
+                let first = look.label(&crate::model::agent_name(session));
+                let second = session_facts(session, locale);
+                let chosen = selected == Some(session.id.as_str());
+                nav_row(
+                    ui,
+                    (full, &mut y),
+                    (&first, &second),
+                    chosen,
+                    (look, palette),
+                );
+            }
+            if !elsewhere.is_empty() {
+                y += 8.0;
+                nav_group(
+                    ui,
+                    (full, &mut y),
+                    &gettext(locale, "Elsewhere"),
+                    (look, palette),
+                );
+            }
+            for other in elsewhere {
+                let first = look.label(&other.agent);
+                let second = match &other.on {
+                    Some((_, name)) => format!("{name} · {shows}"),
+                    None => gettext(locale, "no connection yet").into_owned(),
+                };
+                let chosen = selected == Some(other.id.as_str());
+                nav_row(
+                    ui,
+                    (full, &mut y),
+                    (&first, &second),
+                    chosen,
+                    (look, palette),
+                );
+            }
+        });
+}
+
+/// The terminal look's list of sessions: its width.
+const NAV: f32 = 300.0;
+
+/// A group's title in the terminal look's list of sessions.
+fn nav_group(
+    ui: &egui::Ui,
+    (full, y): (Rect, &mut f32),
+    title: &str,
+    (look, palette): (&Look, &Palette),
+) {
+    let laid = Text::one(
+        look,
+        widgets::body(look),
+        &look.label(title),
+        palette.secondary,
+    )
+    .layout(ui.ctx());
+    laid.paint_left(ui.painter(), full.left() + 14.0, *y + 11.0);
+    *y += 22.0;
+}
+
+/// A session in the terminal look's list: its agent, and a line under it.
+/// The selected one is filled, with the accent at its left edge.
+fn nav_row(
+    ui: &egui::Ui,
+    (full, y): (Rect, &mut f32),
+    (first, second): (&str, &str),
+    chosen: bool,
+    (look, palette): (&Look, &Palette),
+) {
+    let rect = Rect::from_min_size(pos2(full.left(), *y), vec2(full.width() - 1.0, 44.0));
+    if chosen {
+        ui.painter().rect_filled(rect, 0.0, palette.selection);
+        let edge = Rect::from_min_size(rect.min, vec2(2.0, rect.height()));
+        ui.painter().rect_filled(edge, 0.0, palette.accent);
+    }
+    let body = widgets::body(look);
+    let room = (rect.width() - 28.0 - 14.0).max(0.0);
+    let fit = |text: &str| -> String {
+        crate::ui::grid::ellipsize(text, room, false, |text| {
+            body.width(ui.ctx(), look.faces, text)
+        })
+        .into_owned()
+    };
+    let dot = states::Tone::Success.color(palette);
+    ui.painter()
+        .circle_filled(pos2(rect.left() + 18.0, rect.top() + 12.0), 3.5, dot);
+    let laid = Text::one(look, body, &fit(first), palette.text).layout(ui.ctx());
+    laid.paint_left(ui.painter(), rect.left() + 28.0, rect.top() + 12.0);
+    let laid = Text::one(look, body, &fit(second), palette.secondary).layout(ui.ctx());
+    laid.paint_left(ui.painter(), rect.left() + 28.0, rect.top() + 32.0);
+    widgets::announce(ui, rect, &format!("{first} · {second}"));
+    *y += 48.0;
+}
+
+/// What the Log view asks of the app.
+enum LogAsk {
+    /// Every connection's calls, or this one's again.
+    Scope,
+    /// The page after the last call shown.
+    More,
+    /// A call, by its place in the log.
+    Select(i64),
+    /// A filter set, or every call again.
+    Filter(crate::model::AgentsLogFilter),
+    /// The terminal look's filters closed, and kept.
+    CloseFilters,
+    /// The terminal look's pane of the selected call closed.
+    CloseDetails,
+    /// The call's statement opened in a SQL editor, by its place.
+    Open(i64),
+    /// The calls that pass the filters, to a file.
+    Export,
+}
+
+/// The Log view's bar at its top (the terminal's, and macOS's, which holds
+/// the filters), its line for the selected call, and a call's line.
+const LOG_BAR: f32 = 36.0;
+const LOG_FILTER_BAR: f32 = 48.0;
+const LOG_DETAIL: f32 = 30.0;
+/// A row of the terminal look's filters.
+const FILTER_ROW: f32 = 28.0;
+/// The selected call's pane, beside the list: the board's on macOS, a
+/// mono column's more in the terminal.
+const LOG_PANE: f32 = 320.0;
+const LOG_PANE_TERMINAL: f32 = 380.0;
+
+/// The Log view: whose calls (this connection's or every one's) and how
+/// many the log keeps, then the calls the newest first, and under them
+/// what the selected call came to. Rows are never logged: it says so.
+fn log_view(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    (log, keys, days, call): (&crate::model::AgentsLog, LogKeys<'_>, u32, LogCall),
+    (look, palette, locale): (&Look, &Palette, crate::i18n::Locale),
+) -> Option<LogAsk> {
+    let mut ask = None;
+    let body = widgets::body(look);
+    let small = widgets::secondary(look);
+    let height = if look.terminal {
+        LOG_BAR
+    } else {
+        LOG_FILTER_BAR
+    };
+    let bar = Rect::from_min_size(rect.min, vec2(rect.width(), height));
+    widgets::hline(ui, bar.x_range(), bar.bottom() - 0.5, palette.border);
+    let scope = match log.all {
+        false => gettext(locale, "This connection"),
+        true => gettext(locale, "All connections"),
+    };
+    // Of the calls a filter lets through, they match it.
+    let count = match log.filtered() {
+        false => ngettext(locale, "{n} call", "{n} calls", log.total),
+        true => ngettext(locale, "{n} call matches", "{n} calls match", log.total),
+    }
+    .replace("{n}", &crate::i18n::number(locale, log.total));
+    let kept = ngettext(locale, "last {n} day", "last {n} days", days)
+        .replace("{n}", &crate::i18n::number(locale, days));
+    let count = format!("{count} · {kept} · {}", gettext(locale, "on this computer"));
+    if look.terminal {
+        // "log  this connection · 186 calls · … · L all connections".
+        let other = match log.all {
+            false => gettext(locale, "all connections"),
+            true => gettext(locale, "this connection"),
+        };
+        let line = Text::new(look)
+            .add(
+                TextRole::OBody,
+                &look.label(&gettext(locale, "Log")),
+                palette.text,
+            )
+            .space(body, "  ")
+            .add(
+                body,
+                &look.label(&format!("{scope} · {count} · ")),
+                palette.secondary,
+            )
+            .add(body, keys.scope.as_str(), palette.accent)
+            .add(body, &format!(" {other}"), palette.secondary);
+        let used = widgets::paint_text(ui, bar.left() + 14.0, bar.center().y, line);
+        // At its right, `/` for the filters, and with a call selected its
+        // details and its statement in a SQL editor.
+        let mut filter = Text::new(look)
+            .add(body, keys.filter.as_str(), palette.accent)
+            .add(
+                body,
+                &format!(" {}", look.label(&pgettext(locale, "label", "filter"))),
+                palette.secondary,
+            );
+        if log.total > 0 {
+            filter = filter
+                .add(body, " · ", palette.secondary)
+                .add(body, keys.export.as_str(), palette.accent)
+                .add(
+                    body,
+                    &format!(" {}", look.label(&gettext(locale, "export"))),
+                    palette.secondary,
+                );
+        }
+        if log.selected.is_some() {
+            filter = filter
+                .add(body, " · ", palette.secondary)
+                .add(body, keys.details.as_str(), palette.accent)
+                .add(
+                    body,
+                    &format!(" {}", look.label(&gettext(locale, "details"))),
+                    palette.secondary,
+                );
+            if call.open == Some(true) {
+                filter = filter
+                    .add(body, " · ", palette.secondary)
+                    .add(body, keys.open.as_str(), palette.accent)
+                    .add(
+                        body,
+                        &format!(" {}", look.label(&gettext(locale, "open in sql tab"))),
+                        palette.secondary,
+                    );
+            }
+        }
+        // Only where it has the room: the footer names the keys too.
+        let laid = filter.layout(ui.ctx());
+        if bar.left() + 14.0 + used + 24.0 + laid.width() <= bar.right() - 14.0 {
+            laid.paint_right(ui.painter(), bar.right() - 14.0, bar.center().y);
+        }
+        widgets::announce(ui, bar, &look.label(&format!("{scope} · {count}")));
+    } else {
+        // At its right, Export…, off with nothing to export: the filters
+        // keep to the left of it, the search giving up its width first.
+        let label = gettext(locale, "Export…");
+        let reason = gettext(locale, "No calls to export.");
+        let mut export = states::button(&label, look);
+        if log.total == 0 {
+            export = export.disabled(&reason);
+        }
+        let width = export.width(ui, look);
+        let at = Rect::from_center_size(
+            pos2(bar.right() - 16.0 - width / 2.0, bar.center().y),
+            vec2(width, 30.0),
+        );
+        let row = Rect::from_min_max(
+            pos2(bar.left() + 16.0, bar.center().y - 14.0),
+            pos2(at.left() - 12.0, bar.center().y + 14.0),
+        );
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(row)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        child.spacing_mut().item_spacing.x = 8.0;
+        if let Some(filter) =
+            log_filters(&mut child, log, &scope, (look, palette, locale), &mut ask)
+        {
+            ask = Some(LogAsk::Filter(filter));
+        }
+        let filters = child.min_rect().right();
+        if export.show_at(ui, at, look, palette).clicked() && log.total > 0 {
+            ask = Some(LogAsk::Export);
+        }
+        // The count between them, where it has the room.
+        let laid = Text::one(look, small, &count, palette.secondary).layout(ui.ctx());
+        let left = at.left() - 12.0 - laid.width();
+        if left >= filters + 12.0 {
+            laid.paint_left(ui.painter(), left, bar.center().y);
+        }
+        widgets::announce(ui, bar, &format!("{scope} · {count}"));
+    }
+    // The terminal look's filters, under its bar: their rows while open,
+    // else a line that says what they are set to where any is.
+    let mut top = bar.bottom();
+    if look.terminal {
+        top = terminal_filters(
+            ui,
+            (rect, top),
+            log,
+            keys,
+            (look, palette, locale),
+            &mut ask,
+        );
+    }
+    let chosen = log
+        .selected
+        .and_then(|id| log.calls.iter().find(|logged| logged.id == id));
+    // The selected call's pane, at the right: on macOS whenever a call is
+    // selected, in the terminal while it is open.
+    let mut right = rect.right();
+    if let Some(logged) = chosen
+        && (!look.terminal || log.details_open)
+    {
+        // At most half the view: the list keeps the rest.
+        let width = if look.terminal {
+            LOG_PANE_TERMINAL
+        } else {
+            LOG_PANE
+        };
+        let width = width.min(rect.width() / 2.0);
+        let pane = Rect::from_min_max(pos2(rect.right() - width, top), rect.max);
+        right = pane.left();
+        if let Some(asked) = log_pane(ui, pane, logged, (log.all, call), (look, palette, locale)) {
+            ask = Some(asked);
+        }
+        if look.terminal && !log.filters_open && closed(ui, look) {
+            ask = Some(LogAsk::CloseDetails);
+        }
+    }
+    // The selected call's line, at the bottom, where no pane shows it.
+    let detail = Rect::from_min_max(pos2(rect.left(), rect.bottom() - LOG_DETAIL), rect.max);
+    let chosen = chosen.filter(|_| right == rect.right());
+    if let Some(logged) = chosen {
+        ui.painter().rect_filled(detail, 0.0, palette.panel);
+        widgets::hline(ui, detail.x_range(), detail.top() + 0.5, palette.border);
+        let said = log_detail(&logged.entry, locale);
+        let said = look.label(&said);
+        let shown = crate::ui::grid::ellipsize(&said, detail.width() - 32.0, false, |text| {
+            small.width(ui.ctx(), look.faces, text)
+        });
+        widgets::paint_text(
+            ui,
+            detail.left() + 16.0,
+            detail.center().y,
+            Text::one(look, small, &shown, palette.secondary),
+        );
+        widgets::announce(ui, detail, &said);
+    }
+    let bottom = if chosen.is_some() {
+        detail.top()
+    } else {
+        rect.bottom()
+    };
+    let list = Rect::from_min_max(pos2(rect.left(), top), pos2(right, bottom));
+    let row = feed_row(look);
+    let empty = match (&log.failed, log.read, log.all) {
+        (Some(failed), _, _) => Some(format!(
+            "{} {failed}",
+            gettext(locale, "The log could not be read:")
+        )),
+        (None, false, _) => Some(gettext(locale, "Reading the log…").into_owned()),
+        (None, true, _) if !log.calls.is_empty() => None,
+        (None, true, _) if log.filtered() => {
+            Some(gettext(locale, "No calls in the log match these filters.").into_owned())
+        }
+        (None, true, false) => {
+            Some(gettext(locale, "No calls on this connection in the log.").into_owned())
+        }
+        (None, true, true) => Some(gettext(locale, "No calls in the log.").into_owned()),
+    };
+    if let Some(said) = empty {
+        let said = look.label(&said);
+        let line =
+            Rect::from_min_size(pos2(list.left(), list.top() + 8.0), vec2(list.width(), row));
+        widgets::paint_text(
+            ui,
+            line.left() + 16.0,
+            line.center().y,
+            Text::one(look, small, &said, palette.dim),
+        );
+        widgets::announce(ui, line, &said);
+        return ask;
+    }
+    // Time, agent, the connection under All connections, tool, request,
+    // rows, ms, result: the request takes what is left.
+    let room = (list.width() - 32.0).max(0.0);
+    let fixed = |width: f32, share: f32| width.min(room * share);
+    let mut widths = vec![fixed(110.0, 0.14), fixed(120.0, 0.14)];
+    if log.all {
+        widths.push(fixed(150.0, 0.16));
+    }
+    widths.extend([
+        fixed(140.0, 0.16),
+        0.0,
+        fixed(60.0, 0.07),
+        fixed(60.0, 0.07),
+        fixed(110.0, 0.14),
+    ]);
+    let request = widths.len() - 4;
+    widths[request] = (room - widths.iter().sum::<f32>()).max(0.0);
+    let mut names = vec![gettext(locale, "Time"), gettext(locale, "Agent")];
+    if log.all {
+        names.push(gettext(locale, "Connection"));
+    }
+    names.extend([
+        gettext(locale, "Tool"),
+        gettext(locale, "Request"),
+        gettext(locale, "Rows"),
+        gettext(locale, "ms"),
+        gettext(locale, "Result"),
+    ]);
+    let names: Vec<String> = names.iter().map(|name| look.label(name)).collect();
+    let mono = TextRole::pick(look, TextRole::GridCell, TextRole::OBody);
+    let cells = |ui: &egui::Ui, line: Rect, texts: &[(String, TextRole, egui::Color32)]| {
+        let mut x = line.left() + 16.0;
+        for ((text, role, color), width) in texts.iter().zip(&widths) {
+            let shown = crate::ui::grid::ellipsize(text, width - 10.0, false, |text| {
+                role.width(ui.ctx(), look.faces, text)
+            });
+            Text::one(look, *role, &shown, *color)
+                .layout(ui.ctx())
+                .paint_left(ui.painter(), x, line.center().y);
+            x += width;
+        }
+    };
+    let head = Rect::from_min_size(list.min, vec2(list.width(), row));
+    ui.painter().rect_filled(head, 0.0, palette.panel);
+    widgets::hline(ui, head.x_range(), head.bottom() - 0.5, palette.border);
+    let head_cells: Vec<_> = names
+        .iter()
+        .map(|name| (name.clone(), small, palette.secondary))
+        .collect();
+    cells(ui, head, &head_cells);
+    widgets::announce(ui, head, &names.join(" · "));
+    let calls = Rect::from_min_max(pos2(list.left(), head.bottom()), list.max);
+    let mut area = ui.new_child(egui::UiBuilder::new().max_rect(calls));
+    // Rows touch: the scroll area counts each `row` high.
+    area.spacing_mut().item_spacing.y = 0.0;
+    let lines = log.calls.len() + usize::from(log.more);
+    // A selection that moved since the last frame is brought into sight:
+    // `j` and `k` move it past the window's edge.
+    let seen_id = area.id().with("selected-seen");
+    let seen: Option<i64> = area.data(|data| data.get_temp(seen_id)).flatten();
+    let chosen_at = log
+        .selected
+        .and_then(|id| log.calls.iter().position(|logged| logged.id == id));
+    // Only the lines in sight are laid out: a log paged back holds
+    // thousands.
+    egui::ScrollArea::vertical()
+        .id_salt("agents-log")
+        .auto_shrink([false, false])
+        .show_rows(&mut area, row, lines, |ui, range| {
+            let top = ui.cursor().top();
+            let (rect, _) = ui.allocate_exact_size(
+                vec2(ui.available_width(), row * range.len() as f32),
+                egui::Sense::hover(),
+            );
+            // Where line `index` is, in sight or not.
+            let line_at = |index: usize| {
+                let y = top + (index as f32 - range.start as f32) * row;
+                Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), row))
+            };
+            if seen != log.selected
+                && let Some(index) = chosen_at
+            {
+                ui.scroll_to_rect(line_at(index), None);
+            }
+            let shown = range.start.min(log.calls.len())..range.end.min(log.calls.len());
+            for (index, logged) in log.calls[shown.clone()].iter().enumerate() {
+                let entry = &logged.entry;
+                let line = line_at(shown.start + index);
+                let clicked = ui
+                    .interact(
+                        line,
+                        ui.id().with(("log-call", logged.id)),
+                        egui::Sense::click(),
+                    )
+                    .clicked();
+                if clicked {
+                    ask = Some(LogAsk::Select(logged.id));
+                }
+                if log.selected == Some(logged.id) {
+                    ui.painter().rect_filled(line, 0.0, palette.selection);
+                    if look.terminal {
+                        let edge = Rect::from_min_size(line.min, vec2(2.0, line.height()));
+                        ui.painter().rect_filled(edge, 0.0, palette.accent);
+                    }
+                }
+                let at = crate::clock::of_millis(entry.at_ms);
+                let asked = entry
+                    .sql
+                    .as_deref()
+                    .or(entry.request.as_deref())
+                    .map(|asked| {
+                        let start: String = asked.chars().take(400).collect();
+                        start.split_whitespace().collect::<Vec<_>>().join(" ")
+                    })
+                    .unwrap_or_default();
+                let number = |value: Option<i64>| {
+                    value
+                        .map(|n| crate::i18n::number(locale, n))
+                        .unwrap_or_default()
+                };
+                let (word, color) = log_result(&entry.result, palette, locale);
+                let mut texts = vec![
+                    (
+                        look.label(&crate::clock::day(locale, at)),
+                        small,
+                        palette.secondary,
+                    ),
+                    (look.label(&entry.agent), body, palette.text),
+                ];
+                if log.all {
+                    let on = entry.connection.clone().unwrap_or_default();
+                    texts.push((on, body, palette.text));
+                }
+                texts.extend([
+                    (entry.tool.clone(), body, palette.text),
+                    (asked.clone(), mono, palette.text),
+                    (number(entry.rows), small, palette.secondary),
+                    (number(entry.took_ms), small, palette.secondary),
+                    (word.clone(), small, color),
+                ]);
+                cells(ui, line, &texts);
+                let said: Vec<&str> = texts.iter().map(|(text, ..)| text.as_str()).collect();
+                widgets::announce(ui, line, &said.join(" · "));
+                if !look.terminal {
+                    widgets::hline(ui, line.x_range(), line.bottom() - 0.5, palette.border);
+                }
+            }
+            // Show more, the line after the last call, where it is in
+            // sight.
+            if log.more && range.contains(&log.calls.len()) {
+                let label = gettext(locale, "Show more");
+                let more = widgets::ButtonSpec::new(&label).link().padding(6.0);
+                let width = more.width(ui, look);
+                let line = line_at(log.calls.len());
+                let at = Rect::from_min_size(
+                    pos2(line.left() + 10.0, line.top() + 2.0),
+                    vec2(width, row - 4.0),
+                );
+                if more.show_at(ui, at, look, palette).clicked() {
+                    ask = Some(LogAsk::More);
+                }
+            }
+        });
+    area.data_mut(|data| data.insert_temp(seen_id, log.selected));
+    ask
+}
+
+/// The keys the Log view names, and reads, as the keymap has them.
+#[derive(Clone, Copy)]
+pub(crate) struct LogKeys<'a> {
+    /// Every connection's calls, or this one's.
+    pub scope: &'a crate::keymap::Written,
+    /// The terminal look's filters, opened.
+    pub filter: &'a crate::keymap::Written,
+    /// And closed, and the selected call's pane with them.
+    pub close: &'a crate::keymap::Written,
+    /// The terminal look's pane of the selected call, shown.
+    pub details: &'a crate::keymap::Written,
+    /// The selected call's statement, in a SQL editor.
+    pub open: &'a crate::keymap::Written,
+    /// The calls that pass the filters, to a file.
+    pub export: &'a crate::keymap::Written,
+}
+
+/// What the Log view is told of the selected call by the app: whether its
+/// statement opens in a SQL editor (`None` for a call with none, `Some(false)`
+/// for one on a connection deleted since), and the dialect it is read in.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LogCall {
+    pub open: Option<bool>,
+    pub dialect: Option<native-sql-database-client-windows_db::Dialect>,
+}
+
+/// Whether the keymap's close of the log's panes was pressed this frame.
+fn closed(ui: &egui::Ui, look: &Look) -> bool {
+    let keymap = crate::ui::keys::published(ui.ctx());
+    let layout = crate::keymap::Layout::of(look);
+    ui.input_mut(|input| {
+        crate::ui::keys::asked(
+            input,
+            &keymap,
+            layout,
+            crate::keymap::Command::CloseAgentsLogPane,
+            crate::keymap::Scope::Agents,
+            true,
+        )
+        .count
+            > 0
+    })
+}
+
+/// The selected call's pane, in `rect`: the tool and how it ended, who
+/// called and when, the request (a statement in its dialect's colours, or
+/// the tables asked for), and what it came to, line by line; that rows are
+/// never logged; and Open in SQL editor where it has a statement, off for
+/// a connection deleted since. What was asked of it.
+fn log_pane(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    logged: &native-sql-database-client-windows_mcp::Logged,
+    (all, call): (bool, LogCall),
+    (look, palette, locale): (&Look, &Palette, crate::i18n::Locale),
+) -> Option<LogAsk> {
+    let entry = &logged.entry;
+    let mut ask = None;
+    ui.painter().rect_filled(rect, 0.0, palette.panel);
+    widgets::vline(ui, rect.left() + 0.5, rect.y_range(), palette.border);
+    let body = widgets::body(look);
+    let small = widgets::secondary(look);
+    let strong = TextRole::pick(look, TextRole::UiBodyStrong, TextRole::OGroup);
+    let inner = rect.shrink2(vec2(16.0, 14.0));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+    egui::ScrollArea::vertical()
+        .id_salt("agents-log-pane")
+        .auto_shrink([false, false])
+        .show(&mut child, |ui| {
+            ui.spacing_mut().item_spacing.y = 10.0;
+            let width = ui.available_width();
+            // "run_query  ok".
+            let (word, color) = log_result(&entry.result, palette, locale);
+            Text::new(look)
+                .add(strong, &entry.tool, palette.text)
+                .space(body, "  ")
+                .add(body, &look.label(&word), color)
+                .layout(ui.ctx())
+                .label(ui);
+            // Who, and when to the second, and where under All connections.
+            let at = crate::clock::of_millis(entry.at_ms);
+            let mut who = vec![entry.agent.clone(), crate::clock::moment(locale, at)];
+            if all && let Some(on) = &entry.connection {
+                who.push(on.clone());
+            }
+            Text::one(look, body, &look.label(&who.join(" · ")), palette.secondary)
+                .wrap(width)
+                .layout(ui.ctx())
+                .label(ui);
+            // The statement, as it ran.
+            if let Some(sql) = &entry.sql {
+                let frame = egui::Frame::new()
+                    .fill(palette.window)
+                    .stroke(egui::Stroke::new(1.0, palette.border))
+                    .corner_radius(egui::CornerRadius::same(look.radius))
+                    .inner_margin(egui::Margin::symmetric(10, 8));
+                frame.show(ui, |ui| {
+                    // In its dialect's colours; plain where its connection
+                    // was deleted, and its dialect is not known.
+                    let room = width - 20.0;
+                    let laid = match call.dialect {
+                        Some(dialect) => crate::ui::sql_text::highlighted(
+                            ui.ctx(),
+                            look,
+                            palette,
+                            dialect,
+                            sql,
+                            room,
+                        ),
+                        None => {
+                            let mono = TextRole::pick(look, TextRole::Code, TextRole::OCode);
+                            Text::one(look, mono, sql, palette.text)
+                                .wrap(room)
+                                .layout(ui.ctx())
+                        }
+                    };
+                    laid.label(ui);
+                });
+            }
+            for (label, value) in log_facts(entry, locale) {
+                let label = look.label(&label);
+                ui.horizontal_top(|ui| {
+                    let name = Text::one(look, small, &label, palette.secondary).layout(ui.ctx());
+                    let room = (width - 110.0).max(40.0);
+                    ui.allocate_ui(vec2(110.0, name.galley.size().y), |ui| {
+                        ui.set_min_width(110.0);
+                        name.label(ui);
+                    });
+                    Text::one(look, body, &value, palette.text)
+                        .wrap(room)
+                        .layout(ui.ctx())
+                        .label(ui);
+                });
+            }
+            if entry.tool == "run_query" {
+                let note = gettext(locale, "Rows themselves are not logged.");
+                Text::one(look, small, &look.label(&note), palette.dim)
+                    .wrap(width)
+                    .layout(ui.ctx())
+                    .label(ui);
+            }
+            if let Some(open) = call.open {
+                let label = look.label(&gettext(locale, "Open in SQL editor"));
+                let reason = gettext(locale, "Its connection was deleted.");
+                let mut button = states::button(&label, look);
+                if !open {
+                    button = button.disabled(&reason);
+                }
+                let height = states::button_height(look);
+                if button.show(ui, height, look, palette).clicked() && open {
+                    ask = Some(LogAsk::Open(logged.id));
+                }
+            }
+        });
+    ask
+}
+
+/// What a call came to, line by line, as the pane says it: its values, the
+/// tables asked for, what it returned, the columns masked, how it ran and
+/// for how long; or why it ended as it did; and the agent's project.
+fn log_facts(entry: &native-sql-database-client-windows_mcp::Entry, locale: crate::i18n::Locale) -> Vec<(String, String)> {
+    // A phrase from `ngettext` with its count put in.
+    let count = |phrase: std::borrow::Cow<'static, str>, n: i64| {
+        phrase.replace("{n}", &crate::i18n::number(locale, n))
+    };
+    let say = |text: Msgid| text.say(locale).into_owned();
+    let mut facts = Vec::new();
+    if let Some(params) = &entry.params {
+        use crate::model::LoggedValues;
+        let value = match LoggedValues::of(params) {
+            LoggedValues::Each(values) => values.join(", "),
+            LoggedValues::Cut(Some(bytes)) => {
+                let n = i64::try_from(bytes).unwrap_or(i64::MAX);
+                count(
+                    ngettext(
+                        locale,
+                        "cut in the log, of {n} byte",
+                        "cut in the log, of {n} bytes",
+                        n,
+                    ),
+                    n,
+                )
+            }
+            LoggedValues::Cut(None) => say(msgid("cut in the log")),
+            LoggedValues::Unread => say(msgid("not readable in the log")),
+        };
+        facts.push((say(msgid("Params")), value));
+    }
+    if let Some(tables) = &entry.request {
+        facts.push((say(msgid("Tables")), tables.clone()));
+    }
+    if entry.result == "ok" {
+        match (entry.tool.as_str(), entry.rows) {
+            ("describe_schema", Some(tables)) => {
+                facts.push((
+                    say(msgid("Described")),
+                    count(ngettext(locale, "{n} table", "{n} tables", tables), tables),
+                ));
+            }
+            ("list_connections", Some(listed)) => {
+                facts.push((
+                    say(msgid("Listed")),
+                    count(
+                        ngettext(locale, "{n} connection", "{n} connections", listed),
+                        listed,
+                    ),
+                ));
+            }
+            (_, Some(rows)) => {
+                let mut returned = count(ngettext(locale, "{n} row", "{n} rows", rows), rows);
+                if let Some(columns) = entry.columns {
+                    returned = format!(
+                        "{returned}, {}",
+                        count(
+                            ngettext(locale, "{n} column", "{n} columns", columns),
+                            columns
+                        )
+                    );
+                }
+                facts.push((say(msgid("Returned")), returned));
+            }
+            (_, None) => {}
+        }
+        let masked = entry
+            .masked
+            .as_deref()
+            .and_then(|masked| serde_json::from_str::<Vec<String>>(masked).ok())
+            .filter(|masked| !masked.is_empty());
+        if let Some(masked) = masked {
+            facts.push((say(msgid("Masked")), masked.join(", ")));
+        }
+    } else {
+        if let Some(message) = &entry.message {
+            let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+            facts.push((say(msgid("Why")), message));
+        }
+        if let Some(code) = &entry.code {
+            facts.push((say(msgid("Code")), code.clone()));
+        }
+    }
+    if let Some(ran) = &entry.ran_as {
+        facts.push((say(msgid("Ran as")), ran.clone()));
+    }
+    if let Some(took) = entry.took_ms {
+        facts.push((
+            say(msgid("Took")),
+            crate::i18n::numbers::millis(locale, took),
+        ));
+    }
+    if let Some(project) = &entry.project {
+        facts.push((say(msgid("Project")), project.clone()));
+    }
+    facts
+}
+
+/// The macOS look's filters, in a row of `ui`: whose calls, which agent's,
+/// how they ended, and a search of their requests, as the board has them.
+/// The filter set, where one was; the scope is asked through `ask`.
+fn log_filters(
+    ui: &mut egui::Ui,
+    log: &crate::model::AgentsLog,
+    scope: &str,
+    (look, palette, locale): (&Look, &Palette, crate::i18n::Locale),
+    ask: &mut Option<LogAsk>,
+) -> Option<crate::model::AgentsLogFilter> {
+    use crate::model::AgentsLogFilter;
+    use crate::ui::menu;
+    let mut set = None;
+    // The board's widths, each one narrower alike where the bar has not
+    // the room: a dropdown clips what it reads.
+    let board = [170.0, 130.0, 120.0, 220.0];
+    let gaps = 3.0 * ui.spacing().item_spacing.x;
+    let share = ((ui.available_width() - gaps) / board.iter().sum::<f32>()).min(1.0);
+    let [scope_width, agent_width, result_width, search_width] =
+        board.map(|width: f32| (width * share).max(40.0).floor());
+    let named = |response: &egui::Response, name: &str, value: &str| {
+        response.widget_info(|| {
+            let mut info = egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, name);
+            info.current_text_value = Some(value.to_owned());
+            info
+        });
+    };
+    // Whose calls.
+    let this = gettext(locale, "This connection");
+    let all = gettext(locale, "All connections");
+    let scopes = menu::Dropdown::new("agents-log-scope", scope, scope_width)
+        .height(28.0)
+        .show(ui, look, palette, |ui| {
+            for (every, word) in [(false, &this), (true, &all)] {
+                let item = menu::Item::choice(word, log.all == every).show(ui, look, palette);
+                if item.clicked() {
+                    if log.all != every {
+                        *ask = Some(LogAsk::Scope);
+                    }
+                    ui.close();
+                }
+            }
+        });
+    named(&scopes.response, &gettext(locale, "Calls on"), scope);
+    // Which agent's: those that called on what is shown, and the one
+    // chosen, whether it called there or not.
+    let every_agent = gettext(locale, "All agents");
+    let agent = log.agent.clone().unwrap_or_else(|| every_agent.to_string());
+    let mut agents = log.agents.clone();
+    if let Some(chosen) = &log.agent
+        && !agents.contains(chosen)
+    {
+        agents.push(chosen.clone());
+    }
+    let menu = menu::Dropdown::new("agents-log-agent", &agent, agent_width)
+        .height(28.0)
+        .show(ui, look, palette, |ui| {
+            let mut choices = vec![(None, every_agent.to_string())];
+            choices.extend(agents.iter().map(|name| (Some(name.clone()), name.clone())));
+            for (value, word) in choices {
+                let item = menu::Item::choice(&word, log.agent == value).show(ui, look, palette);
+                if item.clicked() {
+                    set = Some(AgentsLogFilter::Agent(value));
+                    ui.close();
+                }
+            }
+        });
+    named(&menu.response, &gettext(locale, "Agent"), &agent);
+    // How they ended.
+    let every_result = gettext(locale, "All results");
+    let result = log.result.as_deref().map_or_else(
+        || every_result.to_string(),
+        |result| result_word(result, locale),
+    );
+    let menu = menu::Dropdown::new("agents-log-result", &result, result_width)
+        .height(28.0)
+        .show(ui, look, palette, |ui| {
+            let mut choices = vec![(None, every_result.to_string())];
+            choices.extend(
+                crate::model::LOG_RESULTS
+                    .iter()
+                    .map(|result| (Some((*result).to_owned()), result_word(result, locale))),
+            );
+            for (value, word) in choices {
+                let item = menu::Item::choice(&word, log.result == value).show(ui, look, palette);
+                if item.clicked() {
+                    set = Some(AgentsLogFilter::Result(value));
+                    ui.close();
+                }
+            }
+        });
+    named(&menu.response, &gettext(locale, "Result"), &result);
+    // What the requests hold.
+    let mut text = log.search.clone();
+    let placeholder = gettext(locale, "Search requests…");
+    let role = widgets::body(look);
+    let field = ui.add_sized(
+        vec2(search_width, 28.0),
+        widgets::field(ui, &mut text, look, role, 28.0, 8)
+            .id(Id::new("agents-log-search"))
+            .hint_text(placeholder.as_ref()),
+    );
+    ui.ctx().accesskit_node_builder(field.id, |node| {
+        node.set_label(placeholder.trim_end_matches('…'));
+    });
+    if field.changed() {
+        set = Some(AgentsLogFilter::Search(text));
+    }
+    set
+}
+
+/// The terminal look's filters, under its bar at `top` of `rect`: while
+/// open, a field for the search and rows of words for the agent and the
+/// result, which Tab moves among and Enter or Space picks, until the
+/// keymap's close; while shut, the line that says what they are set to,
+/// where any is. Where the list starts under them.
+fn terminal_filters(
+    ui: &mut egui::Ui,
+    (rect, top): (Rect, f32),
+    log: &crate::model::AgentsLog,
+    keys: LogKeys<'_>,
+    (look, palette, locale): (&Look, &Palette, crate::i18n::Locale),
+    ask: &mut Option<LogAsk>,
+) -> f32 {
+    use crate::model::AgentsLogFilter;
+    let body = widgets::body(look);
+    let small = widgets::secondary(look);
+    let every = look.label(&gettext(locale, "all"));
+    // The agents that called on what is shown, and the one chosen,
+    // whether it called there or not.
+    let mut agents: Vec<Option<String>> = std::iter::once(None)
+        .chain(log.agents.iter().cloned().map(Some))
+        .collect();
+    if let Some(chosen) = &log.agent
+        && !log.agents.contains(chosen)
+    {
+        agents.push(Some(chosen.clone()));
+    }
+    let agent_words: Vec<String> = agents
+        .iter()
+        .map(|agent| {
+            agent
+                .as_deref()
+                .map_or_else(|| every.clone(), |name| look.label(name))
+        })
+        .collect();
+    let results: Vec<Option<String>> = std::iter::once(None)
+        .chain(
+            crate::model::LOG_RESULTS
+                .iter()
+                .map(|result| Some((*result).to_owned())),
+        )
+        .collect();
+    let result_words: Vec<String> = results
+        .iter()
+        .map(|result| match result {
+            None => every.clone(),
+            Some(result) => look.label(&result_word(result, locale)),
+        })
+        .collect();
+    // Each `/` gives the search the keyboard: the count of them seen last.
+    let seen_id = Id::new("agents-log-filters-seen");
+    let seen: Option<u64> = ui.data(|data| data.get_temp(seen_id));
+    ui.data_mut(|data| data.insert_temp(seen_id, log.filters_asked));
+    if !log.filters_open {
+        if !log.filtered() {
+            return top;
+        }
+        // "filters  agent cursor · result refused · search “select”".
+        let mut said = Vec::new();
+        if let Some(agent) = &log.agent {
+            said.push(gettext(locale, "agent {name}").replace("{name}", agent));
+        }
+        if let Some(result) = &log.result {
+            said.push(
+                gettext(locale, "result {result}")
+                    .replace("{result}", &result_word(result, locale)),
+            );
+        }
+        if !log.search.is_empty() {
+            said.push(gettext(locale, "search “{text}”").replace("{text}", &log.search));
+        }
+        let line = Rect::from_min_size(pos2(rect.left(), top), vec2(rect.width(), FILTER_ROW));
+        let words = look.label(&said.join(" · "));
+        let filters = look.label(&gettext(locale, "filters"));
+        let text = Text::new(look)
+            .add(body, &filters, palette.secondary)
+            .space(body, "  ")
+            .add(body, &words, palette.text);
+        widgets::paint_text(ui, line.left() + 14.0, line.center().y, text);
+        widgets::announce(ui, line, &format!("{filters} {words}"));
+        widgets::hline(ui, line.x_range(), line.bottom() - 0.5, palette.border);
+        return line.bottom();
+    }
+    let panel = Rect::from_min_size(
+        pos2(rect.left(), top),
+        vec2(rect.width(), 3.0 * FILTER_ROW + 26.0),
+    );
+    ui.painter().rect_filled(panel, 0.0, palette.panel);
+    let label_at = |index: usize| {
+        Rect::from_min_size(
+            pos2(
+                panel.left() + 14.0,
+                panel.top() + 4.0 + index as f32 * FILTER_ROW,
+            ),
+            vec2(panel.width() - 28.0, FILTER_ROW),
+        )
+    };
+    let labels = [msgid("search"), msgid("agent"), msgid("result")]
+        .map(|word| look.label(&word.say(locale)));
+    for (index, label) in labels.iter().enumerate() {
+        let at = label_at(index);
+        widgets::paint_text(
+            ui,
+            at.left(),
+            at.center().y,
+            Text::one(look, body, label, palette.dim),
+        );
+    }
+    let cell = |index: usize| {
+        let at = label_at(index);
+        Rect::from_min_max(pos2(at.left() + 100.0, at.top()), at.max)
+    };
+    // The search, which has the keyboard as the filters open.
+    let mut text = log.search.clone();
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell(0)));
+    let field = child.add_sized(
+        vec2(cell(0).width().min(420.0), FILTER_ROW - 4.0),
+        widgets::field(&child, &mut text, look, body, FILTER_ROW - 4.0, 6)
+            .id(Id::new("agents-log-search")),
+    );
+    ui.ctx().accesskit_node_builder(field.id, |node| {
+        node.set_label(labels[0].as_str());
+    });
+    if seen != Some(log.filters_asked) {
+        field.request_focus();
+    }
+    if field.changed() {
+        *ask = Some(LogAsk::Filter(AgentsLogFilter::Search(text)));
+    }
+    let chosen = agents
+        .iter()
+        .position(|agent| *agent == log.agent)
+        .unwrap_or(0);
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell(1)));
+    let picked = words(
+        &mut child,
+        "agents-log-agent",
+        &labels[1],
+        &agent_words,
+        chosen,
+        (look, palette),
+    );
+    if let Some(at) = picked {
+        *ask = Some(LogAsk::Filter(AgentsLogFilter::Agent(agents[at].clone())));
+    }
+    let chosen = results
+        .iter()
+        .position(|result| *result == log.result)
+        .unwrap_or(0);
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell(2)));
+    let picked = words(
+        &mut child,
+        "agents-log-result",
+        &labels[2],
+        &result_words,
+        chosen,
+        (look, palette),
+    );
+    if let Some(at) = picked {
+        *ask = Some(LogAsk::Filter(AgentsLogFilter::Result(results[at].clone())));
+    }
+    // What closes them, as the keymap has it.
+    let hint = label_at(3);
+    let text = Text::new(look)
+        .add(small, keys.close.as_str(), palette.accent)
+        .add(
+            small,
+            &format!(
+                " {}",
+                look.label(&gettext(locale, "closes, and keeps them"))
+            ),
+            palette.secondary,
+        );
+    widgets::paint_text(ui, cell(3).left(), hint.top() + 11.0, text);
+    let keymap = crate::ui::keys::published(ui.ctx());
+    let layout = crate::keymap::Layout::of(look);
+    let closed = ui.input_mut(|input| {
+        crate::ui::keys::asked(
+            input,
+            &keymap,
+            layout,
+            crate::keymap::Command::CloseAgentsLogPane,
+            crate::keymap::Scope::Agents,
+            true,
+        )
+        .count
+            > 0
+    });
+    if closed {
+        field.surrender_focus();
+        *ask = Some(LogAsk::CloseFilters);
+    }
+    widgets::hline(ui, panel.x_range(), panel.bottom() - 0.5, palette.border);
+    panel.bottom()
+}
+
+/// Words in a line, of which `chosen` is boxed in the accent, as the
+/// connection editor's rows draw them in the terminal look: the one
+/// clicked, or picked with Enter or Space. Screen readers hear them as
+/// radio buttons of a group named `name`.
+fn words(
+    ui: &mut egui::Ui,
+    salt: &str,
+    name: &str,
+    labels: &[String],
+    chosen: usize,
+    (look, palette): (&Look, &Palette),
+) -> Option<usize> {
+    let role = widgets::body(look);
+    let (pad, gap, height) = (8.0, 6.0, 23.0);
+    let mut clicked = None;
+    ui.scope_builder(egui::UiBuilder::new().id_salt(salt), |ui| {
+        ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
+            node.set_role(egui::accesskit::Role::RadioGroup);
+            node.set_label(name);
+        });
+        let mut left = ui.max_rect().left();
+        let middle = ui.max_rect().center().y;
+        for (index, label) in labels.iter().enumerate() {
+            let width = (role.width(ui.ctx(), look.faces, label) + 2.0 * pad).ceil();
+            let cell = Rect::from_min_size(pos2(left, middle - height / 2.0), vec2(width, height));
+            left += width + gap;
+            let active = index == chosen;
+            let response = ui.interact(cell, ui.id().with((salt, index)), egui::Sense::click());
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, active, label)
+            });
+            if response.clicked() {
+                clicked = Some(index);
+            }
+            let corner = egui::CornerRadius::same(3);
+            let color = if active {
+                ui.painter().rect_stroke(
+                    cell,
+                    corner,
+                    egui::Stroke::new(1.0, palette.accent),
+                    egui::StrokeKind::Inside,
+                );
+                palette.accent
+            } else if response.hovered() {
+                palette.text
+            } else {
+                palette.dim
+            };
+            crate::ui::focus::hint(
+                ui,
+                &response,
+                cell,
+                crate::ui::focus::Ring::Outer { radius: corner.nw },
+            );
+            Text::one(look, role, label, color)
+                .layout(ui.ctx())
+                .paint_left(ui.painter(), cell.left() + pad, cell.center().y);
+        }
+    });
+    clicked
+}
+
+/// How a call in the log ended, in a word, and its colour.
+fn log_result(
+    result: &str,
+    palette: &Palette,
+    locale: crate::i18n::Locale,
+) -> (String, egui::Color32) {
+    let color = match result {
+        "ok" => states::Tone::Success.color(palette),
+        "timeout" => states::Tone::Warning.color(palette),
+        "cancelled" | "stopped" => palette.secondary,
+        _ => states::Tone::Danger.color(palette),
+    };
+    (result_word(result, locale), color)
+}
+
+/// How a call ended, in a word: what the log keeps, said for a person.
+fn result_word(result: &str, locale: crate::i18n::Locale) -> String {
+    match result {
+        "ok" => gettext(locale, "ok"),
+        "timeout" => gettext(locale, "timed out"),
+        "cancelled" => gettext(locale, "cancelled"),
+        "stopped" => gettext(locale, "stopped"),
+        "error" => gettext(locale, "failed"),
+        _ => gettext(locale, "refused"),
+    }
+    .into_owned()
+}
+
+/// The selected call's line: who, when to the second, and what it came
+/// to. A read says its rows are not logged.
+fn log_detail(entry: &native-sql-database-client-windows_mcp::Entry, locale: crate::i18n::Locale) -> String {
+    let at = crate::clock::of_millis(entry.at_ms);
+    // A phrase from `ngettext` with its count put in.
+    let count = |phrase: std::borrow::Cow<'static, str>, n: i64| {
+        phrase.replace("{n}", &crate::i18n::number(locale, n))
+    };
+    let mut said = vec![entry.agent.clone(), crate::clock::moment(locale, at)];
+    if entry.result == "ok" {
+        match (entry.tool.as_str(), entry.rows) {
+            ("describe_schema", Some(tables)) => {
+                said.push(count(
+                    ngettext(
+                        locale,
+                        "{n} table described",
+                        "{n} tables described",
+                        tables,
+                    ),
+                    tables,
+                ));
+            }
+            (_, Some(rows)) => {
+                let mut returned = count(ngettext(locale, "{n} row", "{n} rows", rows), rows);
+                if let Some(columns) = entry.columns {
+                    returned = format!(
+                        "{returned}, {}",
+                        count(
+                            ngettext(locale, "{n} column", "{n} columns", columns),
+                            columns
+                        )
+                    );
+                }
+                said.push(gettext(locale, "{what} returned").replace("{what}", &returned));
+            }
+            (_, None) => {}
+        }
+        if let Some(took) = entry.took_ms {
+            said.push(crate::i18n::numbers::millis(locale, took));
+        }
+        if entry.tool == "run_query" {
+            said.push(gettext(locale, "rows themselves are not logged").into_owned());
+        }
+    } else {
+        let word = result_word(&entry.result, locale);
+        let message = entry
+            .message
+            .as_deref()
+            .map(|message| message.split_whitespace().collect::<Vec<_>>().join(" "));
+        said.push(match message {
+            Some(message) => format!("{word}: {message}"),
+            None => word,
+        });
+    }
+    said.join(" · ")
+}
+
+/// A line of the feed, and its head.
+fn feed_row(look: &Look) -> f32 {
+    if look.terminal { 26.0 } else { 30.0 }
+}
+
+/// The feed's height: its head, and a line for each call or for saying
+/// there is none yet.
+fn feed_height(calls: usize, look: &Look) -> f32 {
+    feed_row(look) * (1 + calls.max(1)) as f32
+}
+
+/// The calls on this connection, the newest first: when, the tool, what
+/// it asked and how it ended, under a head that names the four.
+fn feed(
+    ui: &egui::Ui,
+    rect: Rect,
+    calls: &[native-sql-database-client-windows_mcp::Call],
+    (look, palette, locale): (&Look, &Palette, crate::i18n::Locale),
+) {
+    let row = feed_row(look);
+    let body = widgets::body(look);
+    let small = widgets::secondary(look);
+    let mono = TextRole::pick(look, TextRole::GridCell, TextRole::OBody);
+    // Time, tool, request, result: the request takes what is left, and
+    // in a narrow tab the tool and the result give way first.
+    let room = (rect.width() - 24.0).max(0.0);
+    let time = 90.0_f32.min(room * 0.2);
+    let (tool, result) = (150.0_f32.min(room * 0.2), 230.0_f32.min(room * 0.3));
+    let request = (room - time - tool - result).max(0.0);
+    let columns = [
+        (rect.left() + 12.0, time),
+        (rect.left() + 12.0 + time, tool),
+        (rect.left() + 12.0 + time + tool, request),
+        (rect.right() - 12.0 - result, result),
+    ];
+    let cell =
+        |ui: &egui::Ui, (x, width): (f32, f32), y: f32, role: TextRole, text: &str, color| {
+            let shown = crate::ui::grid::ellipsize(text, width - 10.0, false, |text| {
+                role.width(ui.ctx(), look.faces, text)
+            });
+            Text::one(look, role, &shown, color)
+                .layout(ui.ctx())
+                .paint_left(ui.painter(), x, y);
+        };
+    let head = Rect::from_min_size(rect.min, vec2(rect.width(), row));
+    ui.painter().rect_filled(head, 0.0, palette.panel);
+    widgets::hline(ui, head.x_range(), head.bottom() - 0.5, palette.border);
+    let names = [
+        msgid("Time"),
+        msgid("Tool"),
+        msgid("Request"),
+        msgid("Result"),
+    ]
+    .map(|name| look.label(&name.say(locale)));
+    for (column, name) in columns.iter().zip(&names) {
+        cell(ui, *column, head.center().y, small, name, palette.secondary);
+    }
+    widgets::announce(ui, head, &names.join(" · "));
+    let mut y = head.bottom();
+    if calls.is_empty() {
+        let said = look.label(&gettext(locale, "No calls on this connection yet."));
+        cell(
+            ui,
+            (columns[0].0, rect.width() - 24.0),
+            y + row / 2.0,
+            small,
+            &said,
+            palette.dim,
+        );
+        widgets::announce(
+            ui,
+            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), row)),
+            &said,
+        );
+        return;
+    }
+    for call in calls {
+        let line = Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), row));
+        let when = crate::clock::time(call.at);
+        let (ended, color) = ended(call, palette, locale);
+        let asked = call.request.as_deref().unwrap_or_default();
+        let center = line.center().y;
+        cell(
+            ui,
+            columns[0],
+            center,
+            small,
+            &look.label(&when),
+            palette.secondary,
+        );
+        cell(ui, columns[1], center, body, &call.tool, palette.text);
+        cell(ui, columns[2], center, mono, asked, palette.text);
+        cell(ui, columns[3], center, small, &ended, color);
+        widgets::announce(
+            ui,
+            line,
+            &format!("{when} · {} · {asked} · {ended}", call.tool),
+        );
+        if !look.terminal {
+            widgets::hline(ui, line.x_range(), line.bottom() - 0.5, palette.border);
+        }
+        y += row;
+    }
+}
+
+/// How a call ended, as the feed says it, and its colour: what it
+/// returned, or why it did not.
+fn ended(
+    call: &native-sql-database-client-windows_mcp::Call,
+    palette: &Palette,
+    locale: crate::i18n::Locale,
+) -> (String, egui::Color32) {
+    // A phrase from `ngettext` with its count put in.
+    let count = |phrase: std::borrow::Cow<'static, str>, n: u64| {
+        phrase.replace("{n}", &crate::i18n::number(locale, n))
+    };
+    if call.result == "ok" {
+        let said = match (call.tool.as_str(), call.rows) {
+            ("describe_schema", Some(tables)) => {
+                let mut said = count(ngettext(locale, "{n} table", "{n} tables", tables), tables);
+                if let Some(columns) = call.columns {
+                    said = format!(
+                        "{said} · {}",
+                        count(
+                            ngettext(locale, "{n} column", "{n} columns", columns),
+                            columns
+                        )
+                    );
+                }
+                said
+            }
+            (_, Some(rows)) => format!(
+                "{} · {}",
+                count(ngettext(locale, "{n} row", "{n} rows", rows), rows),
+                crate::i18n::numbers::millis(
+                    locale,
+                    u64::try_from(call.took.as_millis()).unwrap_or(u64::MAX)
+                )
+            ),
+            (_, None) => gettext(locale, "ok").into_owned(),
+        };
+        return (said, states::Tone::Success.color(palette));
+    }
+    let (word, color) = log_result(&call.result, palette, locale);
+    let said = match &call.message {
+        // On one line: a database's own words may run over several.
+        Some(message) => format!(
+            "{word} · {}",
+            message.split_whitespace().collect::<Vec<_>>().join(" ")
+        ),
+        None => word,
+    };
+    (said, color)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Where agents cannot reach the app, nothing of them shows: no entry,
+    /// and no tab.
+    #[cfg(not(any(unix, windows)))]
+    #[test]
+    fn nothing_of_agents_shows_where_they_cannot_reach_the_app() {
+        let mut harness = crate::testing::Harness::new();
+        let tab = harness.connect_fake();
+        let conn = harness.app.workspace(tab).unwrap().conn_id.clone();
+        let mut saved = harness.app.connections.get(&conn).unwrap().clone();
+        saved.agents.access = crate::connections::AgentAccess::Read;
+        harness.app.connections.upsert(saved);
+        for enabled in [false, true] {
+            harness.app.settings.mcp_enabled = enabled;
+            harness.settle();
+            for state in ["Server off", "Off here", "None connected"] {
+                assert!(!harness.has(&format!("Agents, {state}")), "{state}");
+            }
+        }
+        harness.app.apply(crate::model::Action::ShowAgents(tab));
+        assert_eq!(harness.app.workspace(tab).unwrap().agents_tab(), None);
+        // Nor does Show open the window of a connection that is not open.
+        let mut ledger = crate::testing::fixture_connection();
+        ledger.id = crate::connections::ConnectionId("ledger".into());
+        harness.app.connections.upsert(ledger.clone());
+        let windows = harness.app.tabs.len();
+        harness
+            .app
+            .apply(crate::model::Action::ShowAgentsOn(ledger.id));
+        assert_eq!(harness.app.tabs.len(), windows);
+    }
+}

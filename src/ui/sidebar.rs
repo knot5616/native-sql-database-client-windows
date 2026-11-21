@@ -1,0 +1,1450 @@
+//! The sidebar: filter, the schema picker, the shown
+//! schema's objects in prefix groups or one flat list, and the button that
+//! opens a SQL editor.
+
+use egui::{CornerRadius, Id, Rect, Sense, WidgetInfo, WidgetType, pos2, vec2};
+use native-sql-database-client-windows_db::{ObjectKind, ObjectRef};
+
+use crate::format::display_safe;
+use crate::i18n::{Locale, Msgid, gettext, msgid, ngettext, pmsgid};
+use crate::keymap::{Command, Keymap, Scope, Written};
+use crate::model::{Action, AgentsHere, ConnTabId, TreeNode, TreeRow, Workspace};
+use crate::style::Icon;
+use crate::theme::{Look, Palette};
+use crate::typography::{Text, TextRole};
+use crate::ui::focus::Link;
+use crate::ui::menu;
+use crate::ui::widgets::{self, ButtonSpec};
+use crate::ui::{Paint, focus};
+
+/// The sidebar's width when it opens, per look: the design's 264 and 248
+/// and the 1 pt rule it draws outside them.
+fn default_width(look: &Look) -> f32 {
+    if look.terminal { 265.0 } else { 249.0 }
+}
+
+/// Space around the filter field: macOS 12 (8 under), terminal 10 (6).
+fn margin(look: &Look) -> f32 {
+    if look.terminal { 10.0 } else { 12.0 }
+}
+
+/// The filter field's height: the design's 30 and 34 and the 1 pt border it
+/// draws outside them (its boxes are content-box).
+fn field_height(look: &Look) -> f32 {
+    if look.terminal { 32.0 } else { 36.0 }
+}
+
+/// Where the macOS and Windows sidebar's search field keeps the keyboard,
+/// by window.
+pub(crate) fn find_field_id(tab: ConnTabId) -> Id {
+    Id::new(("sidebar-find", tab.0))
+}
+
+/// The macOS and Windows sidebar's search field, which is quick open's
+/// way in: a box like the filter's, with the magnifier, "Find any
+/// object…" and quick open's key at its right. A click, or Space or Enter
+/// while it has the keyboard, opens quick open (the response is clicked);
+/// what is typed while it has the keyboard is returned, for quick open's
+/// field. A button to a screen reader, named as it reads.
+fn find_field(
+    ui: &mut egui::Ui,
+    tab: ConnTabId,
+    size: egui::Vec2,
+    key: &Written,
+    (look, palette, locale): (&Look, &Palette, Locale),
+) -> (egui::Response, Option<String>) {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let response = ui.interact(rect, find_field_id(tab), Sense::click());
+    let name = gettext(locale, "Find any object…");
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
+    focus::region(ui, focus::Region::Search, rect.expand(8.0));
+    focus::claim(ui, focus::Region::Search, &response);
+    let corner = CornerRadius::same(look.radius);
+    focus::hint(
+        ui,
+        &response,
+        rect,
+        focus::Ring::Field { radius: corner.nw },
+    );
+    let painter = ui.painter();
+    painter.rect_filled(rect, corner, palette.window);
+    let border = if response.hovered() {
+        palette.outline
+    } else {
+        palette.border
+    };
+    painter.rect_stroke(
+        rect,
+        corner,
+        egui::Stroke::new(widgets::hairline(ui), border),
+        egui::StrokeKind::Inside,
+    );
+    let y = rect.center().y;
+    let icon = Rect::from_center_size(pos2(rect.left() + 11.0 + 7.0, y), vec2(14.0, 14.0));
+    Icon::Search.image(palette.dim, 14.0).paint_at(ui, icon);
+    let role = TextRole::UiBody;
+    let right = rect.right() - 10.0;
+    let shortcut = || Text::one(look, TextRole::Shortcut, key.as_str(), palette.dim);
+    let key_width = if key.as_str().is_empty() {
+        0.0
+    } else {
+        widgets::paint_text_right(ui, right, y, shortcut()) + 8.0
+    };
+    let left = rect.left() + 11.0 + 14.0 + 8.0;
+    let room = (right - key_width - left).max(0.0);
+    let shown = crate::ui::grid::ellipsize(&name, room, false, |text| {
+        role.width(ui.ctx(), look.faces, text)
+    });
+    widgets::paint_text(ui, left, y, Text::one(look, role, &shown, palette.dim));
+    // Space and Enter press it while it has the keyboard, as a button.
+    let pressed = response.has_focus()
+        && ui.input_mut(|input| {
+            input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                || input.consume_key(egui::Modifiers::NONE, egui::Key::Space)
+        });
+    // What is typed on it is a search: it goes to quick open's field. A
+    // space alone is the press above.
+    let typed = response
+        .has_focus()
+        .then(|| {
+            ui.input_mut(|input| {
+                let mut typed = String::new();
+                input.events.retain(|event| match event {
+                    egui::Event::Text(text) if !text.trim().is_empty() => {
+                        typed.push_str(text);
+                        false
+                    }
+                    _ => true,
+                });
+                typed
+            })
+        })
+        .filter(|typed| !typed.is_empty());
+    let mut response = response;
+    if pressed {
+        response.flags |= egui::response::Flags::CLICKED;
+    }
+    (response, typed)
+}
+
+/// The Reload button's spinner, and a loading row's.
+const RELOAD_SPINNER: f32 = 14.0;
+const ROW_SPINNER: f32 = 12.0;
+
+/// The tree's inset from the sidebar's sides.
+fn tree_inset(look: &Look) -> f32 {
+    if look.terminal { 4.0 } else { 8.0 }
+}
+
+/// A tree row's height: groups stand taller than their objects.
+fn row_height(row: &TreeRow, look: &Look) -> f32 {
+    match (&row.node, look.terminal) {
+        (TreeNode::Group(..), true) => 26.0,
+        (TreeNode::Group(..), false) => 28.0,
+        _ => look.tree_row,
+    }
+}
+
+/// What an object is, as a screen reader names its row and the terminal's
+/// status line says it.
+pub(super) fn kind_name(locale: Locale, kind: ObjectKind) -> std::borrow::Cow<'static, str> {
+    match kind {
+        ObjectKind::Table => gettext(locale, "table"),
+        ObjectKind::View => gettext(locale, "view"),
+        ObjectKind::MaterializedView => gettext(locale, "materialized view"),
+    }
+}
+
+/// The name kind of an object as the tree tags it, if not a table.
+fn kind_tag(locale: Locale, kind: ObjectKind) -> Option<String> {
+    match kind {
+        ObjectKind::Table => None,
+        ObjectKind::View => Some(gettext(locale, "view").into_owned()),
+        ObjectKind::MaterializedView => Some(gettext(locale, "mview").into_owned()),
+    }
+}
+
+/// Draws the sidebar of the workspace `tab`, and returns what it asks for.
+/// `show_system` is the setting that lists the system's schemas; `agents`
+/// what the Agents entry says, where it has one. The terminal look's filter
+/// line edits the tree's filter in place, and the sidebar takes the tree's
+/// request to scroll its cursor into view.
+pub fn show(
+    ui: &mut egui::Ui,
+    paint: Paint,
+    tab: ConnTabId,
+    workspace: &mut Workspace,
+    keymap: &Keymap,
+    show_system: bool,
+    agents: Option<AgentsHere>,
+) -> Vec<Action> {
+    let Paint {
+        locale,
+        palette,
+        look,
+    } = paint;
+    // The keys under the tree, as the keymap writes them for the look.
+    let layout = paint.layout();
+    let hints = HINTS.map(|(command, label)| {
+        (
+            keymap.key(layout, command),
+            label.say(paint.locale).into_owned(),
+        )
+    });
+    let sql_key = keymap.key(layout, Command::NewSqlTab);
+    let history_key = keymap.key(layout, Command::History);
+    // The Agents entry, where agents can reach the app: what it says, and
+    // the key that shows the tab.
+    // The terminal look names the letters from the tree and the grid, as
+    // the others name their chord.
+    let agents_key = match look.terminal {
+        true => keymap.key_in(layout, Command::ShowAgents, crate::keymap::Scope::Grid),
+        false => keymap.key(layout, Command::ShowAgents),
+    };
+    let agents = agents
+        .filter(|_| crate::endpoint::AVAILABLE)
+        .map(|here| (here, agents_key));
+    if workspace.sidebar_hidden {
+        return Vec::new();
+    }
+    let agents_front = workspace.agents_in_front();
+    let history_front = workspace.history_in_front();
+    let rows = workspace.tree.visible_rows(workspace.driver, show_system);
+    let schemas = workspace
+        .tree
+        .visible_schemas(workspace.driver, show_system);
+    let shown = workspace.tree.shown_schema(workspace.driver, show_system);
+    let flat = workspace.tree.flat;
+    let shown_loading = shown
+        .as_ref()
+        .and_then(|schema| workspace.tree.nodes.get(schema))
+        .is_some_and(|node| node.objects.is_loading());
+    let shown_error = shown
+        .as_ref()
+        .and_then(|schema| workspace.tree.nodes.get(schema))
+        .and_then(|node| node.objects.error.as_ref().map(ToString::to_string));
+    let schemas_loading =
+        workspace.tree.schemas.is_loading() && workspace.tree.schemas.value.is_none();
+    // Loaded, and nothing to show (none, or only system schemas hidden).
+    let nothing = workspace.tree.schemas.value.is_some() && schemas.is_empty();
+    // The top bar offers other databases (PostgreSQL with more than one).
+    let other_databases = workspace
+        .databases
+        .value
+        .as_ref()
+        .is_some_and(|databases| databases.len() > 1);
+    let schemas_error = workspace
+        .tree
+        .schemas
+        .error
+        .as_ref()
+        .map(ToString::to_string);
+    let active = workspace
+        .active_object_tab()
+        .map(|object| object.object.clone());
+
+    // The keyboard cursor, drawn only while the tree has the arrows.
+    let cursor = workspace
+        .tree
+        .cursor
+        .clone()
+        .filter(|_| workspace.pane == crate::model::Pane::Tree);
+    // Where the cursor starts when the Tab key comes to the tree: where it
+    // was, else on the open object's row.
+    let cursor_start = workspace.tree.cursor.clone().or_else(|| {
+        let open = active.as_ref()?;
+        rows.iter()
+            .map(|row| &row.node)
+            .find(|node| matches!(node, TreeNode::Object(object, _) if object == open))
+            .cloned()
+    });
+    // After a key moved the cursor, scroll its row into view.
+    let reveal = workspace
+        .tree
+        .reveal_cursor
+        .then(|| {
+            let cursor = workspace.tree.cursor.as_ref()?;
+            rows.iter().position(|row| &row.node == cursor)
+        })
+        .flatten();
+    let reveal_pending = workspace.tree.reveal_cursor;
+    let mut actions = Vec::new();
+    // Whether the keys come to the tree and the keyboard is in use: then
+    // its cursor shows, and the terminal look marks the pane.
+    let keys = workspace.pane == crate::model::Pane::Tree;
+    let lit = keys && focus::visible(ui.ctx()) && !focus::on_control(ui.ctx());
+
+    // The terminal's sidebar takes the theme's dark background too.
+    let fill = if look.sidebar_tinted || look.terminal {
+        palette.panel
+    } else {
+        palette.window
+    };
+    egui::Panel::left(Id::new(("sidebar", tab.0)))
+        .resizable(true)
+        .default_size(default_width(&look))
+        .size_range(160.0..=400.0)
+        // The rule sits outside the content, as the design's border does.
+        .frame(egui::Frame::new().fill(fill).inner_margin(egui::Margin {
+            right: 1,
+            ..Default::default()
+        }))
+        .show_separator_line(false)
+        .show(ui, |ui| {
+            let full = ui.max_rect();
+            widgets::vline(ui, full.right() + 0.5, full.y_range(), palette.outline);
+            let pad = margin(&look);
+            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+            ui.add_space(pad);
+            ui.horizontal(|ui| {
+                ui.add_space(pad);
+                let size = vec2(full.width() - 2.0 * pad, field_height(&look));
+                // The macOS and Windows field is quick open's: it opens
+                // it. The terminal look's `/` line filters the tree.
+                if !look.terminal {
+                    let key = crate::ui::keys::written(ui.ctx(), &look, Command::FindObject);
+                    let (field, typed) = find_field(ui, tab, size, &key, (&look, &palette, locale));
+                    if let Some(typed) = typed {
+                        actions.push(Action::QuickOpenTyped(typed));
+                    } else if field.clicked() {
+                        actions.push(Action::OpenQuickOpen);
+                    }
+                } else {
+                    let hint = gettext(locale, "filter objects");
+                    let style = widgets::FieldStyle {
+                        fill: Some(palette.window),
+                        boxed: true,
+                        role: TextRole::pick(&look, TextRole::UiBody, TextRole::OField),
+                    };
+                    let field = widgets::filter_field(
+                        ui,
+                        &mut workspace.tree.filter,
+                        &hint,
+                        size,
+                        style,
+                        &look,
+                        &palette,
+                    );
+                    field.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "Filter"));
+                    // The status line, drawn before the sidebar, asks
+                    // whether it has the keyboard.
+                    ui.data_mut(|data| data.insert_temp(filter_field_key(tab), field.id));
+                    focus::region(ui, focus::Region::Search, field.rect.expand(8.0));
+                    focus::claim(ui, focus::Region::Search, &field);
+                    // Clicked from another pane, the field is the tree's
+                    // all the same: its Enter and Esc leave it for the tree.
+                    if field.has_focus() && workspace.pane != crate::model::Pane::Tree {
+                        actions.push(Action::GiveTreeKeys(tab));
+                    }
+                }
+            });
+            ui.add_space(if look.terminal { 6.0 } else { 8.0 });
+            schema_header(
+                ui,
+                tab,
+                &schemas,
+                shown.as_deref(),
+                flat,
+                shown_loading,
+                SchemaHeader {
+                    locale,
+                    look: &look,
+                    palette: &palette,
+                },
+                &mut actions,
+            );
+            if schemas_loading {
+                ui.horizontal(|ui| {
+                    ui.add_space(pad);
+                    ui.spinner();
+                    Text::one(
+                        &look,
+                        widgets::body(&look),
+                        &gettext(locale, "Loading…"),
+                        palette.text,
+                    )
+                    .layout(ui.ctx())
+                    .label(ui);
+                });
+            }
+            if nothing {
+                ui.add_space(12.0);
+                ui.vertical_centered(|ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    let note = |ui: &mut egui::Ui, role, text: &str| {
+                        Text::one(&look, role, text, palette.secondary)
+                            .layout(ui.ctx())
+                            .label(ui);
+                    };
+                    note(
+                        ui,
+                        widgets::body(&look),
+                        &gettext(locale, "This database has no schemas you can see."),
+                    );
+                    note(
+                        ui,
+                        widgets::secondary(&look),
+                        &gettext(
+                            locale,
+                            "The connected user may lack the privileges to list them.",
+                        ),
+                    );
+                    if other_databases {
+                        note(
+                            ui,
+                            widgets::secondary(&look),
+                            &gettext(locale, "Or pick another database in the top bar."),
+                        );
+                    }
+                    ui.add_space(6.0);
+                    if widgets::button(ui, &gettext(locale, "Reload"), &look).clicked() {
+                        actions.push(Action::RefreshTree(tab));
+                    }
+                });
+            }
+            for error in [schemas_error, shown_error].into_iter().flatten() {
+                ui.horizontal(|ui| {
+                    ui.add_space(pad);
+                    let width = ui.available_width() - pad;
+                    Text::one(&look, widgets::body(&look), &error, palette.danger)
+                        .wrap(width)
+                        .layout(ui.ctx())
+                        .label(ui);
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(pad);
+                    if widgets::button(ui, &gettext(locale, "Retry"), &look).clicked() {
+                        actions.push(Action::RefreshTree(tab));
+                    }
+                });
+            }
+            let footer = footer_height(&look, agents.is_some());
+            let body = ui.available_height() - footer;
+            ui.allocate_ui(vec2(full.width(), body.max(0.0)), |ui| {
+                // The tree is one Tab stop, not one for each row: with the
+                // keyboard on it the arrows move its cursor.
+                let area = Rect::from_min_size(ui.cursor().min, vec2(full.width(), body.max(0.0)));
+                let stop = ui.interact(
+                    area,
+                    Id::new(("tree-keys", tab.0)),
+                    Sense::focusable_noninteractive(),
+                );
+                stop.widget_info(|| {
+                    WidgetInfo::labeled(WidgetType::Other, true, gettext(locale, "Objects"))
+                });
+                ui.ctx().accesskit_node_builder(stop.id, |node| {
+                    node.set_role(egui::accesskit::Role::Tree);
+                });
+                focus::pane(ui, &stop);
+                focus::hint(ui, &stop, area, focus::Ring::Own);
+                focus::region(ui, focus::Region::Tree, area);
+                focus::claim(ui, focus::Region::Tree, &stop);
+                // The cursor it had, the open object's row, or its first.
+                let start = cursor_start
+                    .clone()
+                    .or_else(|| rows.first().map(|row| row.node.clone()));
+                if stop.gained_focus()
+                    && let Some(node) = start
+                {
+                    actions.push(Action::SetTreeCursor { tab, node });
+                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                        let top = ui.cursor().top();
+                        let heights: Vec<f32> =
+                            rows.iter().map(|row| row_height(row, &look)).collect();
+                        if let Some(index) = reveal {
+                            let y = top + heights[..index].iter().sum::<f32>();
+                            let row = Rect::from_min_size(
+                                pos2(ui.cursor().left(), y),
+                                vec2(1.0, heights[index]),
+                            );
+                            // Jump, not animate: the next key may come at once.
+                            ui.scroll_to_rect_animation(
+                                row,
+                                None,
+                                egui::style::ScrollAnimation::none(),
+                            );
+                        }
+                        widgets::virtual_rows_varying(ui, &heights, |ui, index| {
+                            tree_row(
+                                ui,
+                                &rows[index],
+                                tab,
+                                Marks {
+                                    active: active.as_ref(),
+                                    cursor: cursor.as_ref(),
+                                    keys,
+                                    lit,
+                                    flat,
+                                },
+                                locale,
+                                Skin {
+                                    look: &look,
+                                    palette: &palette,
+                                },
+                                &mut actions,
+                            );
+                        });
+                        ui.add_space(8.0);
+                    });
+            });
+            let skin = (locale, &look, &palette);
+            if look.terminal {
+                terminal_footer(ui, full, &hints, &look, &palette);
+                if let Some((here, key)) = &agents {
+                    agents_line(ui, full, tab, (here, key, agents_front), skin, &mut actions);
+                }
+            } else {
+                let keys = (&sql_key, &history_key, history_front);
+                sql_button(ui, full, tab, keys, skin, &mut actions);
+                if let Some((here, key)) = &agents {
+                    agents_button(ui, full, tab, (here, key, agents_front), skin, &mut actions);
+                }
+            }
+            if lit {
+                focus::pane_border(ui, full, &look, &palette);
+            }
+        });
+    if reveal_pending {
+        workspace.tree.reveal_cursor = false;
+    }
+    actions
+}
+
+/// Where the terminal look's filter field above the tree keeps its id.
+fn filter_field_key(tab: ConnTabId) -> egui::Id {
+    egui::Id::new(("tree-filter-field", tab.0))
+}
+
+/// Whether the terminal look's filter field above the tree has the
+/// keyboard: the field the last frame drew.
+pub fn filter_focused(ctx: &egui::Context, tab: ConnTabId) -> bool {
+    ctx.data(|data| data.get_temp::<egui::Id>(filter_field_key(tab)))
+        .is_some_and(|id| ctx.memory(|memory| memory.has_focus(id)))
+}
+
+/// The terminal look's key hints under the tree: what each key does, and
+/// the command whose key it is.
+const HINTS: [(Command, Msgid); 4] = [
+    (Command::ToggleSidebar, msgid("hide")),
+    (Command::ToggleTree, msgid("tree")),
+    (Command::OpenObject, pmsgid("key hint", "open")),
+    (Command::Export, msgid("export table")),
+];
+
+/// The terminal footer's padding (8 above and below, 12 at the sides), and
+/// its height for two lines.
+const FOOTER: f32 = 8.0 + 2.0 * 15.0 + 8.0 + 1.0;
+
+/// The sidebar's key hints, with a rule above: keys in the text colour,
+/// the rest muted, wrapping as words do.
+fn terminal_footer(
+    ui: &mut egui::Ui,
+    full: Rect,
+    hints: &[(Written, String); 4],
+    look: &Look,
+    palette: &Palette,
+) {
+    let top = full.bottom() - FOOTER;
+    widgets::hline(ui, full.x_range(), top + 0.5, palette.outline);
+    let role = TextRole::OCaption;
+    let mut text = Text::new(look);
+    for (index, (key, label)) in hints.iter().enumerate() {
+        if index > 0 {
+            text = text.space(role, " ");
+        }
+        // Each action carries the dot that separates it from the next.
+        let label = if index + 1 < hints.len() {
+            format!("{label} ·")
+        } else {
+            label.clone()
+        };
+        text = text
+            .add(role, key, palette.text)
+            .space(role, " ")
+            .add(role, &label, palette.dim);
+    }
+    text.wrap(full.width() - 24.0)
+        .layout(ui.ctx())
+        .paint(ui.painter(), pos2(full.left() + 12.0, top + 1.0 + 8.0));
+}
+
+/// The room under the tree for the SQL Editor button (macOS and standard):
+/// a rule, then 10 above and 12 below a 34 pt button.
+const SQL_FOOTER: f32 = 1.0 + 10.0 + 34.0 + 12.0;
+
+/// What the Agents entry adds above the footer: a 34 pt button and 8
+/// under it, or in the terminal look a line and 6 under it.
+const AGENTS_BUTTON: f32 = 34.0 + 8.0;
+const AGENTS_LINE: f32 = 22.0 + 6.0;
+
+/// The room under the tree, with the Agents entry where it shows.
+fn footer_height(look: &Look, agents: bool) -> f32 {
+    match (look.terminal, agents) {
+        (true, false) => FOOTER,
+        (true, true) => FOOTER + AGENTS_LINE,
+        (false, false) => SQL_FOOTER,
+        (false, true) => SQL_FOOTER + AGENTS_BUTTON,
+    }
+}
+
+/// What the Agents entry says of the connection, in which colour, and
+/// whether a dot leads it: an agent is here.
+pub(super) fn agents_said(
+    here: &crate::model::AgentsHere,
+    look: &Look,
+    palette: &Palette,
+    locale: Locale,
+) -> (String, egui::Color32, bool) {
+    use crate::model::AgentsHere;
+    let said = match here {
+        AgentsHere::ServerOff => gettext(locale, "Server off").into_owned(),
+        AgentsHere::OffHere => gettext(locale, "Off here").into_owned(),
+        AgentsHere::NoneConnected => gettext(locale, "None connected").into_owned(),
+        AgentsHere::Connected { agent, .. } => agent.clone(),
+    };
+    let color = match here {
+        AgentsHere::ServerOff | AgentsHere::OffHere => palette.dim,
+        AgentsHere::NoneConnected => palette.secondary,
+        AgentsHere::Connected { .. } => crate::ui::states::Tone::Success.color(palette),
+    };
+    let said = look.label(&said);
+    (said, color, matches!(here, AgentsHere::Connected { .. }))
+}
+
+/// The dot that leads an agent's name: painted, as not every face has
+/// the glyph. Its right edge at `right`.
+fn agent_dot(ui: &egui::Ui, right: f32, y: f32, color: egui::Color32) {
+    ui.painter().circle_filled(pos2(right - 3.5, y), 3.5, color);
+}
+
+/// The Agents entry of macOS and Windows: a button above SQL Editor, as
+/// wide, its state at its right, lit while the tab is in front. It shows
+/// the tab, and never opens it by itself.
+fn agents_button(
+    ui: &mut egui::Ui,
+    full: Rect,
+    tab: ConnTabId,
+    (here, key, front): (&crate::model::AgentsHere, &Written, bool),
+    (locale, look, palette): (Locale, &Look, &Palette),
+    actions: &mut Vec<Action>,
+) {
+    let top = full.bottom() - SQL_FOOTER - AGENTS_BUTTON;
+    let rect = Rect::from_min_size(
+        pos2(full.left() + 12.0, top + 1.0 + 10.0),
+        vec2(full.width() - 24.0, 34.0),
+    );
+    let label = gettext(locale, "Agents");
+    let (said, color, dot) = agents_said(here, look, palette, locale);
+    let read = format!("{label}, {said}");
+    let response = ButtonSpec::new(&label)
+        .label(&read)
+        .icon(Icon::SquareTerminal)
+        .padding(10.0)
+        .gap(8.0)
+        .justified()
+        .show_at(ui, rect, look, palette)
+        .on_hover_text(format!("{label} · {}", key.as_str()));
+    // Lit while the tab is in front.
+    if front {
+        ui.painter().rect_stroke(
+            rect,
+            egui::CornerRadius::same(look.radius),
+            egui::Stroke::new(1.5, palette.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    // The state gives way at its end to the label and the icon: an agent
+    // may call itself 64 letters long.
+    let role = widgets::secondary(look);
+    let used = 10.0 + 14.0 + 8.0 + TextRole::UiBody.width(ui.ctx(), look.faces, &label) + 16.0;
+    let room = (rect.width() - used - 10.0 - if dot { 12.0 } else { 0.0 }).max(0.0);
+    let said = crate::ui::grid::ellipsize(&said, room, false, |text| {
+        role.width(ui.ctx(), look.faces, text)
+    });
+    let laid = Text::one(look, role, &said, color).layout(ui.ctx());
+    let left = rect.right() - 10.0 - laid.width();
+    laid.paint_left(ui.painter(), left, rect.center().y);
+    if dot {
+        agent_dot(ui, left - 5.0, rect.center().y, color);
+    }
+    if response.clicked() {
+        actions.push(Action::ShowAgents(tab));
+    }
+}
+
+/// The Agents entry of the terminal look: the line above the key hints,
+/// `agents`, its state, and the key that shows the tab.
+fn agents_line(
+    ui: &mut egui::Ui,
+    full: Rect,
+    tab: ConnTabId,
+    (here, key, front): (&crate::model::AgentsHere, &Written, bool),
+    (locale, look, palette): (Locale, &Look, &Palette),
+    actions: &mut Vec<Action>,
+) {
+    let top = full.bottom() - FOOTER - AGENTS_LINE;
+    let rect = Rect::from_min_size(
+        pos2(full.left() + 8.0, top + 2.0),
+        vec2(full.width() - 16.0, 22.0),
+    );
+    let label = look.label(&gettext(locale, "Agents"));
+    let (said, color, dot) = agents_said(here, look, palette, locale);
+    let response = ui.interact(rect, Id::new(("agents-entry", tab.0)), Sense::click());
+    response
+        .widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("{label}, {said}")));
+    let fill = if front || response.hovered() {
+        palette.surface
+    } else {
+        palette.panel
+    };
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::ZERO, fill);
+    ui.painter().rect_stroke(
+        rect,
+        egui::CornerRadius::ZERO,
+        egui::Stroke::new(1.0, palette.outline),
+        egui::StrokeKind::Inside,
+    );
+    let role = TextRole::OCaption;
+    Text::one(look, role, &label, palette.text)
+        .layout(ui.ctx())
+        .paint_left(ui.painter(), rect.left() + 8.0, rect.center().y);
+    let keys = Text::one(look, role, key.as_str(), palette.accent).layout(ui.ctx());
+    let right = rect.right() - 8.0;
+    keys.paint_left(ui.painter(), right - keys.width(), rect.center().y);
+    // The state gives way at its end to the label and the key.
+    let used = 8.0 + role.width(ui.ctx(), look.faces, &label) + 16.0;
+    let room =
+        (right - keys.width() - 10.0 - rect.left() - used - if dot { 12.0 } else { 0.0 }).max(0.0);
+    let said = crate::ui::grid::ellipsize(&said, room, false, |text| {
+        role.width(ui.ctx(), look.faces, text)
+    });
+    let state = Text::one(look, role, &said, color).layout(ui.ctx());
+    let left = right - keys.width() - 10.0 - state.width();
+    state.paint_left(ui.painter(), left, rect.center().y);
+    if dot {
+        agent_dot(ui, left - 5.0, rect.center().y, color);
+    }
+    if response.clicked() {
+        actions.push(Action::ShowAgents(tab));
+    }
+}
+
+/// The width of the SQL Editor button's History segment, at its right.
+const CLOCK: f32 = 38.0;
+
+/// The SQL Editor button, as wide as the sidebar, 12 in from its sides: a
+/// split button whose main part opens a SQL editor, with its keys, and
+/// whose clock at the right shows the History tab, pressed while that tab
+/// is in front. A group named "SQL editor" of two buttons.
+fn sql_button(
+    ui: &mut egui::Ui,
+    full: Rect,
+    tab: ConnTabId,
+    (keys, history_keys, history_front): (&Written, &Written, bool),
+    (locale, look, palette): (Locale, &Look, &Palette),
+    actions: &mut Vec<Action>,
+) {
+    let top = full.bottom() - SQL_FOOTER;
+    widgets::hline(ui, full.x_range(), top + 0.5, palette.surface_hover);
+    let rect = Rect::from_min_size(
+        pos2(full.left() + 12.0, top + 1.0 + 10.0),
+        vec2(full.width() - 24.0, 34.0),
+    );
+    let group = ui.interact(rect, Id::new(("sql-editor-button", tab.0)), Sense::hover());
+    let group_name = gettext(locale, "SQL editor");
+    group.widget_info(|| WidgetInfo::labeled(WidgetType::Other, true, &group_name));
+    ui.ctx().accesskit_node_builder(group.id, |node| {
+        node.set_role(egui::accesskit::Role::Group);
+    });
+    let mut parts = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .accessibility_parent(group.id),
+    );
+    let clock = Rect::from_min_max(pos2(rect.right() - CLOCK, rect.top()), rect.max);
+    let main = Rect::from_min_max(rect.min, pos2(clock.left(), rect.bottom()));
+    let label = gettext(locale, "SQL Editor");
+    let named = format!("{} ({})", gettext(locale, "New SQL editor"), keys.as_str());
+    // 10 at its sides, a 14 pt plus, 8, the words; the keys at the right.
+    let button = || {
+        ButtonSpec::new(&label)
+            .label(&named)
+            .icon(Icon::Plus)
+            .primary()
+            .padding(10.0)
+            .gap(8.0)
+            .justified()
+    };
+    // In a sidebar too narrow for them the keys give way.
+    let with_keys = button().shortcut(keys);
+    let button = if with_keys.width(&parts, look) <= main.width() {
+        with_keys
+    } else {
+        button()
+    };
+    let response = button
+        .show_at(&mut parts, main, look, palette)
+        .on_hover_text(gettext(locale, "Open a new SQL editor"));
+    if response.clicked() {
+        actions.push(Action::NewSqlTab(tab));
+    }
+    // A primary button's fill as it is now: at rest, under the pointer, or
+    // held down (as `ButtonSpec` paints it).
+    let fill_of = |hovered: bool, held: bool| {
+        if held {
+            palette.text.lerp_to_gamma(palette.window, 0.25)
+        } else if hovered {
+            palette.text.lerp_to_gamma(palette.window, 0.15)
+        } else {
+            palette.text
+        }
+    };
+    // The main part's right corners squared in its own fill, and the clock
+    // from the line on, so the two read as one button with a line between
+    // them.
+    let history = format!("{} ({})", gettext(locale, "History"), history_keys.as_str());
+    let pressed_id = Id::new(("sql-editor-history", tab.0));
+    let segment = parts.interact(clock, pressed_id, Sense::click());
+    segment.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, history_front, &history));
+    // Pressed while History is in front.
+    let held = history_front || segment.is_pointer_button_down_on();
+    let radius = look.radius;
+    let corners = Rect::from_min_max(
+        pos2(clock.left() - f32::from(radius), clock.top()),
+        pos2(clock.left(), clock.bottom()),
+    );
+    let main_fill = fill_of(response.hovered(), response.is_pointer_button_down_on());
+    ui.painter().rect_filled(corners, 0.0, main_fill);
+    ui.painter().rect_filled(
+        clock,
+        egui::CornerRadius {
+            nw: 0,
+            sw: 0,
+            ne: radius,
+            se: radius,
+        },
+        fill_of(segment.hovered(), held),
+    );
+    // The line between them, in the colour a spinner has on the fill.
+    widgets::vline(
+        ui,
+        clock.left() + 0.5,
+        clock.y_range(),
+        palette.window.gamma_multiply(0.35),
+    );
+    Icon::Clock
+        .image(palette.window, 15.0)
+        .paint_at(ui, Rect::from_center_size(clock.center(), vec2(15.0, 15.0)));
+    let tip = format!("{} · {}", gettext(locale, "History"), history_keys.as_str());
+    if segment.on_hover_text(tip).clicked() {
+        actions.push(Action::ShowHistory(tab));
+    }
+}
+
+/// What the schema header draws with.
+#[derive(Clone, Copy)]
+struct SchemaHeader<'a> {
+    locale: Locale,
+    look: &'a Look,
+    palette: &'a Palette,
+}
+
+/// The schema picker, the tree/flat switch and Refresh.
+#[allow(clippy::too_many_arguments)] // one call site; the pieces are unrelated
+fn schema_header(
+    ui: &mut egui::Ui,
+    tab: ConnTabId,
+    schemas: &[String],
+    shown: Option<&str>,
+    flat: bool,
+    loading: bool,
+    skin: SchemaHeader<'_>,
+    actions: &mut Vec<Action>,
+) {
+    let SchemaHeader {
+        locale,
+        look,
+        palette,
+    } = skin;
+    let width = ui.available_width();
+    // macOS: a rule, then 8 above and 4 below a 28 pt row, 16 in and 8 from
+    // the right. Terminal: 4 above and below a 22 pt row, 12 in and 8.
+    let (above, row, below, left_pad) = if look.terminal {
+        (4.0, 22.0, 4.0, 12.0)
+    } else {
+        (8.0, 28.0, 4.0, 16.0)
+    };
+    let (band, _) = ui.allocate_exact_size(vec2(width, above + row + below), Sense::hover());
+    if !look.terminal {
+        widgets::hline(ui, band.x_range(), band.top() + 0.5, palette.surface_hover);
+    }
+    let rect = Rect::from_min_size(pos2(band.left(), band.top() + above), vec2(width, row));
+    let left = rect.left() + left_pad;
+    let center = rect.center().y;
+    // The schema: a menu of the others.
+    if let Some(schema) = shown {
+        let label = widgets::section_label(&display_safe(schema), look, palette).layout(ui.ctx());
+        let text_width = label.width();
+        let (glyph_width, gap) = if look.terminal {
+            (8.0, 4.0)
+        } else {
+            (10.0, 4.0)
+        };
+        let hit = Rect::from_min_size(
+            pos2(left - 6.0, center - 13.0),
+            vec2(6.0 + text_width + gap + glyph_width + 6.0, 26.0),
+        );
+        let response = ui.interact(hit, ui.id().with("schema-menu"), Sense::click());
+        response.widget_info(|| {
+            let mut info =
+                WidgetInfo::labeled(WidgetType::ComboBox, true, gettext(locale, "Schema"));
+            info.current_text_value = Some(display_safe(schema).into_owned());
+            info
+        });
+        if response.hovered() && !look.terminal {
+            ui.painter()
+                .rect_filled(hit, CornerRadius::same(6), palette.surface);
+        }
+        label.paint_left(ui.painter(), left, center);
+        let glyph = pos2(left + text_width + gap + glyph_width / 2.0, center);
+        if look.terminal {
+            let mark = Text::one(look, TextRole::OCaption, "▾", palette.dim).layout(ui.ctx());
+            mark.paint_center(ui.painter(), glyph);
+        } else {
+            Icon::ChevronDown
+                .image(palette.secondary, 10.0)
+                .paint_at(ui, Rect::from_center_size(glyph, vec2(10.0, 10.0)));
+        }
+        let picked = menu::choices(&response, 160.0, look, palette, || {
+            schemas
+                .iter()
+                .map(|other| menu::Choice {
+                    text: display_safe(other).into_owned(),
+                    name: None,
+                    selected: Some(other.as_str()) == shown,
+                    disabled: None,
+                })
+                .collect()
+        });
+        if let Some(schema) = picked.and_then(|index| schemas.get(index)) {
+            actions.push(Action::ShowSchema {
+                tab,
+                schema: schema.clone(),
+            });
+        }
+    }
+    // Right to left, 8 in: Reload (macOS, 28 square), 2 apart, then the
+    // tree/flat switch.
+    let mut right = rect.right() - 8.0;
+    if !look.terminal {
+        let refresh = Rect::from_min_size(pos2(right - 28.0, center - 14.0), vec2(28.0, 28.0));
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(refresh));
+        if loading {
+            egui::Spinner::new().size(RELOAD_SPINNER).paint_at(
+                &child,
+                Rect::from_center_size(refresh.center(), vec2(14.0, 14.0)),
+            );
+        } else if widgets::icon_button_tipped(
+            &mut child,
+            Icon::RefreshCw,
+            // Named apart from a table's own Reload, which can be on
+            // screen with it. The tooltip is the command's name.
+            (
+                &gettext(locale, "Reload objects"),
+                &gettext(locale, "Reload"),
+            ),
+            look,
+            palette,
+        )
+        .clicked()
+        {
+            actions.push(Action::RefreshTree(tab));
+        }
+        right = refresh.left() - 2.0;
+    }
+    let (segments, segment) = if look.terminal {
+        (
+            [
+                widgets::Segment::Text("tree"),
+                widgets::Segment::Text("flat"),
+            ],
+            vec2(0.0, 20.0),
+        )
+    } else {
+        (
+            [
+                widgets::Segment::Icon(Icon::ListTree, "Tree"),
+                widgets::Segment::Icon(Icon::List, "Flat"),
+            ],
+            vec2(26.0, 22.0),
+        )
+    };
+    // The switch's size, measured as `segmented` lays it out.
+    let cells: f32 = if look.terminal {
+        ["tree", "flat"]
+            .iter()
+            .map(|text| TextRole::OCaption.width(ui.ctx(), look.faces, text) + 12.0)
+            .sum()
+    } else {
+        2.0 * segment.x
+    };
+    let pad = if look.terminal { 1.0 } else { 2.0 };
+    let total = vec2(cells + 2.0 * pad, segment.y + 2.0 * pad);
+    let place = Rect::from_min_size(pos2(right - total.x, center - total.y / 2.0), total);
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(place));
+    if let Some(index) = widgets::segmented(
+        &mut child,
+        &segments,
+        usize::from(flat),
+        segment,
+        None,
+        look,
+        palette,
+    ) && (index == 1) != flat
+    {
+        actions.push(Action::ToggleFlatTree(tab));
+    }
+}
+
+/// Which rows are highlighted: the open object and the keyboard cursor.
+#[derive(Clone, Copy)]
+struct Marks<'a> {
+    active: Option<&'a ObjectRef>,
+    cursor: Option<&'a TreeNode>,
+    /// The arrows are the tree's.
+    keys: bool,
+    /// And the keyboard is in use: the cursor shows.
+    lit: bool,
+    /// The objects are one flat list: no groups, no indent.
+    flat: bool,
+}
+
+/// How rows are drawn: the platform look and the colour palette.
+#[derive(Clone, Copy)]
+struct Skin<'a> {
+    look: &'a Look,
+    palette: &'a Palette,
+}
+
+/// One step of the macOS tree's indent: the chevron, 12, and the 6 after
+/// it. A group's name and a single object's start one step past the
+/// chevron.
+pub(crate) const INDENT: f32 = 18.0;
+
+/// Where the macOS guide stands: 4 into the group's chevron.
+pub(crate) const GUIDE: f32 = 4.0;
+
+/// How far a grouped object's highlight begins past its guide: the 1 pt
+/// line, then 4.
+pub(crate) const PAST_GUIDE: f32 = 5.0;
+
+/// How far a grouped object's name stands into its highlight.
+pub(crate) const NAME_IN: f32 = 14.0;
+
+/// Where a tree row draws, from its left edge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Places {
+    /// The fold mark: macOS's chevron, the terminal's ▸.
+    pub fold: f32,
+    /// The name.
+    pub label: f32,
+    /// The guide along an open group's objects, on each of its rows:
+    /// macOS's line 4 into the chevron, the terminal's `│` under its
+    /// group's name.
+    pub guide: Option<f32>,
+    /// Where the highlight and the focus ring begin: inside the indent,
+    /// past the guide, for a grouped object.
+    pub band: f32,
+}
+
+/// Where `row` draws, in the look. `glyph` is the fold mark's width and
+/// `cell` one character's of the terminal's face. macOS: the chevron 8
+/// into the row (itself 8 in), a group's name and a single object's one
+/// step past it; a grouped object's highlight 4 past the guide and its
+/// name 14 into that, so it stands in from its group's name. Terminal: the mark 4 and 8 in, a
+/// group's name 6 after it, and in the tree every object two cells
+/// further, a grouped one with `│` in the first of them.
+pub(crate) fn places(row: &TreeRow, flat: bool, look: &Look, glyph: f32, cell: f32) -> Places {
+    let inset = tree_inset(look);
+    let fold = inset + 8.0;
+    let grouped = row.depth > 0;
+    if look.terminal {
+        let name = fold + glyph + 6.0;
+        let label = match row.node {
+            TreeNode::Object(..) if !flat => name + 2.0 * cell,
+            _ => name,
+        };
+        return Places {
+            fold,
+            label,
+            guide: grouped.then_some(name),
+            band: inset,
+        };
+    }
+    let guide = fold + GUIDE;
+    let highlight = guide + PAST_GUIDE;
+    // The pill stands 8 inside its band.
+    let pill = match look.selection {
+        crate::theme::Selection::Pill => 8.0,
+        crate::theme::Selection::Tint | crate::theme::Selection::Bar => 0.0,
+    };
+    Places {
+        fold,
+        label: if grouped {
+            highlight + NAME_IN
+        } else {
+            fold + INDENT
+        },
+        guide: grouped.then_some(guide),
+        band: if grouped { highlight - pill } else { 0.0 },
+    }
+}
+
+/// One character's width in the terminal's face.
+fn cell_width(ui: &egui::Ui, look: &Look) -> f32 {
+    TextRole::OBody.width(ui.ctx(), look.faces, " ")
+}
+
+/// The width of the fold mark: macOS's 12 pt chevron, the terminal's ▾.
+fn glyph_width(ui: &egui::Ui, look: &Look) -> f32 {
+    if look.terminal {
+        TextRole::OBody.width(ui.ctx(), look.faces, "▾")
+    } else {
+        12.0
+    }
+}
+
+fn tree_row(
+    ui: &mut egui::Ui,
+    row: &TreeRow,
+    tab: ConnTabId,
+    marks: Marks<'_>,
+    locale: Locale,
+    skin: Skin<'_>,
+    actions: &mut Vec<Action>,
+) {
+    let Skin { look, palette } = skin;
+    let small = widgets::secondary(look);
+    // A quiet note, not a row: the text is never clickable, and a small
+    // link after it reloads the tree in case objects appeared since. In a
+    // narrow sidebar the note gives way ("…") so the link stays in view.
+    if matches!(row.node, TreeNode::Empty(_)) {
+        let size = vec2(ui.available_width(), look.tree_row);
+        let layout = egui::Layout::left_to_right(egui::Align::Center);
+        ui.allocate_ui_with_layout(size, layout, |ui| {
+            ui.set_min_size(size);
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let at = places(row, marks.flat, look, glyph_width(ui, look), 0.0);
+            ui.add_space(at.label);
+            let refresh = gettext(locale, "Reload");
+            let link_width = small.width(ui.ctx(), look.faces, &refresh);
+            let room = ui.available_width() - link_width - ui.spacing().item_spacing.x;
+            let note = gettext(locale, "No tables or views");
+            let shown = crate::ui::grid::ellipsize(&note, room.max(0.0), false, |text| {
+                small.width(ui.ctx(), look.faces, text)
+            });
+            Text::one(look, small, &shown, palette.secondary)
+                .layout(ui.ctx())
+                .label(ui);
+            let link = Text::one(look, small, &refresh, palette.accent)
+                .layout(ui.ctx())
+                .label_sense(ui, Sense::click());
+            link.widget_info(|| WidgetInfo::labeled(WidgetType::Link, true, refresh.as_ref()));
+            if link.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if link.clicked() {
+                actions.push(Action::RefreshTree(tab));
+            }
+        });
+        return;
+    }
+    // A row takes a click, not the Tab key: the tree is the stop.
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), row_height(row, look)),
+        Sense::CLICK,
+    );
+    // Names come from the server: nothing hidden in them.
+    let full_name = match &row.node {
+        TreeNode::Object(object, _) => display_safe(&object.name),
+        _ => display_safe(&row.label),
+    };
+    let label = display_safe(&row.label);
+    let selected = matches!(&row.node, TreeNode::Object(object, _) if Some(object) == marks.active);
+    // A tree's item, named in full with what it is, though a grouped
+    // object's prefix is not drawn: "book_, 21 tables", "book_covers, table".
+    let name = match &row.node {
+        TreeNode::Group(..) => {
+            let count = row.count.unwrap_or_default();
+            ngettext(locale, "{name}, {n} table", "{name}, {n} tables", count)
+                .replace("{n}", &crate::i18n::number(locale, count))
+                .replace("{name}", &label)
+        }
+        TreeNode::Object(_, kind) => format!("{full_name}, {}", kind_name(locale, *kind)),
+        TreeNode::Empty(_) => label.to_string(),
+    };
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_role(egui::accesskit::Role::TreeItem);
+        node.set_level(usize::from(row.depth) + 1);
+        if let Some(open) = row.expanded {
+            node.set_expanded(open);
+        }
+        if selected {
+            node.set_selected(true);
+        }
+    });
+    let glyph = glyph_width(ui, look);
+    let at = places(row, marks.flat, look, glyph, cell_width(ui, look));
+    // Rows sit in the tree's inset: the macOS pill fills it, the terminal
+    // bar spans it. A grouped object's begins past its guide.
+    let band = Rect::from_min_max(
+        pos2(rect.left() + at.band, rect.top()),
+        pos2(
+            rect.right() - if look.terminal { at.band } else { 0.0 },
+            rect.bottom(),
+        ),
+    );
+    widgets::selection(ui, band, selected, response.hovered(), look, palette);
+    let highlight = widgets::selection_rect(band, look);
+    // The terminal's bar on the open object's row is muted while the keys
+    // are elsewhere: selected, not focused.
+    if selected && !marks.keys && look.selection == crate::theme::Selection::Bar {
+        let edge = Rect::from_min_size(band.min, vec2(2.0, band.height()));
+        ui.painter()
+            .rect_filled(edge, CornerRadius::ZERO, palette.dim);
+    }
+    // The row the arrows are on, while the keyboard is in use and its keys
+    // come to the tree: the ring a focused row takes. Apart from the open
+    // object's fill: one says where the keys are, the other what is open.
+    if marks.cursor == Some(&row.node) && marks.lit {
+        ui.painter().rect_stroke(
+            highlight,
+            CornerRadius::same(look.radius.saturating_sub(2)),
+            egui::Stroke::new(2.0, palette.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let center = rect.center().y;
+    let x = rect.left() + at.label;
+    let fold_x = rect.left() + at.fold;
+    // The guide along the open group, a piece on each of its rows: one
+    // line from its first object to its last.
+    if let Some(guide) = at.guide {
+        let guide = rect.left() + guide;
+        if look.terminal {
+            let mark = Text::one(look, TextRole::OBody, "│", palette.dim);
+            widgets::paint_text(ui, guide, center, mark);
+        } else {
+            let line = Rect::from_min_size(pos2(guide, rect.top()), vec2(1.0, rect.height()));
+            ui.painter()
+                .rect_filled(line, CornerRadius::ZERO, palette.surface_active);
+        }
+    }
+    if let Some(expanded) = row.expanded {
+        if look.terminal {
+            let mark = if expanded { "▾" } else { "▸" };
+            widgets::paint_text(
+                ui,
+                fold_x,
+                center,
+                Text::one(look, TextRole::OBody, mark, palette.dim),
+            );
+        } else {
+            let icon = if expanded {
+                Icon::ChevronDown
+            } else {
+                Icon::ChevronRight
+            };
+            icon.image(palette.dim, 12.0).paint_at(
+                ui,
+                Rect::from_center_size(pos2(fold_x + 6.0, center), vec2(12.0, 12.0)),
+            );
+        }
+    }
+    let right = rect.right() - tree_inset(look) - 8.0;
+    // What sits at the right: a group's count or an object's kind.
+    let (trailing, trailing_color) = match &row.node {
+        TreeNode::Group(..) => (
+            row.count.map(|count| crate::i18n::number(locale, count)),
+            palette.dim,
+        ),
+        TreeNode::Object(_, kind) => (
+            kind_tag(locale, *kind),
+            if look.terminal {
+                palette.dim
+            } else {
+                palette.faint
+            },
+        ),
+        TreeNode::Empty(_) => (None, palette.dim),
+    };
+    let trailing_role = match (&row.node, look.terminal) {
+        (TreeNode::Group(..), true) => TextRole::OCaption,
+        (TreeNode::Group(..), false) => TextRole::ColumnType,
+        (_, true) => TextRole::OColumnType,
+        (_, false) => TextRole::TagSmall,
+    };
+    let trailing_width = trailing.as_ref().map_or(0.0, |text| {
+        widgets::paint_text_right(
+            ui,
+            right,
+            center,
+            Text::one(look, trailing_role, text, trailing_color),
+        )
+    });
+    // Groups: macOS Plex Mono 500 at 12, the terminal bold. Objects: 13,
+    // the selected one medium in the strong accent (macOS) or in the text
+    // colour among muted ones (terminal).
+    let (role, color) = match row.node {
+        TreeNode::Group(..) if look.terminal => (TextRole::OGroup, palette.text),
+        TreeNode::Group(..) => (TextRole::MonoGroup, palette.text),
+        _ if selected && look.terminal => (TextRole::OBody, palette.text),
+        _ if selected => (TextRole::UiBodyStrong, palette.accent_hover),
+        _ if look.terminal => (TextRole::OBody, palette.secondary),
+        _ => (
+            TextRole::UiBody,
+            palette.text.lerp_to_gamma(palette.secondary, 0.37),
+        ),
+    };
+    // Long names end in "…" and show in full on hover.
+    // Room for the spinner or error dot only when there is one.
+    let marker = if row.loading || row.error.is_some() {
+        22.0
+    } else {
+        0.0
+    };
+    let room = right - trailing_width - 8.0 - x - marker;
+    let shown = crate::ui::grid::ellipsize(&label, room, false, |text| {
+        role.width(ui.ctx(), look.faces, text)
+    });
+    if shown != label || label != full_name {
+        response.clone().on_hover_text(&*full_name);
+    }
+    Text::one(look, role, &shown, color)
+        .layout(ui.ctx())
+        .paint_left(&ui.painter().with_clip_rect(rect), x, center);
+    if row.loading {
+        let spinner =
+            Rect::from_center_size(pos2(highlight.right() - 10.0, center), vec2(12.0, 12.0));
+        egui::Spinner::new().size(ROW_SPINNER).paint_at(ui, spinner);
+    }
+    if let Some(error) = &row.error {
+        response.clone().on_hover_text(error);
+        ui.painter()
+            .circle_filled(pos2(highlight.right() - 10.0, center), 4.0, palette.danger);
+    }
+    match &row.node {
+        TreeNode::Group(schema, prefix) if response.clicked() => {
+            actions.push(Action::ToggleGroup {
+                tab,
+                schema: schema.clone(),
+                prefix: prefix.clone(),
+            });
+        }
+        TreeNode::Object(object, kind) => {
+            if response.double_clicked() {
+                actions.push(Action::OpenObject {
+                    tab,
+                    object: object.clone(),
+                    kind: *kind,
+                    pin: true,
+                });
+            } else if response.clicked() {
+                actions.push(Action::OpenObject {
+                    tab,
+                    object: object.clone(),
+                    kind: *kind,
+                    pin: false,
+                });
+            }
+        }
+        _ => {}
+    }
+    // A click also puts the keyboard cursor here and gives the tree the
+    // arrows (after the row's own action, which may give them to the grid).
+    // A secondary click too: its menu is about this row.
+    if response.clicked() || response.secondary_clicked() {
+        actions.push(Action::SetTreeCursor {
+            tab,
+            node: row.node.clone(),
+        });
+    }
+    if let TreeNode::Object(object, kind) = &row.node {
+        object_menu(&response, (tab, object, *kind), locale, skin, actions);
+    }
+}
+
+/// The menu a secondary click on a table's or view's row opens (spec 3b,
+/// R5): Open, Structure, DDL, Copy name, Export…, and Import… greyed.
+fn object_menu(
+    response: &egui::Response,
+    (tab, object, kind): (ConnTabId, &ObjectRef, ObjectKind),
+    locale: Locale,
+    skin: Skin<'_>,
+    actions: &mut Vec<Action>,
+) {
+    use crate::model::TreePick;
+    let Skin { look, palette } = skin;
+    menu::context(response, look, palette, |ui| {
+        let ctx = ui.ctx().clone();
+        let word = |text: Msgid| look.label(&text.say(locale));
+        let key = |command| crate::ui::keys::written_in(&ctx, look, command, Scope::Sidebar);
+        let rows = [
+            (
+                TreePick::Open,
+                word(msgid("Open")),
+                key(Command::OpenObject),
+            ),
+            (
+                TreePick::Structure,
+                word(msgid("Structure")),
+                Written::default(),
+            ),
+            (TreePick::Ddl, word(msgid("DDL")), Written::default()),
+        ];
+        let mut picked = None;
+        let row = |ui: &mut egui::Ui, words: &str, key: &Written| {
+            let mut item = menu::Item::action(words);
+            if !look.terminal && !key.as_str().is_empty() {
+                item = item.detail(key.as_str());
+            }
+            item.show(ui, look, palette).clicked()
+        };
+        for (pick, words, key) in &rows {
+            if row(ui, words, key) {
+                picked = Some(*pick);
+            }
+        }
+        let copy = word(msgid("Copy name"));
+        if row(ui, &copy, &Written::default()) {
+            picked = Some(TreePick::CopyName);
+        }
+        menu::separator(ui, palette);
+        let export = word(msgid("Export…"));
+        if row(ui, &export, &key(Command::Export)) {
+            picked = Some(TreePick::Export);
+        }
+        let import = word(msgid("Import…"));
+        let later = word(msgid("later"));
+        let why = gettext(locale, "Import comes after Export");
+        menu::Item::action(&import)
+            .detail(&later)
+            .disabled(&why)
+            .show(ui, look, palette);
+        if let Some(pick) = picked {
+            actions.push(Action::FromTree {
+                tab,
+                object: object.clone(),
+                kind,
+                pick,
+            });
+            ui.close();
+        }
+    });
+}

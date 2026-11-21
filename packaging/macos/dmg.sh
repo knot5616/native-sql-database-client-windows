@@ -1,0 +1,42 @@
+#!/bin/bash
+# Wrap native-sql-database-client-windows.app in a DMG with an Applications link, on a macOS machine.
+#
+#   packaging/macos/dmg.sh <native-sql-database-client-windows.app> <output.dmg>
+#
+# With CODESIGN_IDENTITY the DMG is signed; with NOTARY_PROFILE as well (a
+# profile saved by `xcrun notarytool store-credentials`, in NOTARY_KEYCHAIN
+# when that is set) it is also notarized and stapled (Apple rejects an
+# unsigned one). The Apple password never appears on this script's command
+# lines. Without them the DMG is left as is, and says so.
+set -euo pipefail
+
+app="$1"
+dmg="$2"
+
+stage="$(mktemp -d)"
+cp -R "$app" "$stage/"
+ln -s /Applications "$stage/Applications"
+rm -f "$dmg"
+# hdiutil's own guess at the volume's size from -srcfolder can come out short
+# for a large binary, and the copy into it then fails with "No space left on
+# device". Size it from the stage instead, a quarter and 50 MB over: the
+# compressed DMG holds only what was copied, so the room costs nothing.
+stage_kb="$(du -sk "$stage" | cut -f1)"
+hdiutil create -volname native-sql-database-client-windows -srcfolder "$stage" \
+    -size "$((stage_kb * 5 / 4 + 51200))k" -ov -format UDZO "$dmg"
+
+if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+    codesign --force --timestamp --sign "$CODESIGN_IDENTITY" "$dmg"
+fi
+if [ -n "${CODESIGN_IDENTITY:-}" ] && [ -n "${NOTARY_PROFILE:-}" ]; then
+    if [ -n "${NOTARY_KEYCHAIN:-}" ]; then
+        xcrun notarytool submit "$dmg" --keychain-profile "$NOTARY_PROFILE" \
+            --keychain "$NOTARY_KEYCHAIN" --wait
+    else
+        xcrun notarytool submit "$dmg" --keychain-profile "$NOTARY_PROFILE" --wait
+    fi
+    xcrun stapler staple "$dmg"
+else
+    echo "::notice::Not notarized: it takes a signing identity and the Apple notary secrets."
+fi
+echo "$dmg"

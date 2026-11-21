@@ -1,0 +1,526 @@
+//! The font files behind each look, one egui family per weight.
+//!
+//! - Standard: Inter (fastframe's set-up), with egui's monospace for data.
+//! - macOS, and Linux's classic look: IBM Plex Sans (400, 500, 600) and
+//!   IBM Plex Mono (400, 500), bundled on both: `plex-sans-400` ... `plex-mono-500`; JetBrains Mono (400,
+//!   500), the other bundled face data can be drawn in: `jetbrains-mono-400`
+//!   and `jetbrains-mono-500`; and the installed font the settings name for
+//!   the data, where one was read ([`crate::font_files::installed_font`]):
+//!   `installed-mono-400` and `installed-mono-500`, holding Plex Mono
+//!   without one.
+//! - Omarchy: the desktop's monospace font at 400, 500 and 700 (fontconfig
+//!   reads it, [`crate::font_files::desktop_font`]), or the bundled
+//!   JetBrains Mono when it found none: `omarchy-mono-400` ...
+//!   `omarchy-mono-700`.
+//!
+//! egui's own Proportional and Monospace families (and fastframe's Inter
+//! weight families, which the edit connection dialog still names) lead with
+//! the look's regular faces, so text egui draws by itself matches.
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+use std::sync::Arc;
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+use egui::{FontData, epaint::text::VariationCoords};
+use egui::{FontDefinitions, FontFamily};
+
+use super::{Kind, family_name};
+use crate::font_files::TerminalFaces;
+use crate::theme::{Look, Typeface};
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+use {super::data_family_name, crate::theme::DataFace};
+
+/// IBM Plex Sans, variable in weight and width (SIL OFL 1.1).
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub(crate) const PLEX_SANS: &[u8] = include_bytes!("../../assets/fonts/IBMPlexSans-Variable.ttf");
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub(crate) const PLEX_MONO: &[u8] = include_bytes!("../../assets/fonts/IBMPlexMono-Regular.ttf");
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub(crate) const PLEX_MONO_MEDIUM: &[u8] =
+    include_bytes!("../../assets/fonts/IBMPlexMono-Medium.ttf");
+/// Noto Sans Symbols 2 cut down to the keyboard symbols Plex lacks (⌘ ⌥ ⇧
+/// ⌫ ⌦ ⏎), with ⌃ from Noto Sans Symbols beside them, for the macOS
+/// shortcuts (both SIL OFL 1.1, of the same authors). It keeps the line of
+/// the first cut, which the symbols' place on the baseline is tuned to.
+/// Neither has ⇥: the keymap writes that key as a word.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub(crate) const KEYS: &[u8] = include_bytes!("../../assets/fonts/NotoSansSymbols2-Keys.ttf");
+/// JetBrains Mono, variable in weight (SIL OFL 1.1): Omarchy's default, for
+/// desktops without a monospace font of their own, and the other data face
+/// of macOS.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub(crate) const JETBRAINS_MONO: &[u8] =
+    include_bytes!("../../assets/fonts/JetBrainsMono-Variable.ttf");
+
+/// A face's line box in ems: what epaint places its glyphs by.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[derive(Clone, Copy)]
+struct Metrics {
+    ascent: f32,
+    descent: f32,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+impl Metrics {
+    /// The baseline, below the middle of the line box.
+    fn baseline(self) -> f32 {
+        (self.ascent - self.descent) / 2.0
+    }
+}
+
+/// IBM Plex's line box, Sans and Mono alike.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+const PLEX_METRICS: Metrics = Metrics {
+    ascent: 1.025,
+    descent: 0.275,
+};
+/// The key symbols' line box: it reaches far deeper below the baseline.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+const KEYS_METRICS: Metrics = Metrics {
+    ascent: 1.069,
+    descent: 0.63,
+};
+/// The height of Plex's capitals in ems, Sans and Mono alike.
+const PLEX_CAPITALS: f32 = 0.698;
+
+/// The height of `typeface`'s capitals in ems, where the line box does not
+/// centre on them: Plex's centres a little above its capitals. Inter's and
+/// JetBrains Mono's centre on theirs, and a desktop font's are not known.
+pub fn capitals(typeface: Typeface) -> Option<f32> {
+    // Windows, which bundles no Plex, never draws the Plex look.
+    (typeface == Typeface::Plex && cfg!(any(target_os = "macos", target_os = "linux", test)))
+        .then_some(PLEX_CAPITALS)
+}
+
+/// fastframe's families for Inter's named weights.
+const MEDIUM: &str = "inter-medium";
+const SEMIBOLD: &str = "inter-semibold";
+const BOLD: &str = "inter-bold";
+
+/// A variable face at `weight`.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn weighted(bytes: &'static [u8], weight: f32) -> Arc<FontData> {
+    let mut data = FontData::from_static(bytes);
+    data.tweak.coords = VariationCoords::new([(b"wght", weight)]);
+    Arc::new(data)
+}
+
+/// Puts `face` first in `family`, ahead of what it held (Inter and the
+/// fallbacks stay behind it for glyphs the face lacks).
+fn lead(fonts: &mut FontDefinitions, family: FontFamily, face: &str) {
+    let list = fonts.families.entry(family).or_default();
+    list.retain(|name| name != face);
+    list.insert(0, face.to_owned());
+}
+
+/// The fonts behind the first in a family: its fallbacks.
+fn tail(fonts: &FontDefinitions, family: &FontFamily) -> Vec<String> {
+    fonts
+        .families
+        .get(family)
+        .map(|list| list.iter().skip(1).cloned().collect())
+        .unwrap_or_default()
+}
+
+/// A family of its own for `face`, with `family`'s fallbacks behind it.
+fn own(fonts: &mut FontDefinitions, name: &str, face: &str, fallbacks: &FontFamily) {
+    let mut list = vec![face.to_owned()];
+    list.extend(tail(fonts, fallbacks));
+    fonts.families.insert(FontFamily::Name(name.into()), list);
+}
+
+/// A family named `name` holding what `from` holds.
+fn alias(fonts: &mut FontDefinitions, name: &str, from: &FontFamily) {
+    let list = fonts.families.get(from).cloned().unwrap_or_default();
+    fonts.families.insert(FontFamily::Name(name.into()), list);
+}
+
+/// Replaces the faces fastframe set up with the look's. `desktop` is the
+/// font read from the system for the settings' name (never in tests or
+/// screenshots): the desktop's own monospace that fontconfig gave the
+/// terminal look, which has the bundled one drawn without it, or the
+/// installed font macOS draws data in.
+pub fn configure(fonts: &mut FontDefinitions, look: &Look, desktop: Option<&TerminalFaces>) {
+    match look.faces.typeface {
+        Typeface::Inter => inter(fonts),
+        Typeface::Plex => plex(fonts, desktop),
+        Typeface::Terminal => terminal(fonts, desktop),
+    }
+}
+
+/// Inter's weights under the role families' names.
+fn inter(fonts: &mut FontDefinitions) {
+    for (weight, from) in [
+        (400, FontFamily::Proportional),
+        (500, FontFamily::Name(MEDIUM.into())),
+        (600, FontFamily::Name(SEMIBOLD.into())),
+        (700, FontFamily::Name(BOLD.into())),
+    ] {
+        alias(
+            fonts,
+            &family_name(Typeface::Inter, Kind::Sans, weight),
+            &from,
+        );
+    }
+    alias(
+        fonts,
+        &family_name(Typeface::Inter, Kind::Mono, 400),
+        &FontFamily::Monospace,
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn plex(fonts: &mut FontDefinitions, installed: Option<&TerminalFaces>) {
+    for weight in [400, 500, 600] {
+        let name = family_name(Typeface::Plex, Kind::Sans, weight);
+        fonts
+            .font_data
+            .insert(name.clone(), weighted(PLEX_SANS, f32::from(weight)));
+        own(fonts, &name, &name, &FontFamily::Proportional);
+    }
+    for (weight, bytes) in [(400, PLEX_MONO), (500, PLEX_MONO_MEDIUM)] {
+        let name = family_name(Typeface::Plex, Kind::Mono, weight);
+        fonts
+            .font_data
+            .insert(name.clone(), Arc::new(FontData::from_static(bytes)));
+        own(fonts, &name, &name, &FontFamily::Monospace);
+    }
+    // The other face data can be drawn in, at the same weights, whichever
+    // the settings name: a change of it lays the text out again, and
+    // loads nothing.
+    for weight in [400, 500] {
+        let name = data_family_name(DataFace::JetBrainsMono, weight);
+        fonts
+            .font_data
+            .insert(name.clone(), weighted(JETBRAINS_MONO, f32::from(weight)));
+        own(fonts, &name, &name, &FontFamily::Monospace);
+    }
+    // The installed font the settings name, where one was read. Without
+    // one its families hold Plex Mono, so a look that names them draws.
+    for (weight, face) in [(400, 0), (500, 1)] {
+        let name = data_family_name(DataFace::Installed, weight);
+        match installed {
+            Some(faces) => {
+                fonts.font_data.insert(name.clone(), faces[face].clone());
+                own(fonts, &name, &name, &FontFamily::Monospace);
+            }
+            None => {
+                fonts.font_data.remove(&name);
+                let plex = family_name(Typeface::Plex, Kind::Mono, weight);
+                own(fonts, &name, &plex, &FontFamily::Monospace);
+            }
+        }
+    }
+    let sans = |weight| family_name(Typeface::Plex, Kind::Sans, weight);
+    lead(fonts, FontFamily::Proportional, &sans(400));
+    lead(fonts, FontFamily::Name(MEDIUM.into()), &sans(500));
+    lead(fonts, FontFamily::Name(SEMIBOLD.into()), &sans(600));
+    // Only the three weights the design allows: bold is semibold.
+    lead(fonts, FontFamily::Name(BOLD.into()), &sans(600));
+    lead(
+        fonts,
+        FontFamily::Monospace,
+        &family_name(Typeface::Plex, Kind::Mono, 400),
+    );
+    // The keyboard symbols right behind each face, ahead of the fallbacks.
+    // epaint centres a fallback face's line box on the leading face's
+    // instead of sharing its baseline, which would stand the symbols well
+    // above the letters: the shift puts them on Plex's baseline.
+    let mut keys = FontData::from_static(KEYS);
+    keys.tweak.y_offset_factor = PLEX_METRICS.baseline() - KEYS_METRICS.baseline();
+    fonts.font_data.insert("keys".into(), Arc::new(keys));
+    for list in fonts.families.values_mut() {
+        if list.first().is_some_and(|face| face.starts_with("plex-")) {
+            list.retain(|face| face != "keys");
+            list.insert(1, "keys".into());
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", test)))]
+fn plex(fonts: &mut FontDefinitions, _installed: Option<&TerminalFaces>) {
+    inter(fonts);
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn bundled_terminal_faces() -> Option<TerminalFaces> {
+    Some([
+        weighted(JETBRAINS_MONO, 400.0),
+        weighted(JETBRAINS_MONO, 500.0),
+        weighted(JETBRAINS_MONO, 700.0),
+    ])
+}
+
+#[cfg(not(any(target_os = "linux", test)))]
+fn bundled_terminal_faces() -> Option<TerminalFaces> {
+    None
+}
+
+/// Omarchy: one monospace face for the interface and the data alike.
+fn terminal(fonts: &mut FontDefinitions, desktop: Option<&TerminalFaces>) {
+    let faces = desktop.cloned().or_else(bundled_terminal_faces);
+    let Some(faces) = faces else {
+        // No monospace of its own: the families still exist, on Inter.
+        for weight in [400, 500, 700] {
+            let from = if weight == 400 {
+                FontFamily::Monospace
+            } else {
+                FontFamily::Name(if weight == 500 { MEDIUM } else { BOLD }.into())
+            };
+            alias(
+                fonts,
+                &family_name(Typeface::Terminal, Kind::Mono, weight),
+                &from,
+            );
+        }
+        return;
+    };
+    for (weight, data) in [400, 500, 700].into_iter().zip(faces) {
+        let name = family_name(Typeface::Terminal, Kind::Mono, weight);
+        fonts.font_data.insert(name.clone(), data);
+        own(fonts, &name, &name, &FontFamily::Monospace);
+    }
+    let face = |weight| family_name(Typeface::Terminal, Kind::Mono, weight);
+    lead(fonts, FontFamily::Monospace, &face(400));
+    lead(fonts, FontFamily::Proportional, &face(400));
+    lead(fonts, FontFamily::Name(MEDIUM.into()), &face(500));
+    lead(fonts, FontFamily::Name(SEMIBOLD.into()), &face(700));
+    lead(fonts, FontFamily::Name(BOLD.into()), &face(700));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::Faces;
+    use crate::typography::{Text, TextRole};
+
+    const PLEX: Faces = Faces::of(Typeface::Plex);
+
+    /// A context drawing in the macOS faces at `pixels_per_point`.
+    fn macos_at(pixels_per_point: f32) -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(pixels_per_point);
+        ctx.set_fonts(configured(&Look::macos()));
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .textures_delta
+            .clear();
+        ctx
+    }
+
+    /// The bottom of `character`'s texture as `galley` paints it, the font's
+    /// tweak included (`glyph.pos` alone misses it): the baseline, for a
+    /// glyph that stands on it.
+    fn painted_bottom(galley: &egui::Galley, character: char) -> f32 {
+        let row = &galley.rows[0];
+        let glyph = row
+            .glyphs
+            .iter()
+            .find(|glyph| glyph.chr == character)
+            .expect("the character is laid out");
+        let first = glyph.first_vertex as usize;
+        row.visuals.mesh.vertices[first..first + 4]
+            .iter()
+            .map(|vertex| vertex.pos.y)
+            .fold(f32::NEG_INFINITY, f32::max)
+    }
+
+    #[test]
+    fn macos_key_symbols_stand_on_the_letters_baseline() {
+        for pixels_per_point in [1.0, 2.0] {
+            let ctx = macos_at(pixels_per_point);
+            for role in [
+                TextRole::Secondary,
+                TextRole::Shortcut,
+                TextRole::MonoSecondary,
+            ] {
+                // Each of these symbols stands on the baseline, like the N.
+                let laid = Text::in_faces(PLEX)
+                    .add(role, "N⌘⌫⌦", egui::Color32::WHITE)
+                    .layout(&ctx);
+                let letter = painted_bottom(&laid.galley, 'N');
+                for key in ['⌘', '⌫', '⌦'] {
+                    // Glyphs and their offsets snap to pixels separately.
+                    let apart = (painted_bottom(&laid.galley, key) - letter).abs();
+                    assert!(
+                        apart * pixels_per_point <= 1.01,
+                        "{} at {pixels_per_point}x: {key} is {apart} pt off the baseline",
+                        role.id()
+                    );
+                }
+            }
+        }
+    }
+
+    /// An icon is centred on the line its text is painted on, and reads as
+    /// centred when the capitals beside it are.
+    #[test]
+    fn macos_text_is_painted_with_its_capitals_centred() {
+        for pixels_per_point in [1.0, 2.0] {
+            let ctx = macos_at(pixels_per_point);
+            let plex = TextRole::ALL
+                .into_iter()
+                .filter(|role| !role.id().starts_with("o-"));
+            for role in plex {
+                for text in ["H", "⌘H"] {
+                    let laid = Text::in_faces(PLEX)
+                        .add(role, text, egui::Color32::WHITE)
+                        .layout(&ctx);
+                    for line in [32.0, 100.3] {
+                        // epaint snaps the text's corner to a pixel.
+                        let top =
+                            ((line - laid.middle()) * pixels_per_point).round() / pixels_per_point;
+                        let baseline = top + painted_bottom(&laid.galley, 'H');
+                        let middle = baseline - PLEX_CAPITALS * role.size(PLEX) / 2.0;
+                        let off = (middle - line).abs() * pixels_per_point;
+                        assert!(
+                            off <= 0.51,
+                            "{} {text:?} at {pixels_per_point}x: {off} px off the line",
+                            role.id()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_plex_centres_text_by_its_capitals() {
+        assert_eq!(capitals(Typeface::Plex), Some(PLEX_CAPITALS));
+        assert_eq!(capitals(Typeface::Inter), None);
+        assert_eq!(capitals(Typeface::Terminal), None);
+    }
+
+    /// The metrics above are the bundled files' own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_metrics_are_the_bundled_fonts() {
+        use skrifa::MetadataProvider as _;
+        let same = |read: f32, expected: f32| (read - expected).abs() < 1e-6;
+        for (bytes, expected, capitals) in [
+            (PLEX_SANS, PLEX_METRICS, Some(PLEX_CAPITALS)),
+            (PLEX_MONO, PLEX_METRICS, Some(PLEX_CAPITALS)),
+            (PLEX_MONO_MEDIUM, PLEX_METRICS, Some(PLEX_CAPITALS)),
+            (KEYS, KEYS_METRICS, None),
+        ] {
+            let font = skrifa::FontRef::new(bytes).expect("a bundled font parses");
+            let metrics = font.metrics(
+                skrifa::instance::Size::unscaled(),
+                skrifa::instance::LocationRef::default(),
+            );
+            let units = f32::from(metrics.units_per_em);
+            assert!(same(metrics.leading, 0.0), "no line gap to count");
+            assert!(same(metrics.ascent / units, expected.ascent));
+            assert!(same(-metrics.descent / units, expected.descent));
+            if let Some(capitals) = capitals {
+                let read = metrics.cap_height.expect("Plex has a cap height");
+                assert!(same(read / units, capitals));
+            }
+        }
+    }
+
+    fn configured(look: &Look) -> FontDefinitions {
+        let mut fonts = fastframe_fonts::FontSetup::default()
+            .system_fallbacks(false)
+            .definitions();
+        configure(&mut fonts, look, None);
+        fonts
+    }
+
+    fn first(fonts: &FontDefinitions, family: FontFamily) -> String {
+        fonts.families[&family][0].clone()
+    }
+
+    #[test]
+    fn macos_draws_data_in_the_face_the_settings_name() {
+        use crate::settings::Settings;
+        let fonts = configured(&Look::macos());
+        // Both faces are there, whichever is drawn.
+        for weight in [400, 500] {
+            let name = format!("jetbrains-mono-{weight}");
+            assert_eq!(first(&fonts, FontFamily::Name(name.as_str().into())), name);
+        }
+        let family = |faces: Faces, role: TextRole| match role.font_id(faces).family {
+            FontFamily::Name(name) => name.to_string(),
+            other => format!("{other:?}"),
+        };
+        let settings = Settings {
+            font: Some("JetBrains Mono".into()),
+            ..Settings::default()
+        };
+        let jetbrains = Look::macos().with_text(&settings, false).faces;
+        assert_eq!(family(jetbrains, TextRole::GridCell), "jetbrains-mono-400");
+        assert_eq!(
+            family(jetbrains, TextRole::CompletionMatch),
+            "jetbrains-mono-500"
+        );
+        assert_eq!(family(jetbrains, TextRole::Code), "jetbrains-mono-400");
+        // The interface's monospace stays Plex.
+        assert_eq!(family(jetbrains, TextRole::MonoSecondary), "plex-mono-400");
+        assert_eq!(family(PLEX, TextRole::GridCell), "plex-mono-400");
+        // JetBrains Mono's line centres on its capitals: no shift for them.
+        let laid = Text::in_faces(jetbrains).add(TextRole::GridCell, "H", egui::Color32::WHITE);
+        assert_eq!(laid.capitals, None);
+    }
+
+    #[test]
+    fn macos_draws_data_in_the_installed_font_read() {
+        use crate::settings::Settings;
+        let settings = Settings {
+            font: Some("Fira Code".into()),
+            ..Settings::default()
+        };
+        let faces = Look::macos().with_text(&settings, true).faces;
+        let family = |weight: u16| FontFamily::Name(format!("installed-mono-{weight}").into());
+        assert_eq!(TextRole::GridCell.font_id(faces).family, family(400));
+        assert_eq!(TextRole::CompletionMatch.font_id(faces).family, family(500));
+        // Its capitals are not known: no shift for them.
+        let laid = Text::in_faces(faces).add(TextRole::GridCell, "H", egui::Color32::WHITE);
+        assert_eq!(laid.capitals, None);
+        // Before one is read, its families hold Plex Mono.
+        let fonts = configured(&Look::macos());
+        assert_eq!(first(&fonts, family(400)), "plex-mono-400");
+        assert_eq!(first(&fonts, family(500)), "plex-mono-500");
+        // Read: they lead with its faces, the fallbacks behind.
+        let read = |bytes: &'static [u8]| Arc::new(FontData::from_static(bytes));
+        let installed = [read(JETBRAINS_MONO), read(PLEX_MONO_MEDIUM), read(KEYS)];
+        let mut fonts = configured(&Look::macos());
+        configure(&mut fonts, &Look::macos(), Some(&installed));
+        for (weight, bytes) in [(400, JETBRAINS_MONO), (500, PLEX_MONO_MEDIUM)] {
+            let name = first(&fonts, family(weight));
+            assert_eq!(name, format!("installed-mono-{weight}"));
+            assert_eq!(fonts.font_data[&name].font.len(), bytes.len());
+            assert!(fonts.families[&family(weight)].len() > 1);
+        }
+        // And back to Plex Mono when none is.
+        configure(&mut fonts, &Look::macos(), None);
+        assert_eq!(first(&fonts, family(400)), "plex-mono-400");
+        assert!(!fonts.font_data.contains_key("installed-mono-400"));
+    }
+
+    #[test]
+    fn macos_draws_plex_and_omarchy_one_monospace_face() {
+        let mac = configured(&Look::macos());
+        assert_eq!(first(&mac, FontFamily::Proportional), "plex-sans-400");
+        assert_eq!(first(&mac, FontFamily::Monospace), "plex-mono-400");
+        assert_eq!(
+            first(&mac, FontFamily::Name("plex-mono-500".into())),
+            "plex-mono-500"
+        );
+        let omarchy = configured(&Look::omarchy());
+        assert_eq!(
+            first(&omarchy, FontFamily::Proportional),
+            "omarchy-mono-400"
+        );
+        assert_eq!(first(&omarchy, FontFamily::Monospace), "omarchy-mono-400");
+        assert_eq!(
+            first(&omarchy, FontFamily::Name(SEMIBOLD.into())),
+            "omarchy-mono-700"
+        );
+        let standard = configured(&Look::standard());
+        assert_eq!(first(&standard, FontFamily::Proportional), "inter");
+        assert_eq!(
+            first(&standard, FontFamily::Name("inter-600".into())),
+            first(&standard, FontFamily::Name(SEMIBOLD.into()))
+        );
+    }
+}

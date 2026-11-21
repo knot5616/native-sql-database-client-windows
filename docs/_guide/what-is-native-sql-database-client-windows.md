@@ -1,0 +1,96 @@
+---
+title: What is native-sql-database-client-windows?
+description: What native-sql-database-client-windows does, which databases and systems it works with, and what it does not do yet.
+nav_order: 0
+---
+
+## Why native-sql-database-client-windows
+
+**A fast, native database client.** native-sql-database-client-windows connects to PostgreSQL, MySQL
+(and MariaDB), SQLite and BigQuery. It is written in Rust and draws its own
+window, so there is no browser inside. It runs on Linux (Omarchy and
+Hyprland first), macOS and Windows.
+
+{% include shot.html file="macos-table" alt="native-sql-database-client-windows with a table's data grid, the sidebar of tables on the left and the row panel on the right" %}
+
+## What it does
+
+- **Stays quick on a far-away server.** On PostgreSQL, MySQL and
+  MariaDB, opening a table, loading a page, counting rows and running a
+  read-only `SELECT` usually wait on the server once. On every database
+  the window keeps answering while the database works.
+  [Read about speed and security]({% link _guide/speed-and-security.md %}).
+- **Keeps your connections.** Saved connections sit in a picker, each tagged
+  with its environment (local, dev, staging, production) and when it was
+  last used. Open more than one and each is a chip in the window's header.
+- **Connects the way your servers need.** Direct connections, TLS
+  (`verify-full` checks the certificate), and SSH tunnels with a password, a key file or
+  your agent, through the `ProxyJump` and `ProxyCommand` hosts of your
+  `~/.ssh/config`. Passwords live in the system keyring, or are asked for
+  when you connect, and a MySQL password asked for in plain text goes
+  only over TLS. BigQuery signs in
+  with a service-account key file or Google Cloud's default credentials.
+  [Read about connections]({% link _reference/connections.md %}).
+- **Browses tables.** A sidebar of one schema's tables and views, quick
+  open to find any of them by name, a data grid with sorting, filters and
+  paging done by the server, a row panel that shows every field of a row,
+  and Structure and DDL views.
+  [Browse a table]({% link _guide/browsing-data.md %}).
+- **Edits data safely.** Change values, and add, duplicate and delete
+  rows. Dates have a calendar, and a foreign key of one column searches
+  the table it points at as you type. Changes stay pending until you
+  save. A save is
+  one transaction. When someone else changed the same row, the save
+  writes nothing and asks you what to do.
+  [See how editing works]({% link _guide/editing-data.md %}).
+- **Runs SQL.** An editor per connection with completion, a formatter,
+  Vim keys if you want them, a row limit and a timeout, read-only or
+  read-write, and a History tab of what ran on the connection lately.
+  [Open the SQL editor guide]({% link _guide/sql-editor.md %}).
+- **Copies and exports.** Select cells or rows in a table's grid or a
+  SQL result, and copy them as CSV, TSV, JSON, Markdown or SQL INSERT.
+  Export a table or a result to a file in those formats or JSON Lines.
+  Exports run in the background, several at once if you like.
+  [Copy and export]({% link _guide/browsing-data.md %}#copying).
+- **Lets agents read your databases.** Claude Code, Cursor and other
+  agents ask native-sql-database-client-windows over MCP. They read only the connections you
+  allow, never get the connection's password, and are kept from what is
+  in the tables you hide and the values of the columns you mask. You can
+  read a log of their calls.
+  [Connect an agent]({% link _guide/agents.md %}).
+- **Is careful with production.** PostgreSQL, MySQL and SQLite keep
+  read-only themselves, not a guess from the SQL. A production connection opens read-only unless
+  you turn that off, and a save to production asks first, with the
+  statements on screen.
+- **Looks at home.** A macOS look in IBM Plex, and on Linux the Omarchy
+  look: square, keyboard first, with vim keys. **Settings › Keyboard**
+  changes the keys.
+  Read about [the Omarchy look]({% link _guide/omarchy.md %}) and
+  [native-sql-database-client-windows on macOS]({% link _guide/macos.md %}).
+- **Keeps itself up to date.** It checks GitHub for a new version. On
+  macOS from Applications, and on Linux from the AppImage or the unpacked
+  archive, it installs the new version when you restart, once the
+  release's signature and the file's checksum check out; on Windows it
+  links to the release.
+  [See the download page]({% link _guide/download.md %}).
+
+## What it does not do yet
+
+native-sql-database-client-windows is young. These are the limits you are most likely to meet:
+
+- You can change values in existing rows, and add, duplicate and delete
+  rows. Pasting rows is not built yet.
+- Binary values, values over 256 KiB, views, and tables without a primary
+  key or unique index cannot be edited.
+- Importing a file into a table is not built yet.
+- The SQL editor does not run read-write on a production connection.
+- A BigQuery connection is read-only: BigQuery has no transactions to
+  edit rows with. It has no DDL view, and agents cannot read it once it
+  hides a table or masks a column.
+- The app is in English only.
+
+## Open source
+
+native-sql-database-client-windows is free and open source under the MIT license. The code, the
+issues and the releases are on
+[GitHub](https://github.com/igor-alexandrov/native-sql-database-client-windows).

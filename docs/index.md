@@ -1,0 +1,171 @@
+---
+layout: home
+title: native-sql-database-client-windows
+description: A fast, native database client for PostgreSQL, MySQL, MariaDB, SQLite and BigQuery.
+permalink: /
+hero:
+  name: native-sql-database-client-windows
+  text: Your databases, native and fast
+  tagline: A database client for PostgreSQL, MySQL, MariaDB, SQLite and BigQuery. Written in Rust, for Linux, macOS and Windows.
+  actions:
+    - theme: brand
+      text: Download
+      link: /download/
+    - theme: alt
+      text: What is native-sql-database-client-windows?
+      link: /what-is-native-sql-database-client-windows/
+    - theme: alt
+      text: GitHub
+      link: https://github.com/igor-alexandrov/native-sql-database-client-windows
+  image:
+    light: /assets/images/macos-table.webp
+    dark: /assets/images/macos-table-dark.webp
+    alt: "native-sql-database-client-windows in its macOS look: a table's data grid, the sidebar of tables on the left and the row panel on the right"
+    width: 2560
+    height: 1600
+
+features:
+  - icon: ⚡
+    title: Fast, even far away
+    details: Written in Rust, with no browser inside. On PostgreSQL, MySQL and MariaDB, opening a table, loading a page and running a read-only SELECT usually wait on the server once, so a remote database feels close.
+    link: /speed-and-security/
+    link_text: Why it is fast
+  - icon: 🗄️
+    title: Four databases
+    details: PostgreSQL, MySQL (MariaDB too), SQLite and BigQuery, with the same grid, row panel and SQL editor for each.
+  - icon: 🔐
+    title: Secure connections
+    details: TLS that checks the certificate when you choose verify-full, SSH tunnels (through ProxyJump and ProxyCommand too) that check the SSH server's key, and passwords kept in the system keyring, never in a file.
+    link: /connections/
+    link_text: How connections work
+  - icon: 🛡️
+    title: Careful with production
+    details: PostgreSQL, MySQL and SQLite keep read-only themselves, not a guess from the SQL. A production connection opens read-only unless you say otherwise, and a save to production asks first, with its SQL on screen.
+  - icon: ✏️
+    title: Edit in the grid
+    details: Change values, add, duplicate and delete rows, pick dates from a calendar, and search the table a one-column foreign key points at. A save is one transaction, and stops to ask when someone else changed the row.
+    link: /editing-data/
+    link_text: How editing works
+  - icon: 🧭
+    title: Made for browsing
+    details: Sort, filter and page on the server. Find any table with quick open, read a row's every field, follow its foreign keys, and read a table's structure and DDL. Copy a selection as CSV, JSON, Markdown or SQL, or export a table or a result to a file.
+    link: /browsing-data/
+    link_text: Browse a table
+  - icon: ⌨️
+    title: SQL editor
+    details: Run the statement at the cursor or the whole script, read-only or read-write, with completion, a formatter, optional Vim keys and a history of recent runs.
+    link: /sql-editor/
+    link_text: Open the guide
+  - icon: 🤖
+    title: Agents
+    details: Let Claude Code, Cursor and other agents read the databases you choose, over MCP. Reads only, within your limits, with a log of their calls.
+    link: /agents/
+    link_text: Connect an agent
+  - icon: 🔓
+    title: Open and signed
+    details: Free under the MIT license. Each release's checksums are signed, the macOS app is signed and notarized, an update installs only once it verifies, and the dependencies are audited every day.
+    link: /speed-and-security/#releases-and-updates
+    link_text: How releases are checked
+---
+
+## Two looks, one app
+
+The picture above is the macOS look, and Windows gets a close relative of
+it. On Linux, native-sql-database-client-windows takes the Omarchy look: square, keyboard first,
+with vim keys and the desktop's monospace font throughout. On Omarchy it
+follows the desktop's theme and recolors when you switch themes. Each
+system can have the other look too: **Settings › Appearance › Interface**
+switches between the classic look and the Omarchy one at once.
+Read about [the Omarchy look]({% link _guide/omarchy.md %}) and
+[native-sql-database-client-windows on macOS]({% link _guide/macos.md %}).
+
+{% include shot.html file="omarchy-table" alt="native-sql-database-client-windows in its Omarchy look: the same table in a dark, square, keyboard-first layout with key hints along the bottom" width="2880" height="1800" %}
+
+## A closer look
+
+<div class="shot-grid">
+  <figure>
+    {% include shot.html file="macos-edit-review" alt="Review SQL open above the bar of pending changes" %}
+    <figcaption>Read the SQL of your changes before it runs.</figcaption>
+  </figure>
+  <figure>
+    {% include shot.html file="macos-edit-conflict" alt="The question about a row that changed on the server" %}
+    <figcaption>See what changed on the server before you decide.</figcaption>
+  </figure>
+  <figure>
+    {% include shot.html file="macos-sql-complete" alt="The completion list in the SQL editor" %}
+    <figcaption>Write SQL with completion for tables and columns.</figcaption>
+  </figure>
+  <figure>
+    {% include shot.html file="macos-connections" alt="The connection picker with connections tagged by environment" %}
+    <figcaption>Keep every connection, tagged with its environment.</figcaption>
+  </figure>
+</div>
+
+## Quick far away, careful up close
+
+Most of the wait on a remote database is the network. native-sql-database-client-windows sends
+what each step needs together, so on PostgreSQL, MySQL and MariaDB
+opening a table, loading a page, counting rows and running a read-only
+`SELECT` usually take one round trip (a MySQL table with a `FLOAT`
+column takes more). Through a network that adds 200 ms to
+each round trip, a table opens in about 0.2 seconds.
+
+It is careful with what you trust it with: passwords stay in the system
+keyring, PostgreSQL, MySQL and SQLite keep read-only themselves, and an update installs
+only once its signature checks out.
+[Read about speed and security]({% link _guide/speed-and-security.md %}).
+
+## Try it without a database
+
+Start native-sql-database-client-windows with `--demo` and it opens a sample database, so you can
+look around before you connect to your own.
+[Get started]({% link _guide/getting-started.md %}).
+
+<style>
+  /* The hero image slot is sized for a square logo; the screenshot needs the
+     room. Page-scoped overrides, so the theme stays untouched. */
+  .VPHero .image-container {
+    width: 100% !important;
+    height: auto !important;
+    transform: none !important;
+  }
+  .VPHero .image-src {
+    position: relative !important;
+    top: auto !important;
+    left: auto !important;
+    transform: none !important;
+    width: 100% !important;
+    height: auto !important;
+    max-width: 100% !important;
+    max-height: none !important;
+    padding: 0 !important;
+    border-radius: 12px;
+    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.25);
+  }
+  .shot-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 24px;
+  }
+  .shot-grid figure {
+    margin: 0;
+  }
+  .shot-grid a.shot {
+    margin: 0 0 8px;
+  }
+  .shot-grid figcaption {
+    color: var(--vp-c-text-2);
+    font-size: 14px;
+  }
+  @media (max-width: 767px) {
+    .shot-grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+  @media (max-width: 959px) {
+    .VPHero .image {
+      margin: 0 0 24px !important;
+    }
+  }
+</style>

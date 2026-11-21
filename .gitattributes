@@ -1,0 +1,8 @@
+# Signed bytes: a checkout must not change line endings (tests/update_release.rs).
+tests/fixtures/update/** -text
+
+# Expected texts the DDL tests compare byte for byte: LF on every checkout.
+crates/native-sql-database-client-windows-db/tests/ddl/*.sql text eol=lf
+
+# Expected texts of the export writers, byte for byte: CRLF and the BOM stay.
+crates/native-sql-database-client-windows-core/src/export/golden/** -text

@@ -1,0 +1,48 @@
+# Maintainer: Igor Alexandrov <igor.alexandrov@gmail.com>
+pkgname=native-sql-database-client-windows
+pkgver=@VERSION@
+pkgrel=@PKGREL@
+pkgdesc="Native database client for PostgreSQL, MySQL and SQLite"
+arch=('x86_64' 'aarch64')
+url="https://github.com/igor-alexandrov/native-sql-database-client-windows"
+license=('MIT')
+depends=('dbus' 'libglvnd' 'libxkbcommon' 'wayland' 'libx11')
+makedepends=('rust')
+optdepends=('libxkbcommon-x11: keyboard handling in X11 sessions')
+conflicts=('native-sql-database-client-windows-bin')
+# !lto: ring compiles its own C, and Arch's default LTO flags leave objects
+# the linker cannot resolve.
+options=('!debug' '!lto')
+source=("${pkgname}-${pkgver}.tar.gz::${url}/releases/download/v${pkgver}/native-sql-database-client-windows-v${pkgver}-source.tar.gz")
+sha256sums=('@SOURCE_SHA256@')
+
+prepare() {
+  cd "${srcdir}/native-sql-database-client-windows-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "${srcdir}/native-sql-database-client-windows-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "${srcdir}/native-sql-database-client-windows-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  # The app's own tests: its interface's and its core's.
+  cargo test --frozen --release --lib -p native-sql-database-client-windows -p native-sql-database-client-windows-core
+}
+
+package() {
+  cd "${srcdir}/native-sql-database-client-windows-${pkgver}"
+  install -Dm755 target/release/native-sql-database-client-windows "${pkgdir}/usr/bin/native-sql-database-client-windows"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 packaging/linux/dev.native-sql-database-client-windows.native-sql-database-client-windows.desktop \
+    "${pkgdir}/usr/share/applications/dev.native-sql-database-client-windows.native-sql-database-client-windows.desktop"
+  install -Dm644 packaging/linux/dev.native-sql-database-client-windows.native-sql-database-client-windows.svg \
+    "${pkgdir}/usr/share/icons/hicolor/scalable/apps/dev.native-sql-database-client-windows.native-sql-database-client-windows.svg"
+}

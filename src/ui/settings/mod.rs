@@ -1,0 +1,1326 @@
+//! The Settings window: the options of its panes, General and, where
+//! agents can reach the app, Agents, each changed where it is shown and
+//! saved at once. The terminal look draws a screen over the whole window
+//! with its keys in the footer (`terminal.rs`); the other looks draw a
+//! sheet over the dimmed window, with a control for each option
+//! (`sheet.rs`, and `agents.rs` for the Agents pane).
+
+mod agents;
+mod file_pane;
+mod keyboard;
+mod keyboard_sheet;
+mod keyboard_terminal;
+#[cfg(test)]
+pub(crate) use keyboard_sheet::search_id as keyboard_search_id;
+mod editor_preview;
+mod preview;
+mod sheet;
+mod terminal;
+mod updates;
+mod updates_terminal;
+
+use std::borrow::Cow;
+
+use crate::app::App;
+use crate::connections::SavedConnection;
+use crate::i18n::{LanguageTag, Locale, Msgid, gettext, msgid, ngettext, pmsgid};
+use crate::keymap::{Command, Keymap, Layout, Scope, Spelled, Stroke};
+use crate::model::{Action, AgentsView, Dialog, SettingsDialog, SettingsPane, SettingsRow};
+use crate::settings::{
+    Autocomplete, Commas, EditorKeys, EnvBar, Idle, KeywordCase, Language, Launch, LineNumbers,
+    LookChoice, Mode, NewTab, OptionId, OptionValue, RowHeight, RunScope, Settings, TableList,
+    Theme, ThemeChoice, Timestamps, UpdateCheck, Zone,
+};
+
+/// The label of an option's row, marked: the caller says it, and the
+/// terminal look lower-cases. Quick open lists the rows by it.
+pub(crate) fn label(option: OptionId) -> Msgid {
+    match option {
+        OptionId::Language => msgid("Language"),
+        OptionId::OnLaunch => msgid("On launch"),
+        OptionId::RestoreTabs => msgid("Restore tabs and filters"),
+        OptionId::PageSize => msgid("Rows per page"),
+        OptionId::Timestamps => msgid("Timestamps"),
+        OptionId::Tz => msgid("Time zone for timestamptz"),
+        OptionId::GroupDigits => msgid("Numbers"),
+        OptionId::ValueTags => msgid("Value tags"),
+        OptionId::DatePicker => msgid("Show a calendar when editing dates"),
+        OptionId::ProductionReadOnly => msgid("New production connections open read-only"),
+        OptionId::ConfirmCloseEdits => msgid("Ask before closing with unsaved edits"),
+        OptionId::IdleDisconnect => msgid("Disconnect when idle"),
+        OptionId::AgentsOn => msgid("Let agents use native-sql-database-client-windows"),
+        OptionId::LogDays => msgid("Keep the activity log"),
+        OptionId::AgentsNotify => msgid("Notify when an agent connects"),
+        OptionId::Look => msgid("Interface"),
+        OptionId::Theme => msgid("Theme"),
+        OptionId::InterfaceScale => msgid("Interface scale"),
+        OptionId::Font => msgid("Data font"),
+        OptionId::FontSize => msgid("Data font size"),
+        OptionId::RowHeight => msgid("Row density"),
+        OptionId::Zebra => msgid("Alternate row shading"),
+        OptionId::ColumnTypes => msgid("Show column types"),
+        OptionId::TableList => msgid("Table list"),
+        OptionId::EnvBar => msgid("Window header"),
+        OptionId::NewTab => msgid("New tabs run in"),
+        OptionId::RowLimit => msgid("Row limit"),
+        OptionId::Timeout => msgid("Timeout"),
+        // `{run}` is the run key, as the keymap writes it: see `said`.
+        OptionId::RunScope => msgid("{run} runs"),
+        OptionId::ConfirmUnsafeWrites => msgid("Confirm UPDATE or DELETE without WHERE"),
+        OptionId::EditorKeys => msgid("Keybindings"),
+        OptionId::Indent => msgid("Indent"),
+        OptionId::Autocomplete => msgid("Autocomplete"),
+        OptionId::ClosePairs => msgid("Close brackets and quotes"),
+        OptionId::LineNumbers => msgid("Line numbers"),
+        OptionId::HighlightLine => msgid("Current line highlight"),
+        OptionId::Wrap => msgid("Wrap"),
+        OptionId::Keywords => msgid("Keywords"),
+        OptionId::Commas => msgid("Commas"),
+        OptionId::HistoryKeep => msgid("Keep query history"),
+        OptionId::UpdatesCheck => msgid("Check for updates"),
+    }
+}
+
+/// A row's label or a section's heading as the window writes it,
+/// translated: with the run key in place of `{run}` and the editor's
+/// Format key in place of `{format}`, as the keymap writes them for the
+/// look.
+pub(super) fn said(
+    ctx: &egui::Context,
+    look: &crate::theme::Look,
+    locale: Locale,
+    text: Msgid,
+) -> String {
+    let mut said = text.say(locale).into_owned();
+    if said.contains("{run}") {
+        let key = crate::ui::keys::written(ctx, look, Command::RunStatement);
+        said = said.replace("{run}", key.as_str());
+    }
+    if said.contains("{format}") {
+        let key = crate::ui::keys::written_in(ctx, look, Command::Format, Scope::SqlEditor);
+        said = said.replace("{format}", key.as_str());
+    }
+    said
+}
+
+/// The label of an option's row in the terminal look, which names some
+/// options its own way, as their artboards do (`timestamptz zone`, the
+/// Appearance pane's). English, as [`label`]'s, and lower-cased by the
+/// look.
+pub(super) fn terminal_label(option: OptionId) -> Msgid {
+    match option {
+        OptionId::Tz => msgid("timestamptz zone"),
+        OptionId::ProductionReadOnly => msgid("production opens read-only"),
+        OptionId::ConfirmCloseEdits => msgid("confirm close with edits"),
+        OptionId::DatePicker => msgid("calendar for dates"),
+        OptionId::RowHeight => msgid("Row height"),
+        OptionId::Zebra => msgid("Alternate rows"),
+        OptionId::ColumnTypes => msgid("Column types"),
+        OptionId::EnvBar => msgid("Connection bar"),
+        OptionId::ConfirmUnsafeWrites => msgid("Confirm write without where"),
+        OptionId::ClosePairs => msgid("Close brackets"),
+        OptionId::HistoryKeep => msgid("Keep"),
+        // One font and one size for everything.
+        OptionId::Font => msgid("Font"),
+        OptionId::FontSize => msgid("Size"),
+        OptionId::OnLaunch
+        | OptionId::RestoreTabs
+        | OptionId::PageSize
+        | OptionId::Timestamps
+        | OptionId::GroupDigits
+        | OptionId::ValueTags
+        | OptionId::IdleDisconnect
+        | OptionId::AgentsOn
+        | OptionId::LogDays
+        | OptionId::AgentsNotify
+        | OptionId::Look
+        | OptionId::Theme
+        | OptionId::InterfaceScale
+        | OptionId::TableList
+        | OptionId::NewTab
+        | OptionId::RowLimit
+        | OptionId::Timeout
+        | OptionId::RunScope
+        | OptionId::EditorKeys
+        | OptionId::Indent
+        | OptionId::Autocomplete
+        | OptionId::LineNumbers
+        | OptionId::HighlightLine
+        | OptionId::Wrap
+        | OptionId::Keywords
+        | OptionId::Commas
+        | OptionId::Language
+        | OptionId::UpdatesCheck => label(option),
+    }
+}
+
+/// What a row says under its label, where it says something. English.
+pub(super) fn small_print(option: OptionId) -> Option<Msgid> {
+    match option {
+        // As the board writes it, though hiding columns is not built: what
+        // the option will cover once it is.
+        OptionId::RestoreTabs => Some(msgid("Per connection, including sort and hidden columns")),
+        OptionId::Language => Some(LANGUAGE_PRINT),
+        // The board's hint: beside the menu it has no room in the sheet.
+        OptionId::OnLaunch => Some(msgid("Or: show Connections · open a chosen connection")),
+        OptionId::PageSize => Some(msgid("Table view; the SQL editor has its own limit")),
+        OptionId::ValueTags => Some(msgid("Colors for enum, CHECK (…IN…) and boolean columns")),
+        OptionId::DatePicker => Some(msgid("Under date and time fields; typing always works")),
+        OptionId::LogDays => Some(msgid(
+            "Every call and its SQL, never the rows. On this computer only",
+        )),
+        OptionId::Tz => Some(msgid(
+            "Values are shown in this zone and sent with their offset",
+        )),
+        OptionId::ProductionReadOnly => Some(msgid("Default for the switch in each connection")),
+        OptionId::IdleDisconnect => Some(msgid(
+            "Closes server sessions; tabs stay and reconnect on use",
+        )),
+        OptionId::ColumnTypes => Some(msgid("Second line in headers: int8, varchar, jsonb")),
+        OptionId::TableList => Some(msgid(
+            "Default for new connections; the sidebar toggle overrides it",
+        )),
+        OptionId::EnvBar => Some(msgid("Production always uses the full tint")),
+        OptionId::Look => Some(msgid("Omarchy: keyboard-first, square, monospace")),
+        OptionId::InterfaceScale => Some(msgid(
+            "Everything in the window: text, controls, rows and spacing",
+        )),
+        OptionId::Font => Some(msgid(
+            "Grid cells, SQL editor, JSON · scales with the interface",
+        )),
+        OptionId::NewTab => Some(msgid("The badge in each tab can still switch it")),
+        // Igor's words (2026-10-19), in place of the board's "Adds LIMIT to
+        // results you browse; exports get everything"): the rows are capped
+        // as they come, nothing is added to the SQL, and Show all under a
+        // cut result runs it again with no limit.
+        OptionId::RowLimit => Some(msgid(
+            "Caps results you browse. Show all and exports get every row.",
+        )),
+        OptionId::ConfirmUnsafeWrites => Some(msgid("On every connection that allows writes")),
+        OptionId::Autocomplete => Some(msgid(
+            "Tables, views, columns and functions from the schema",
+        )),
+        OptionId::HistoryKeep => Some(msgid(
+            "Per connection, on this computer: SQL editor, grid saves, filters and agent runs. Results are never stored.",
+        )),
+        // When the last check ran, with Check now: the pane writes it.
+        OptionId::UpdatesCheck
+        | OptionId::Timeout
+        | OptionId::RunScope
+        | OptionId::EditorKeys
+        | OptionId::Indent
+        | OptionId::ClosePairs
+        | OptionId::LineNumbers
+        | OptionId::HighlightLine
+        | OptionId::Wrap
+        | OptionId::Keywords
+        | OptionId::Commas
+        | OptionId::Timestamps
+        | OptionId::GroupDigits
+        | OptionId::ConfirmCloseEdits
+        | OptionId::AgentsOn
+        | OptionId::AgentsNotify
+        | OptionId::Theme
+        | OptionId::FontSize
+        | OptionId::RowHeight
+        | OptionId::Zebra => None,
+    }
+}
+
+/// What describes `option`'s controls to a screen reader: its small print,
+/// or what is written beside its control where it has none. English.
+pub(super) fn helper(option: OptionId) -> Option<Msgid> {
+    small_print(option).or(match option {
+        OptionId::RunScope => Some(msgid("A selection always wins")),
+        _ => None,
+    })
+}
+
+/// What is said of a data font the settings name that is neither bundled
+/// nor installed, `{name}` for its name: the default is drawn instead.
+/// English.
+pub const FONT_NOT_INSTALLED: Msgid = msgid("“{name}” is not installed: IBM Plex Mono is used");
+
+/// What is said of a pinned theme that is nowhere to be found, `{name}`
+/// for its name: what is drawn instead. English.
+pub fn pin_missing(catalog: &crate::theme::Catalog) -> Msgid {
+    if catalog.follows_omarchy() {
+        msgid("Theme “{name}” not found: following Omarchy")
+    } else {
+        msgid("Theme “{name}” not found: following the system")
+    }
+}
+
+/// The contributor guide, which "Help translate" opens.
+pub(super) const TRANSLATING: &str = "https://igor.works/native-sql-database-client-windows/translating/";
+
+/// The Language row's small print. English, as [`small_print`]'s.
+const LANGUAGE_PRINT: Msgid = msgid("Menus, labels and messages; data and SQL stay as they are");
+
+/// The words of the Language row, translated: its label, the section's
+/// heading, and the link to the contributor guide. Said here in full so
+/// the template has them: [`label`] hands its words to `gettext` in a
+/// variable, which no extractor reads.
+pub(super) fn language_words(locale: Locale) -> [String; 3] {
+    [
+        gettext(locale, "Language").into_owned(),
+        gettext(
+            locale,
+            "Menus, labels and messages; data and SQL stay as they are",
+        )
+        .into_owned(),
+        gettext(locale, "Help translate").into_owned(),
+    ]
+}
+
+/// The English word beside the Language row's label in any other
+/// language: the way back for someone who chose one they cannot read.
+/// Never translated.
+pub(super) fn language_aside_label(locale: Locale) -> Option<&'static str> {
+    (locale != Locale::English).then_some("Language")
+}
+
+/// A language as the menu and the row write it: in its own name, and
+/// System with the language it is drawn in (`System (Русский)`). Where
+/// the system's first language (`system`) has no catalog, System is
+/// written as English, the language it stands for.
+pub(super) fn language_text(
+    locale: Locale,
+    language: Language,
+    system: Option<&LanguageTag>,
+) -> String {
+    match language.shown(system) {
+        Language::System => gettext(locale, "System ({language})")
+            .replace("{language}", language.resolve(system).native_name()),
+        Language::Fixed(fixed) => fixed.native_name().to_owned(),
+    }
+}
+
+/// A language's name in the window's language, which the menu writes
+/// beside its own: none for the window's own language.
+pub(super) fn language_aside(locale: Locale, of: Locale) -> Option<String> {
+    let name = match of {
+        Locale::English => gettext(locale, "English"),
+        Locale::BrazilianPortuguese => gettext(locale, "Brazilian Portuguese"),
+        Locale::Russian => gettext(locale, "Russian"),
+    };
+    (of != locale).then(|| name.into_owned())
+}
+
+/// What the Language row says under its label: that the system's first
+/// language is not translated yet, where System stands for it in English,
+/// and else its small print. A language with no name in the list is
+/// named by its tag.
+pub(super) fn language_print(
+    locale: Locale,
+    language: Language,
+    system: Option<&LanguageTag>,
+) -> String {
+    match system {
+        Some(tag) if language == Language::System && Locale::from_tag(tag).is_none() => {
+            let name = crate::i18n::endonym(tag).unwrap_or(&tag.language);
+            gettext(locale, "{language} is not translated yet").replace("{language}", name)
+        }
+        _ => language_words(locale)[1].clone(),
+    }
+}
+
+/// A zone as the window writes it: the computer's with its own name
+/// beside it where it has one (`System · America/New_York`), UTC, or the
+/// zone's name. `system` is the computer's zone's name. English: the
+/// terminal look writes it its own way.
+pub(super) fn zone_text(locale: Locale, zone: &Zone, system: Option<&str>) -> String {
+    match zone {
+        Zone::System => match system {
+            Some(name) => gettext(locale, "System · {zone}").replace("{zone}", name),
+            None => gettext(locale, "System").into_owned(),
+        },
+        Zone::Utc => "UTC".to_owned(),
+        Zone::Named(name) => name.clone(),
+    }
+}
+
+/// What a launch can open, as the menu lists it and the screen steps
+/// through it: the last session, Connections, then each saved connection
+/// in the order they are saved.
+pub(super) fn launch_choices(connections: &[SavedConnection]) -> Vec<Launch> {
+    let mut choices = vec![Launch::Restore, Launch::Connections];
+    choices.extend(connections.iter().map(|saved| Launch::Connection {
+        id: saved.id.clone(),
+        name: saved.name.clone(),
+    }));
+    choices
+}
+
+/// What a launch opens, as the window writes it: a connection by its name
+/// as it is saved now. English but the name. One that is not saved (the
+/// file names another) is said to be gone: the next launch shows
+/// Connections in its place.
+pub(super) fn launch_text(
+    locale: Locale,
+    launch: &Launch,
+    connections: &[SavedConnection],
+) -> String {
+    match launch {
+        Launch::Restore => gettext(locale, "Restore last session").into_owned(),
+        Launch::Connections => gettext(locale, "Show Connections").into_owned(),
+        Launch::Connection { id, .. } => match connections.iter().find(|saved| saved.id == *id) {
+            Some(saved) => saved.name.clone(),
+            None => gettext(locale, "Connection not found").into_owned(),
+        },
+    }
+}
+
+/// Where a saved connection points, as the menu writes it beside its
+/// name: so that three of one name are told apart.
+pub(super) fn place(saved: &SavedConnection) -> String {
+    let (host, database) = crate::ui::picker::target(saved);
+    format!("{host}{database}")
+}
+
+/// How long a connection may go unused, as the menu writes it.
+pub(super) fn idle_text(locale: Locale, choice: Idle) -> String {
+    let minutes = |count: u32| {
+        (
+            ngettext(locale, "After {n} min", "After {n} min", count),
+            count,
+        )
+    };
+    let hours = |count: u32| (ngettext(locale, "After {n} h", "After {n} h", count), count);
+    let (phrase, count) = match choice {
+        Idle::Never => return gettext(locale, "Never").into_owned(),
+        Idle::Minutes5 => minutes(5),
+        Idle::Minutes15 => minutes(15),
+        Idle::Minutes30 => minutes(30),
+        Idle::Hour1 => hours(1),
+        Idle::Hours4 => hours(4),
+    };
+    phrase.replace("{n}", &crate::i18n::number(locale, count))
+}
+
+/// How often a check for updates runs, as the window writes it.
+pub(super) fn check_text(locale: Locale, choice: UpdateCheck) -> String {
+    let words = match choice {
+        UpdateCheck::Daily => msgid("Every day"),
+        UpdateCheck::Weekly => msgid("Every week"),
+        UpdateCheck::Never => msgid("Only when I ask"),
+    };
+    words.say(locale).into_owned()
+}
+
+/// The days the log keeps a call, as the window writes them.
+pub(super) fn days(locale: Locale, days: u32) -> String {
+    ngettext(locale, "{n} day", "{n} days", days).replace("{n}", &crate::i18n::number(locale, days))
+}
+
+/// Whether an option of on and off is on.
+pub(super) fn is_on(value: &OptionValue) -> bool {
+    matches!(
+        value,
+        OptionValue::RestoreTabs(true)
+            | OptionValue::ValueTags(true)
+            | OptionValue::DatePicker(true)
+            | OptionValue::ProductionReadOnly(true)
+            | OptionValue::ConfirmCloseEdits(true)
+            | OptionValue::AgentsOn(true)
+            | OptionValue::AgentsNotify(true)
+            | OptionValue::Zebra(Some(true))
+            | OptionValue::ColumnTypes(true)
+            | OptionValue::ConfirmUnsafeWrites(true)
+            | OptionValue::ClosePairs(true)
+            | OptionValue::HighlightLine(true)
+            | OptionValue::Wrap(true)
+            | OptionValue::LineNumbers(Some(LineNumbers::Absolute | LineNumbers::Relative))
+    )
+}
+
+/// The settings as the window shows them: the server's switch as it is in
+/// force, off where a change made outside the app that turned it on is
+/// held, the grouping of numbers as the look has it where it is not set,
+/// the stripes and the font's size as the look draws them while they are
+/// not set, the look as it is drawn, and the theme as the look reads it:
+/// a value of the other looks' is the desktop followed.
+pub(super) fn shown(app: &App) -> Settings {
+    let mut settings = app.settings.clone();
+    settings.look = Some(LookChoice::of(app.look.terminal));
+    settings.mcp_enabled = app.agents_on();
+    settings.group_digits = Some(app.settings.grouped(app.layout()));
+    settings.zebra = Some(settings.zebra_in(app.look.terminal));
+    settings.font_size = Some(settings.font_size_in(app.look.terminal));
+    settings.editor_keys = Some(settings.editor_keys_in(app.look.terminal));
+    settings.line_numbers = Some(settings.line_numbers_in(app.look.terminal));
+    settings.keywords = Some(settings.keywords_in(app.look.terminal));
+    settings.theme = match (app.look.terminal, settings.theme.mode()) {
+        (true, _) if settings.theme.pin().is_some() => settings.theme,
+        (true, _) => Theme::Omarchy,
+        (false, Mode::System) => Theme::System,
+        (false, Mode::Light) => Theme::Light,
+        (false, Mode::Dark) => Theme::Dark,
+    };
+    settings
+}
+
+/// Puts `value` in the window's own copy of the settings, as `App::apply`
+/// will put it in the app's: a new pin is Omarchy's theme of the moment.
+fn set_shown(app: &App, value: &OptionValue, settings: &mut Settings) {
+    value.set(settings);
+    if *value == OptionValue::Theme(ThemeChoice::Pinned)
+        && settings.theme.pin().is_none()
+        && let Some(name) = &app.desktop_theme.current
+    {
+        settings.theme = Theme::Pinned(name.clone());
+    }
+}
+
+/// A timestamp as the grid shows one at each precision.
+pub(super) fn sample_timestamp(timestamps: Timestamps) -> &'static str {
+    match timestamps {
+        Timestamps::Second => "2026-01-12 09:14:03",
+        Timestamps::Full => "2026-01-12 09:14:03.482915",
+    }
+}
+
+/// The settings file's path as the window writes it: the home directory
+/// as `~`. The home directory was found at the start, with the app's own:
+/// no frame looks it up.
+pub(super) fn path_shown(app: &App) -> String {
+    file_pane::shown_path(&app.dirs.settings_file(), app.dirs.home.as_deref())
+}
+
+/// Where updates stand, as the Updates pane reads it.
+fn update_status(app: &App) -> updates::Status<'_> {
+    updates::Status {
+        updates: &app.updates,
+        skip: app.settings.update_skip.as_deref(),
+        now: app.now_secs(),
+    }
+}
+
+/// The server, as the Agents pane says it.
+fn server(app: &App) -> agents::Server {
+    agents::Server {
+        on: app.agents_on(),
+        connected: app.agents.sessions.len(),
+        window: app.agents_window().is_some(),
+    }
+}
+
+/// How the sheet draws for `dialog`: the look, the palette and the
+/// language, with what its rows say beside them.
+fn sheet_skin<'a>(app: &'a App, dialog: &SettingsDialog) -> sheet::Skin<'a> {
+    sheet::Skin {
+        look: &app.look,
+        palette: &app.palette,
+        locale: app.locale,
+        system: app.system_zone.iana_name(),
+        language: app.system_language.as_ref(),
+        zones: app.zones.as_deref().map_or(&[], crate::zones::Zones::names),
+        connections: &app.connections.connections,
+        fonts: sheet::DataFonts {
+            installed: &app.installed_fonts,
+            missing: app.data_font_missing(),
+        },
+        asked: dialog.asked.map(|option| (option, dialog.reveal)),
+    }
+}
+
+/// What the sheet reads of the app beside its skin: `interrupted` is
+/// `App::work_in_progress`, which the sheet asks only while the Updates
+/// card is held.
+fn sheet_asked<'a>(
+    app: &'a App,
+    interrupted: &'a dyn Fn() -> Vec<crate::app::Work>,
+) -> sheet::Asked<'a> {
+    sheet::Asked {
+        keymap: &app.keymap,
+        ignored: &app.settings_file.invalid,
+        shown: shown(app),
+        server: server(app),
+        status: update_status(app),
+        path: path_shown(app),
+        interrupted,
+    }
+}
+
+/// How the terminal screen draws: the look, the palette and the language,
+/// with what its rows say beside them. `launches` is what On launch steps
+/// through (`launch_choices`), and `checked` when updates were last
+/// checked, as the Updates pane's row writes it.
+fn terminal_skin<'a>(
+    app: &'a App,
+    launches: &'a [Launch],
+    checked: Option<&'a str>,
+    zoom: f32,
+) -> terminal::Skin<'a> {
+    terminal::Skin {
+        look: &app.look,
+        palette: &app.palette,
+        locale: app.locale,
+        window: app.agents_window().is_some(),
+        system: app.system_zone.iana_name(),
+        named: app.named_zone.as_deref(),
+        language: app.system_language.as_ref(),
+        connections: &app.connections.connections,
+        launches,
+        desktop: desktop_shown(app),
+        font: font_shown(app),
+        checked,
+        inset: app.titlebar.inset / zoom,
+    }
+}
+
+/// What fontconfig gave for the font the settings name, as the terminal
+/// screen's font row says it.
+fn font_shown(app: &App) -> terminal::FontShown<'_> {
+    let read = &app.desktop_font;
+    terminal::FontShown {
+        family: read.family.as_deref(),
+        missing: read.asked.as_deref().filter(|_| read.missing),
+    }
+}
+
+/// What the terminal screen's theme rows say of the desktop: Omarchy's
+/// theme of the moment, and how a pin stands.
+fn desktop_shown(app: &App) -> terminal::Desktop<'_> {
+    let pin = app.settings.theme.pin().zip(app.pin_state());
+    terminal::Desktop {
+        current: app.desktop_theme.current.as_deref(),
+        pin,
+        follows_omarchy: app.themes.follows_omarchy(),
+    }
+}
+
+/// What the terminal screen reads of the app beside its skin, for
+/// `dialog`: `interrupted` is `App::work_in_progress`, which the screen
+/// asks only while the Updates card is held.
+fn terminal_asked<'a>(
+    app: &'a App,
+    dialog: &SettingsDialog,
+    interrupted: &'a dyn Fn() -> Vec<crate::app::Work>,
+) -> terminal::Asked<'a> {
+    let cursor = dialog.pane.rows().get(dialog.row).copied();
+    terminal::Asked {
+        notice: app.notice.as_deref(),
+        keymap: &app.keymap,
+        file: &app.settings_file,
+        path: path_shown(app),
+        binds: &app.settings.keys.binds,
+        shown: shown(app),
+        server: server(app),
+        status: update_status(app),
+        opened: cursor.and_then(|row| opened(app, row)),
+        interrupted,
+    }
+}
+
+/// What a choice is called.
+#[derive(Clone, Copy)]
+pub(super) enum Said {
+    /// A word, marked: whoever writes it says it.
+    Word(Msgid),
+    /// A value as the app shows one, the same in every language: put into
+    /// another, it would say something the app does not show.
+    Sample(&'static str),
+    /// A number as the grid groups it in the window's language:
+    /// "1,240.50", «1 240,50».
+    Grouped(&'static str),
+    /// A command's first key, as the keymap writes it for the look.
+    Key(Command),
+}
+
+impl Said {
+    /// What a screen reader and the tests call the choice.
+    pub(super) fn name(
+        self,
+        ctx: &egui::Context,
+        look: &crate::theme::Look,
+        locale: Locale,
+    ) -> Cow<'static, str> {
+        match self {
+            Self::Word(word) => word.say(locale),
+            Self::Sample(sample) => Cow::Borrowed(sample),
+            Self::Grouped(number) => crate::i18n::numbers::group_number(locale, number),
+            Self::Key(command) => Cow::Owned(
+                crate::ui::keys::written(ctx, look, command)
+                    .as_str()
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
+/// The values a click can set on `option`'s row, each with what it is
+/// called: what the row draws as segments or as a check, and what a screen
+/// reader and the tests call them.
+/// `named` is the last named zone the session had, which the zone's steps
+/// reach, and `launches` what On launch steps through.
+pub(super) fn choices(
+    option: OptionId,
+    settings: &Settings,
+    (named, language): (Option<&str>, Option<&LanguageTag>),
+    launches: &[Launch],
+) -> Vec<(Said, OptionValue)> {
+    use Said::{Grouped, Key, Sample, Word};
+    match option {
+        OptionId::Language => vec![
+            (
+                Word(msgid("fewer")),
+                settings.stepped_language(language, false),
+            ),
+            (
+                Word(msgid("more")),
+                settings.stepped_language(language, true),
+            ),
+        ],
+        OptionId::OnLaunch => vec![
+            (
+                Word(msgid("fewer")),
+                settings.stepped_launch(launches, false),
+            ),
+            (Word(msgid("more")), settings.stepped_launch(launches, true)),
+        ],
+        OptionId::Tz => vec![
+            (Word(msgid("fewer")), settings.stepped_zone(named, false)),
+            (Word(msgid("more")), settings.stepped_zone(named, true)),
+        ],
+        // Stepped, not listed: one way and the other.
+        OptionId::PageSize => vec![
+            (Word(msgid("fewer")), settings.stepped(option, false)),
+            (Word(msgid("more")), settings.stepped(option, true)),
+        ],
+        OptionId::Timestamps => vec![
+            (
+                Word(msgid("second")),
+                OptionValue::Timestamps(Timestamps::Second),
+            ),
+            (
+                Word(msgid("full")),
+                OptionValue::Timestamps(Timestamps::Full),
+            ),
+        ],
+        // A number as each value writes it.
+        OptionId::GroupDigits => vec![
+            (Grouped("1240.50"), OptionValue::GroupDigits(Some(true))),
+            (Sample("1240.50"), OptionValue::GroupDigits(Some(false))),
+        ],
+        OptionId::ValueTags => vec![
+            (Word(msgid("off")), OptionValue::ValueTags(false)),
+            (Word(msgid("on")), OptionValue::ValueTags(true)),
+        ],
+        OptionId::DatePicker => vec![
+            (Word(msgid("off")), OptionValue::DatePicker(false)),
+            (Word(msgid("on")), OptionValue::DatePicker(true)),
+        ],
+        OptionId::ProductionReadOnly => vec![
+            (Word(msgid("off")), OptionValue::ProductionReadOnly(false)),
+            (Word(msgid("on")), OptionValue::ProductionReadOnly(true)),
+        ],
+        OptionId::ConfirmCloseEdits => vec![
+            (Word(msgid("off")), OptionValue::ConfirmCloseEdits(false)),
+            (Word(msgid("on")), OptionValue::ConfirmCloseEdits(true)),
+        ],
+        OptionId::RestoreTabs => vec![
+            (Word(msgid("off")), OptionValue::RestoreTabs(false)),
+            (Word(msgid("on")), OptionValue::RestoreTabs(true)),
+        ],
+        OptionId::AgentsOn => vec![
+            (Word(msgid("off")), OptionValue::AgentsOn(false)),
+            (Word(msgid("on")), OptionValue::AgentsOn(true)),
+        ],
+        OptionId::LogDays | OptionId::IdleDisconnect | OptionId::UpdatesCheck => vec![
+            (Word(msgid("fewer")), settings.stepped(option, false)),
+            (Word(msgid("more")), settings.stepped(option, true)),
+        ],
+        OptionId::AgentsNotify => vec![
+            (Word(msgid("off")), OptionValue::AgentsNotify(false)),
+            (Word(msgid("on")), OptionValue::AgentsNotify(true)),
+        ],
+        OptionId::Look => vec![
+            (
+                Word(msgid("classic")),
+                OptionValue::Look(Some(LookChoice::Classic)),
+            ),
+            (
+                Word(msgid("omarchy")),
+                OptionValue::Look(Some(LookChoice::Omarchy)),
+            ),
+        ],
+        // The terminal look's: macOS and Windows draw their tiles.
+        OptionId::Theme => vec![
+            (
+                Word(msgid("follow omarchy")),
+                OptionValue::Theme(ThemeChoice::Omarchy),
+            ),
+            (Word(msgid("pin")), OptionValue::Theme(ThemeChoice::Pinned)),
+        ],
+        // macOS's and Windows's menu: the terminal look has no row of it.
+        OptionId::InterfaceScale => vec![
+            (Word(msgid("smaller")), settings.stepped(option, false)),
+            (Word(msgid("larger")), settings.stepped(option, true)),
+        ],
+        // A name is set in the file: the window offers none.
+        OptionId::Font => Vec::new(),
+        OptionId::FontSize => vec![
+            (Word(msgid("smaller")), settings.stepped(option, false)),
+            (Word(msgid("larger")), settings.stepped(option, true)),
+        ],
+        OptionId::RowHeight => vec![
+            (
+                Word(msgid("compact")),
+                OptionValue::RowHeight(RowHeight::Compact),
+            ),
+            (
+                Word(msgid("regular")),
+                OptionValue::RowHeight(RowHeight::Regular),
+            ),
+            (
+                Word(msgid("roomy")),
+                OptionValue::RowHeight(RowHeight::Roomy),
+            ),
+        ],
+        OptionId::Zebra => vec![
+            (Word(msgid("off")), OptionValue::Zebra(Some(false))),
+            (Word(msgid("on")), OptionValue::Zebra(Some(true))),
+        ],
+        OptionId::ColumnTypes => vec![
+            (Word(msgid("off")), OptionValue::ColumnTypes(false)),
+            (Word(msgid("on")), OptionValue::ColumnTypes(true)),
+        ],
+        OptionId::TableList => vec![
+            (Word(msgid("tree")), OptionValue::TableList(TableList::Tree)),
+            (Word(msgid("flat")), OptionValue::TableList(TableList::Flat)),
+        ],
+        OptionId::EnvBar => vec![
+            (
+                Word(msgid("tint + label")),
+                OptionValue::EnvBar(EnvBar::Tint),
+            ),
+            (
+                Word(msgid("label only")),
+                OptionValue::EnvBar(EnvBar::Label),
+            ),
+        ],
+        OptionId::NewTab => vec![
+            (
+                Word(msgid("read-only")),
+                OptionValue::NewTab(NewTab::ReadOnly),
+            ),
+            (
+                Word(msgid("follow connection")),
+                OptionValue::NewTab(NewTab::Connection),
+            ),
+        ],
+        OptionId::RowLimit | OptionId::Timeout | OptionId::Indent | OptionId::HistoryKeep => {
+            vec![
+                (Word(msgid("fewer")), settings.stepped(option, false)),
+                (Word(msgid("more")), settings.stepped(option, true)),
+            ]
+        }
+        OptionId::RunScope => vec![
+            (
+                Word(pmsgid("label", "statement")),
+                OptionValue::RunScope(RunScope::Statement),
+            ),
+            (
+                Word(msgid("whole tab")),
+                OptionValue::RunScope(RunScope::All),
+            ),
+        ],
+        OptionId::ConfirmUnsafeWrites => vec![
+            (Word(msgid("off")), OptionValue::ConfirmUnsafeWrites(false)),
+            (Word(msgid("on")), OptionValue::ConfirmUnsafeWrites(true)),
+        ],
+        // As the terminal look's board draws them: vim first.
+        OptionId::EditorKeys => vec![
+            (
+                Word(msgid("vim")),
+                OptionValue::EditorKeys(Some(EditorKeys::Vim)),
+            ),
+            (
+                Word(msgid("standard")),
+                OptionValue::EditorKeys(Some(EditorKeys::Standard)),
+            ),
+        ],
+        OptionId::Autocomplete => vec![
+            (
+                Word(msgid("as you type")),
+                OptionValue::Autocomplete(Autocomplete::Typing),
+            ),
+            (
+                Key(Command::Complete),
+                OptionValue::Autocomplete(Autocomplete::Manual),
+            ),
+            (
+                Word(msgid("off")),
+                OptionValue::Autocomplete(Autocomplete::Off),
+            ),
+        ],
+        OptionId::ClosePairs => vec![
+            (Word(msgid("off")), OptionValue::ClosePairs(false)),
+            (Word(msgid("on")), OptionValue::ClosePairs(true)),
+        ],
+        OptionId::LineNumbers => LineNumbers::TERMINAL
+            .into_iter()
+            .map(|numbers| {
+                let word = match numbers {
+                    LineNumbers::Relative => msgid("relative"),
+                    LineNumbers::Absolute => msgid("absolute"),
+                    LineNumbers::Off => msgid("off"),
+                };
+                (Word(word), OptionValue::LineNumbers(Some(numbers)))
+            })
+            .collect(),
+        OptionId::HighlightLine => vec![
+            (Word(msgid("off")), OptionValue::HighlightLine(false)),
+            (Word(msgid("on")), OptionValue::HighlightLine(true)),
+        ],
+        OptionId::Wrap => vec![
+            (Word(msgid("off")), OptionValue::Wrap(false)),
+            (Word(msgid("on")), OptionValue::Wrap(true)),
+        ],
+        // The case is the choice: the look does not lower-case it.
+        OptionId::Keywords => vec![
+            (
+                Sample("UPPER"),
+                OptionValue::Keywords(Some(KeywordCase::Upper)),
+            ),
+            (
+                Sample("lower"),
+                OptionValue::Keywords(Some(KeywordCase::Lower)),
+            ),
+            (
+                Word(msgid("keep")),
+                OptionValue::Keywords(Some(KeywordCase::Keep)),
+            ),
+        ],
+        OptionId::Commas => vec![
+            (
+                Word(msgid("trailing")),
+                OptionValue::Commas(Commas::Trailing),
+            ),
+            (Word(msgid("leading")), OptionValue::Commas(Commas::Leading)),
+        ],
+    }
+}
+
+/// What Enter does on `row`, where it does something: the Agents tab, its
+/// log, or Connections. Showing the tab needs a window: with none open,
+/// nothing.
+pub(super) fn opened(app: &App, row: SettingsRow) -> Option<Vec<Action>> {
+    let show = |view| {
+        app.agents_window()
+            .map(|_| vec![Action::ShowAgentsFromSettings(view)])
+    };
+    match row {
+        SettingsRow::AgentsStatus => show(AgentsView::Activity),
+        SettingsRow::Option(OptionId::LogDays) => show(AgentsView::Log),
+        SettingsRow::AgentsAccess => Some(vec![Action::CloseDialog, Action::ShowConnections]),
+        SettingsRow::Option(OptionId::HistoryKeep) => app
+            .agents_window()
+            .map(|_| vec![Action::ShowHistoryFromSettings]),
+        SettingsRow::Option(_) => None,
+    }
+}
+
+/// What a disabled Show Agents tab and Show log say, with no window open.
+pub(super) const NO_WINDOW: Msgid = msgid("Open a connection to see its agents");
+
+/// What one of the screen's keys asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asked {
+    /// Open the file in the editor.
+    Edit,
+    Close,
+    /// Move the cursor by this many rows.
+    Move(isize),
+    /// Put the cursor's option back to its default.
+    Reset,
+    /// Step the cursor's option to its next value, or to the one before.
+    Step {
+        forward: bool,
+    },
+    /// Flip the cursor's option, if it has two values.
+    Flip,
+    /// Show the next pane (`true`) or the one before.
+    Pane {
+        forward: bool,
+    },
+    /// Open what the cursor's row shows.
+    Open,
+    /// Copy the command that connects an agent.
+    Copy,
+    /// Answer the history's question: delete what it kept, or keep it.
+    History(bool),
+    /// The Updates pane's: check now, the notes, skip the version offered,
+    /// `U` (download, restart), and cancel the download.
+    CheckNow,
+    Notes,
+    Skip,
+    Install,
+    CancelDownload,
+    /// Answer `:update`'s question: install and restart, or not.
+    Answer(bool),
+}
+
+/// What `event` asks of the screen, if it is a press of one of its keys,
+/// as the keymap has them (`held` is what the frame holds). A button of
+/// the screen that has the keyboard (`free` is then false) keeps Space,
+/// which presses it, and the arrows, which move focus from it, as in the
+/// workspace: the screen's plain keys but its close. Its letters, the
+/// chord that opens the file and the key that closes are the screen's
+/// wherever the keyboard is.
+fn asked(
+    keymap: &Keymap,
+    event: &egui::Event,
+    held: egui::Modifiers,
+    (free, pane, question): (bool, SettingsPane, bool),
+) -> Option<Asked> {
+    // The screen is Omarchy's.
+    let layout = Layout::Omarchy;
+    // The Updates pane's own come first there, and are read nowhere else:
+    // its `n` is the notes, which the history's question has elsewhere.
+    // While `:update` asks, its answers come before them: Esc and `n`
+    // say no.
+    let updates = [
+        Command::SettingsInstallYes,
+        Command::SettingsInstallNo,
+        Command::SettingsCheckNow,
+        Command::SettingsReleaseNotes,
+        Command::SettingsSkipVersion,
+        Command::SettingsInstallUpdate,
+        Command::SettingsCancelDownload,
+    ];
+    let updates = match (pane, question) {
+        (SettingsPane::Updates, true) => &updates[..],
+        (SettingsPane::Updates, false) => &updates[2..],
+        _ => &[],
+    };
+    let commands = updates.iter().copied().chain([
+        Command::SettingsOpenFile,
+        Command::SettingsReset,
+        Command::SettingsClose,
+        Command::SettingsMove,
+        Command::SettingsChange,
+        Command::SettingsToggle,
+        Command::SettingsPane,
+        Command::SettingsOpenRow,
+        Command::SettingsCopyCommand,
+        Command::SettingsDeleteHistory,
+        Command::SettingsKeepHistory,
+    ]);
+    // A letter is read as the key that types it, with Shift for its
+    // capital and nothing else held.
+    let typed = match event {
+        egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } if !(modifiers.command || modifiers.ctrl || modifiers.mac_cmd || modifiers.alt) => {
+            crate::keymap::char_of(*key, modifiers.shift)
+        }
+        _ => None,
+    };
+    for command in commands {
+        // A pane's two chords are the one before, then the next.
+        for (nth, keys) in keymap
+            .chords_now(layout, command, Scope::Prompt, true)
+            .enumerate()
+        {
+            let pressed = match crate::keymap::spell(keys) {
+                Ok(Spelled::Strokes(strokes)) => match strokes.as_slice() {
+                    [Stroke::Text(letter)] => typed == Some(*letter),
+                    [Stroke::Key { mods, .. }] => {
+                        let plain = mods.none() && command != Command::SettingsClose;
+                        (free || !plain)
+                            && crate::ui::keys::press_of(layout, held, event, keys).is_some()
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !pressed {
+                continue;
+            }
+            return Some(match command {
+                Command::SettingsOpenFile => Asked::Edit,
+                Command::SettingsReset => Asked::Reset,
+                Command::SettingsClose => Asked::Close,
+                Command::SettingsMove if matches!(keys, "k" | "up") => Asked::Move(-1),
+                Command::SettingsMove => Asked::Move(1),
+                Command::SettingsChange => Asked::Step {
+                    forward: matches!(keys, "l" | "right"),
+                },
+                Command::SettingsPane => Asked::Pane { forward: nth == 1 },
+                Command::SettingsOpenRow => Asked::Open,
+                Command::SettingsCopyCommand => Asked::Copy,
+                Command::SettingsDeleteHistory => Asked::History(true),
+                Command::SettingsKeepHistory => Asked::History(false),
+                Command::SettingsCheckNow => Asked::CheckNow,
+                Command::SettingsReleaseNotes => Asked::Notes,
+                Command::SettingsSkipVersion => Asked::Skip,
+                Command::SettingsInstallUpdate => Asked::Install,
+                Command::SettingsCancelDownload => Asked::CancelDownload,
+                Command::SettingsInstallYes => Asked::Answer(true),
+                Command::SettingsInstallNo => Asked::Answer(false),
+                _ => Asked::Flip,
+            });
+        }
+    }
+    None
+}
+
+/// The screen's keys. Nothing under the screen has them first: the app
+/// runs none of the workspace's shortcuts while a dialog is open, and egui
+/// takes the keyboard from what is under a modal.
+///
+/// Several keys can come in one frame, and each acts on what the ones
+/// before it left: the cursor where they moved it, an option as they set
+/// it. `j` then `l` changes the row `j` moved to, and `l` twice steps
+/// twice.
+///
+/// While the editor's preview has the keyboard (`preview`), its letters
+/// and Esc are its own, as in the editor: only the chords that open the
+/// file and change the pane are the screen's.
+fn keys(
+    app: &App,
+    ctx: &egui::Context,
+    dialog: &SettingsDialog,
+    preview: bool,
+    actions: &mut Vec<Action>,
+) {
+    let free = !super::focus::on_control(ctx);
+    // As `App::apply` will have them once it has run the actions so far.
+    let mut cursor = dialog.row;
+    let mut pane = dialog.pane;
+    let mut settings = shown(app);
+    let keymap = app.keymap.clone();
+    // Copied once the input is let go: the clipboard is the context's.
+    let mut copy = false;
+    let mut update_command = None;
+    ctx.input_mut(|input| {
+        let held = input.modifiers;
+        input.events.retain(|event| {
+            let question = pane == SettingsPane::Updates && dialog.update_question.is_some();
+            let Some(asked) = asked(&keymap, event, held, (free, pane, question)) else {
+                return true;
+            };
+            if preview && !matches!(asked, Asked::Edit | Asked::Pane { .. }) {
+                return true;
+            }
+            let repeat = matches!(event, egui::Event::Key { repeat: true, .. });
+            match asked {
+                // A fresh press only: every repeat of a key held down
+                // would start another editor.
+                Asked::Edit => {
+                    if !repeat {
+                        actions.push(Action::EditSettingsFile);
+                    }
+                }
+                Asked::Close => actions.push(Action::CloseDialog),
+                Asked::Move(by) => {
+                    let last = pane.rows().len() - 1;
+                    cursor = cursor.saturating_add_signed(by).min(last);
+                    actions.push(Action::MoveSettingsRow(by));
+                }
+                Asked::Pane { forward } => {
+                    let listed = SettingsPane::listed();
+                    let at = listed.iter().position(|shown| *shown == pane).unwrap_or(0);
+                    let next = match forward {
+                        true => (at + 1).min(listed.len() - 1),
+                        false => at.saturating_sub(1),
+                    };
+                    if listed[next] != pane {
+                        pane = listed[next];
+                        cursor = 0;
+                        actions.push(Action::ShowSettingsPane(pane));
+                    }
+                }
+                // What the row opens, on a row that opens something: else
+                // the key is left.
+                Asked::Open => {
+                    let opens = pane.rows().get(cursor).and_then(|row| opened(app, *row));
+                    let Some(opens) = opens else {
+                        return true;
+                    };
+                    // A fresh press only: a held Enter would go on to the
+                    // screen it opened.
+                    if !repeat {
+                        actions.extend(opens);
+                    }
+                }
+                Asked::Copy => match pane {
+                    SettingsPane::Agents => copy |= !repeat,
+                    // The command that updates a copy something else
+                    // installed, where it has one.
+                    SettingsPane::Updates => match updates::managed_command(update_status(app)) {
+                        Some(command) => {
+                            if !repeat {
+                                update_command = Some(command);
+                            }
+                        }
+                        None => return true,
+                    },
+                    _ => return true,
+                },
+                // Fresh presses only: a held key would ask again and again.
+                Asked::CheckNow => {
+                    if !repeat {
+                        actions.push(Action::CheckForUpdates);
+                    }
+                }
+                Asked::Notes => {
+                    if !repeat {
+                        actions.push(Action::ShowReleaseNotes);
+                    }
+                }
+                // Only where the block offers it: a version that downloads
+                // or waits to install is not skipped, and the key is left.
+                Asked::Skip => {
+                    if !updates::skips(update_status(app)) {
+                        return true;
+                    }
+                    if !repeat {
+                        actions.push(Action::SkipUpdate);
+                    }
+                }
+                // What the card offers: a press with nothing to do is
+                // left.
+                Asked::Install => match updates::install_action(update_status(app)) {
+                    Some(action) => {
+                        if !repeat {
+                            actions.push(action);
+                        }
+                    }
+                    None => return true,
+                },
+                Asked::CancelDownload => {
+                    if !matches!(app.updates.install, crate::update::Install::Downloading(_)) {
+                        return true;
+                    }
+                    actions.push(Action::CancelDownload);
+                }
+                Asked::Answer(yes) => {
+                    if !repeat {
+                        actions.push(Action::AnswerUpdateQuestion(yes));
+                    }
+                }
+                // Only while the question stands.
+                Asked::History(delete) => {
+                    if dialog.history_question.is_none() || repeat {
+                        return true;
+                    }
+                    actions.push(Action::AnswerHistoryQuestion(delete));
+                }
+                Asked::Reset | Asked::Step { .. } | Asked::Flip => {
+                    // A cursor on no option has no option to change: the
+                    // key is left, and the ones above still close the
+                    // screen or move it back onto a row.
+                    let row = pane.rows().get(cursor);
+                    let Some(option) = row.and_then(|row| row.option()) else {
+                        return true;
+                    };
+                    // The server's switch has no default to put back:
+                    // off, it would end every agent's session.
+                    if asked == Asked::Reset && option == OptionId::AgentsOn {
+                        return true;
+                    }
+                    let value = match asked {
+                        Asked::Reset => Some(option.default_value()),
+                        Asked::Step { forward } if option == OptionId::Language => {
+                            Some(settings.stepped_language(app.system_language.as_ref(), forward))
+                        }
+                        Asked::Step { forward } if option == OptionId::Tz => {
+                            Some(settings.stepped_zone(app.named_zone.as_deref(), forward))
+                        }
+                        Asked::Step { forward } if option == OptionId::OnLaunch => {
+                            let launches = launch_choices(&app.connections.connections);
+                            Some(settings.stepped_launch(&launches, forward))
+                        }
+                        Asked::Step { forward } => Some(settings.stepped(option, forward)),
+                        _ => settings.flipped(option),
+                    };
+                    // A step to the theme the row shows already changes
+                    // nothing: a value of the other looks', shown as the
+                    // desktop followed, stays in the file.
+                    let same = |value: &OptionValue| {
+                        option == OptionId::Theme
+                            && asked != Asked::Reset
+                            && *value == settings.value(option)
+                    };
+                    if let Some(value) = value.filter(|value| !same(value)) {
+                        set_shown(app, &value, &mut settings);
+                        // Stripes put back to the look's are drawn as the
+                        // look draws them: the next key flips those.
+                        settings.zebra = Some(settings.zebra_in(app.look.terminal));
+                        actions.push(Action::SetOption(value));
+                    }
+                }
+            }
+            false
+        });
+    });
+    if copy {
+        crate::ui::agents::copy_command(ctx, app.locale);
+    }
+    if let Some(command) = update_command {
+        updates::copy_command(ctx, command, app.locale);
+    }
+}
+
+/// The editor preview's text field, for the tests.
+#[cfg(test)]
+pub(crate) fn editor_preview_field() -> egui::Id {
+    editor_preview::field_id()
+}
+
+/// The Settings window, while it is the dialog: the keys of a row being
+/// recorded first, then the terminal look's screen with its keys or the
+/// sheet. What they push reaches `app.actions` after them, in that order.
+pub fn show(app: &mut App, ctx: &egui::Context) {
+    let Some(Dialog::Settings(dialog)) = &app.dialog else {
+        return;
+    };
+    let mut actions = Vec::new();
+    // A row being recorded has the frame's keys before anything else: the
+    // key is the row's, whatever it would do otherwise. A button of the
+    // refusal's line keeps the keys that press it.
+    let keyboard = dialog.pane == SettingsPane::Keyboard;
+    if keyboard && let Some(recording) = &dialog.keyboard.recording {
+        let on_buttons = keyboard_sheet::on_refusal(ctx);
+        keyboard::record(
+            ctx,
+            &app.keymap,
+            app.layout(),
+            (recording, on_buttons),
+            &mut actions,
+        );
+    }
+    if app.look.terminal {
+        // The screen's keys act on its cursor. The sheet has none: its
+        // controls are reached with Tab. The Keyboard pane's are its own,
+        // and its `/` line's field has them while it is open.
+        // The editor's preview, while it has the keyboard, has the
+        // screen's letters and Esc: they are its own, as in the editor.
+        let in_preview = ctx.memory(|memory| memory.has_focus(editor_preview::field_id()));
+        if keyboard {
+            if dialog.keyboard.recording.is_none() && !dialog.keyboard.filtering {
+                let (keymap, layout) = (&app.keymap, app.layout());
+                keyboard_terminal::keys(ctx, keymap, layout, app.locale, dialog, &mut actions);
+            }
+        } else {
+            keys(app, ctx, dialog, in_preview, &mut actions);
+        }
+        let interrupted = || app.work_in_progress();
+        let asked = terminal_asked(app, dialog, &interrupted);
+        let launches = launch_choices(&app.connections.connections);
+        let checked = updates::checked_text(asked.status, &app.look, app.locale, true);
+        let skin = terminal_skin(app, &launches, checked.as_deref(), ctx.zoom_factor());
+        terminal::show(ctx, &skin, dialog, asked, &mut actions);
+    } else {
+        let interrupted = || app.work_in_progress();
+        let asked = sheet_asked(app, &interrupted);
+        sheet::show(ctx, &sheet_skin(app, dialog), dialog, &asked, &mut actions);
+    }
+    app.actions.extend(actions);
+}
